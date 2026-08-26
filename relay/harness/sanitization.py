@@ -13,11 +13,14 @@ import os
 import re
 from collections.abc import Iterable
 
-#: ENV_VAR=value / ENV_VAR: value where the name smells credential-shaped.
-_CREDENTIAL_ASSIGNMENT = re.compile(
-    r"\b[A-Z][A-Z0-9_]*"
-    r"(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|CREDENTIALS|BEARER|AUTH"
-    r"|COOKIE|SESSION)[A-Z0-9_]*\b\s*[:=]\s*\S+"
+#: Broad uppercase ENV-style assignment candidates; value masking happens
+#: only when the NAME carries a credential keyword anywhere inside it
+#: (substring test beats enumeration: SECRET_FODDER=…, MY_API_KEY_V2=…,
+#: OPENAI_API_KEY=… all classify without pattern gymnastics).
+_ASSIGNMENT_CANDIDATE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})(\s*[:=]\s*)(\S+)")
+
+_KEYWORD_WITHIN_NAME = re.compile(
+    r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS?|BEARER|AUTH|COOKIE|SESSION"
 )
 
 #: Common credential literal shapes.
@@ -31,6 +34,20 @@ _LIKE_SECRET_LITERALS = (
 )
 
 _MASK = "[REDACTED]"
+
+
+def _mask_credential_assignments(text: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        name, separator, _value = (
+            match.group(1),
+            match.group(2),
+            match.group(3),
+        )
+        if _KEYWORD_WITHIN_NAME.search(name):
+            return f"{name}{separator}{_MASK}"
+        return match.group(0)
+
+    return _ASSIGNMENT_CANDIDATE.sub(repl, text)
 
 
 def _home_prefixes(home: str | None) -> list[str]:
@@ -86,7 +103,7 @@ def redact(
     for secret in secrets:
         if secret and len(secret) >= 6 and secret in result:
             result = result.replace(secret, _MASK)
-    result = _CREDENTIAL_ASSIGNMENT.sub(lambda m: m.group(0).split(":")[0].split("=")[0] + f"={_MASK}", result)
+    result = _mask_credential_assignments(result)
     for pattern in _LIKE_SECRET_LITERALS:
         result = pattern.sub(_MASK, result)
     return _shorten_paths(result, home)

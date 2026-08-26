@@ -84,6 +84,13 @@ class HarnessAgent(Agent):
     #: This adapter's deliberate self-whitelist from the conflict set (C.4).
     self_allowed_env: frozenset[str] = frozenset()
 
+    #: Adapter-advertised fault triggers for the conformance battery:
+    #: ``(argv --mode flag, expected failure-message hint)`` pairs. Declared
+    #: per adapter because failure vocabularies legitimately differ (R3);
+    #: empty means the adapter advertises none and B05 degrades to a
+    #: documented pass rather than a hard-coded assumption.
+    failure_modes: tuple[tuple[str, str], ...] = ()
+
     def __init__(
         self,
         settings: AgentSettings | None = None,
@@ -91,6 +98,7 @@ class HarnessAgent(Agent):
         profile: HarnessAgentConfig | None = None,
         workspace_root: str | Path | None = None,
     ) -> None:
+
         self._settings = settings or AgentSettings(adapter=self.name)
         self._profile = profile
         self._workspace_root = Path(workspace_root) if workspace_root else Path.cwd()
@@ -214,11 +222,14 @@ class HarnessAgent(Agent):
         Contract: implementations that declare ``structured_output`` MUST
         raise :class:`HarnessOutputError` on malformed streams themselves —
         never leak raw parser internals, never silently fabricate success.
-        The default (no capability) treats stdout(+stderr tail) as prose.
+        The default treats stdout as contract data (echoed verbatim — C.4
+        probes rely on exact payloads) and STDERR as noise: any stderr that
+        reaches a response passes :func:`redact` first, so credential-shaped
+        chatter can never ride a successful run into persisted history.
         """
         combined = stdout_text
         if stderr_text.strip():
-            combined += "\n" + stderr_text.strip()
+            combined += "\n" + redact(stderr_text.strip())
         return combined
 
     # -- execution ---------------------------------------------------------------
@@ -234,11 +245,21 @@ class HarnessAgent(Agent):
             ) from exc
 
     def _child_env(self) -> dict[str, str]:
-        return build_child_env(
+        """C.4 allowlist policy plus Relay-forced neutral stdio settings.
+
+        Children MUST speak UTF-8 regardless of platform defaults: a console
+        codepage like cp1252 turns any non-ASCII path/output into a child
+        crash (observed: UnicodeEncodeError during cwd echoes). These two are
+        environment *settings*, never credentials.
+        """
+        env = build_child_env(
             os.environ,
             conflict_variables=self.conflict_variables(),
             self_allowed=self.self_allowed_env,
         )
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        return env
 
     def compose_argv(
         self, resolved: ResolvedExecutable, grant: ExecutionGrant
