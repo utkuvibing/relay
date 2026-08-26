@@ -35,6 +35,7 @@ from relay.agents.base import (
     BackendType,
     RunObservation,
     TokenUsage,
+    ToolObservation,
 )
 from relay.agents.config import AgentSettings
 from relay.agents.errors import AgentError
@@ -254,6 +255,16 @@ class HarnessAgent(Agent):
         """
         return None
 
+    def tool_observations(self) -> list[ToolObservation]:
+        """Normalized tool events from the last parse; default: none.
+
+        Adapters that expose structured event streams override this to
+        translate vendor-specific shapes into the neutral vocabulary
+        (:class:`~relay.agents.base.ToolObservation`). Core persists these
+        without ever seeing a provider name or event schema.
+        """
+        return []
+
     # -- execution ---------------------------------------------------------------
 
     def _prepared_cwd(self) -> Path:
@@ -358,6 +369,7 @@ class HarnessAgent(Agent):
             output=output,
             usage=self.response_usage(),
             observation=self.run_observation(),
+            tool_observations=self.tool_observations(),
         )
 
     @staticmethod

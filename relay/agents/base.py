@@ -84,6 +84,22 @@ class RunObservation(BaseModel):
     )
 
 
+class ToolObservation(BaseModel):
+    """One provider-neutral tool/tool-like event a backend reported.
+
+    Adapters translate their native event streams into this shape; core
+    persists it without knowing any provider vocabulary (App. C.1). Fields
+    are allowlist-shaped and bounded upstream by the adapter.
+    """
+
+    kind: str = Field(description="Neutral kind, e.g. 'shell', 'file_edit', 'message'.")
+    summary: str = Field(default="", description="Bounded human-readable description.")
+    command: str | None = Field(
+        default=None,
+        description="Sanitized command line when the observation is a shell-type event.",
+    )
+
+
 class AgentResponse(BaseModel):
     """Structured result of one agent run."""
 
@@ -97,6 +113,8 @@ class AgentResponse(BaseModel):
     usage: TokenUsage | None = None
     #: Optional execution observation (harness runs report what actually ran).
     observation: RunObservation | None = None
+    #: Adapter-normalized tool events (observability tier; App. C.5/C.7).
+    tool_observations: list[ToolObservation] = Field(default_factory=list)
 
 
 class Agent(abc.ABC):

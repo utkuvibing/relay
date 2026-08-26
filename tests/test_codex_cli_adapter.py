@@ -156,6 +156,12 @@ class TestEnvironmentPolicy:
 # ---------------------------------------------------------------------------
 
 
+def _settings_with_model(model: str):
+    from relay.agents.config import AgentSettings
+
+    return AgentSettings(adapter="codex_cli", model=model)
+
+
 def _event_stream() -> str:
     return "\n".join(
         [
@@ -217,6 +223,88 @@ class TestParseOutput:
         )
         with pytest.raises(HarnessOutputError):
             agent.parse_output(stream, "")
+
+    def test_turn_failed_fails_typed_even_with_agent_message(self):
+        """Blocker 6: turn.failed is a terminal failure, never success."""
+        agent = CodexCLIAdapter({})
+        stream = "\n".join(
+            [
+                json.dumps({"type": "thread.started"}),
+                json.dumps(
+                    {"type": "item.completed", "item": {"id": "f", "type": "agent_message", "text": "partial"}}
+                ),
+                json.dumps({"type": "turn.failed", "error": {"message": "model overloaded"}}),
+            ]
+        )
+        with pytest.raises(HarnessOutputError, match="turn failed"):
+            agent.parse_output(stream, "")
+
+    def test_agent_message_without_completed_turn_is_not_success(self):
+        """Blocker 6: a final message alone is NOT a valid terminator."""
+        agent = CodexCLIAdapter({})
+        stream = "\n".join(
+            [
+                json.dumps({"type": "thread.started"}),
+                json.dumps(
+                    {"type": "item.completed", "item": {"id": "f", "type": "agent_message", "text": "looks done"}}
+                ),
+            ]
+        )
+        with pytest.raises(HarnessOutputError, match="without a completed turn"):
+            agent.parse_output(stream, "")
+
+    def test_completed_turn_with_final_message_succeeds(self):
+        agent = CodexCLIAdapter({})
+        stream = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "t9"}),
+                json.dumps(
+                    {"type": "item.completed", "item": {"id": "f", "type": "agent_message", "text": "done properly"}}
+                ),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 2}}),
+            ]
+        )
+        assert agent.parse_output(stream, "") == "done properly"
+
+    def test_command_execution_normalizes_to_shell_observation(self):
+        """Blocker 1: adapter emits neutral ToolObservations from its own
+        event vocabulary."""
+        agent = CodexCLIAdapter({})
+        stream = "\n".join(
+            [
+                json.dumps({"type": "thread.started"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "c1",
+                            "type": "command_execution",
+                            "command": "echo SECRET_NAME=leak-attempt",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {"type": "item.completed", "item": {"id": "f", "type": "agent_message", "text": "ok"}}
+                ),
+                json.dumps({"type": "turn.completed"}),
+            ]
+        )
+        assert agent.parse_output(stream, "") == "ok"
+        observations = agent.tool_observations()
+        assert len(observations) == 1
+        assert observations[0].kind == "shell"
+        assert observations[0].command is not None
+        assert "SECRET_NAME" in observations[0].command  # name survives redaction
+        assert "leak-attempt" not in (observations[0].command or "")  # value does not
+
+    def test_resolved_model_stays_none_without_harness_report(self):
+        """Blocker 5: settings.model is REQUESTED; resolved stays None unless
+        the harness itself reports the effective model."""
+        agent = CodexCLIAdapter(_settings_with_model("gpt-5.6-codex"))
+        agent.parse_output(_event_stream(), "")
+        observation = agent.run_observation()
+        assert observation is not None
+        assert observation.resolved_model is None
 
     def test_empty_stream_fails_typed(self):
         agent = CodexCLIAdapter({})
@@ -441,3 +529,106 @@ async def test_live_codex_read_only_smoke(tmp_path):
     )
     assert response.status == "ok"
     assert response.output
+
+
+# ---------------------------------------------------------------------------
+# Live BUILD smoke (blocker 7) — P2.2 gate G2 against the real harness.
+# Disabled unless RELAY_RUN_LIVE_TESTS=1 AND a logged-in codex is present;
+# CI runners have neither, so this can never activate there. No API keys or
+# subscription credentials are persisted or forwarded (C.4 child-env policy).
+# ---------------------------------------------------------------------------
+
+
+def _live_build_relay_yaml(executable_json: str) -> str:
+    return (
+        "agents:\n"
+        "  codex:\n"
+        "    backend: harness\n"
+        "    adapter: codex_cli\n"
+        "    model: gpt-5.6-codex\n"
+        "    harness:\n"
+        f"      executable_path: {executable_json}\n"
+        "      grant: workspace_write\n"
+        "      timeout_seconds: 600\n"
+    )
+
+
+@pytest.mark.skipif(
+    not _live_codex_available(),
+    reason="live build smoke: set RELAY_RUN_LIVE_TESTS=1 with a logged-in codex on PATH",
+)
+def test_live_codex_build_smoke(tmp_path, monkeypatch):
+    """Full `relay build` through real Codex CLI inside a scratch git repo."""
+    import subprocess as _subprocess
+
+    from typer.testing import CliRunner as _CliRunner
+
+    from relay.cli.main import app as _app
+    from relay.core.evidence import EvidenceKind as _EvidenceKind
+    from relay.storage.models import ArtifactKind as _ArtifactKind
+    from relay.storage.models import Run as _Run
+    from relay.storage.models import Task as _Task
+    from relay.storage.store import SqliteRelayStore as _Store
+
+    monkeypatch.setenv("RELAY_MODEL", "")  # keep settings deterministic
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    for args in (
+        ["config", "user.email", "relay-live@local"],
+        ["config", "user.name", "Relay Live"],
+    ):
+        _subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=True)
+    (repo / "counter.py").write_text("count = 0\n", encoding="utf-8")
+    _subprocess.run(["git", "-C", str(repo), "add", "."], capture_output=True, check=True)
+    _subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "init"], cwd=repo, capture_output=True, check=True
+    )
+
+    monkeypatch.chdir(repo)
+    # executable_path: null -> discovery falls through to PATH (codex is present).
+    (repo / "relay.yaml").write_text(_live_build_relay_yaml("null"), encoding="utf-8")
+
+    runner = _CliRunner()
+    init_result = runner.invoke(_app, ["init"])
+    assert init_result.exit_code == 0, init_result.output
+
+    build_result = runner.invoke(
+        _app,
+        [
+            "build",
+            "Modify counter.py so the module exposes COUNT = 1 instead of count = 0.",
+            "--agent",
+            "codex",
+        ],
+    )
+    assert build_result.exit_code == 0, build_result.output
+
+    conn = __import__("relay.storage", fromlist=["connect"]).connect(
+        repo / ".relay" / "relay.sqlite3"
+    )
+    store = _Store(conn)
+    tasks = list(store.all_models(_Task))
+    runs = list(store.all_models(_Run))
+    assert len(tasks) == 1 and len(runs) == 1
+    task, run = tasks[0], runs[0]
+    assert run.task_id == task.id  # blocker 3 linkage
+    assert run.backend == "harness"  # C.6 observation seam live
+    diffs = store.artifacts_for_run(run.id, kind=_ArtifactKind.DIFF)
+    assert len(diffs) == 1, "expected a Relay-owned diff artifact from a real edit"
+    assert "COUNT = 1" in (diffs[0].content or "")
+
+    evidence_store = __import__("relay.storage", fromlist=["SqliteEvidenceStore"]).SqliteEvidenceStore(store)
+    kinds = {r.kind for r in evidence_store.records_for_task(task.id)}
+    assert _EvidenceKind.IMPLEMENTATION_PRODUCED in kinds
+
+    # Credential leakage audit over all persisted bytes (main + WAL): no
+    # env-var names or key shapes may survive persistence.
+    for suffix in ("", "-wal"):
+        side = repo / ".relay" / ("relay.sqlite3" + suffix)
+        if side.exists():
+            blob = side.read_bytes().lower()
+            assert b"codex_api_key" not in blob
+            assert b"openai_api_key" not in blob
+    conn.close()

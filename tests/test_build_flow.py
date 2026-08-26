@@ -18,11 +18,14 @@ import subprocess
 import pytest
 from typer.testing import CliRunner
 
+from relay.agents.base import ToolObservation
 from relay.agents.registry import transient_adapters
 from relay.cli.main import app
 from relay.core.evidence import EvidenceKind
 from relay.harness.capabilities import HarnessCapability
+from relay.harness.errors import HarnessOutputError
 from relay.harness.runtime import HarnessAgent
+from relay.harness.sanitization import redact
 from relay.storage.models import (
     ArtifactKind,
     EventType,
@@ -74,6 +77,48 @@ class _FakeImplementer(HarnessAgent):
 
     def invocation_argv(self, resolved):
         return (resolved.command, "-c", _BUILD_SRC)
+
+    def parse_output(self, stdout_text, stderr_text):
+        """Normalize own JSONL → output + ToolObservations.
+
+        Same neutral seam CodexCLIAdapter uses (blocker 1): core persists
+        observations without knowing the fake's event vocabulary either.
+        """
+        self._last_observations = []
+        finals: list[str] = []
+        for line in stdout_text.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            item = payload.get("item")
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            item_type = str(item.get("type", "unknown"))
+            if item_type == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    finals.append(text)
+            else:
+                command = item.get("command")
+                self._last_observations.append(
+                    ToolObservation(
+                        kind="shell" if item_type == "command_execution" else item_type,
+                        summary=str(item.get("id", ""))[:120],
+                        command=redact(str(command or "")[:200]) or None,
+                    )
+                )
+        if not finals:
+            raise HarnessOutputError(f"{self.name}: no final agent message")
+        return "\n".join(finals)
+
+    def tool_observations(self):
+        return list(getattr(self, "_last_observations", []) or [])
 
 
 @pytest.fixture()
@@ -143,12 +188,12 @@ class TestBuildFlowHappyPath:
         task = tasks[0]
         assert task.title.startswith("write implemented.txt")
 
-        # Run succeeded with observation columns populated (C.6).
+        # Run succeeded — task linkage REQUIRED now (blocker 3).
         runs = list(store.all_models(Run))
         assert len(runs) == 1
         run = runs[0]
         assert run.status.value == "succeeded"
-        assert run.task_id is None or run.task_id == task.id
+        assert run.task_id == task.id
 
         # DIFF artifact extracted Relay-owned from the dirty workspace.
         diffs = store.artifacts_for_run(run.id, kind=ArtifactKind.DIFF)
@@ -161,11 +206,12 @@ class TestBuildFlowHappyPath:
         outputs = store.artifacts_for_run(run.id, kind=ArtifactKind.RUN_OUTPUT)
         assert len(outputs) == 1
 
-        # Observed harness events recorded as ToolRuns (mediation-tier notes).
+        # Observed harness events recorded as ToolRuns — neutral kinds now
+        # (blocker 1: no provider event vocabulary reaches core).
         tool_runs = list(store.all_models(ToolRun))
         types = {tr.tool for tr in tool_runs}
-        assert "harness.command_execution" in types
-        assert "harness.file_change" in types
+        assert "shell" in types
+        assert "file_change" in types
 
         # IMPLEMENTATION_PRODUCED evidence with valid provenance.
         evidence_store = __import__(
@@ -221,6 +267,88 @@ class TestBuildRefusals:
         result = runner.invoke(app, ["build", "whatever"])
         assert result.exit_code == 1
         assert "no harness-backed agent" in result.output
+
+
+class TestDiffProvenance:
+    def test_pre_existing_untracked_file_not_attributed_to_harness(self, build_workspace):
+        """Blocker 2 regression: a file that existed BEFORE the build (the
+        pre-run baseline) must NOT appear in the produced DIFF artifact —
+        even though it is untracked and the harness touched nothing."""
+        untracked = build_workspace / "pre_existing_notes.txt"
+        untracked.write_text("existed before this build ran\n", encoding="utf-8")
+
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "touch implemented.txt"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        run = next(iter(store.all_models(Run)))
+        diffs = store.artifacts_for_run(run.id, kind=ArtifactKind.DIFF)
+        assert len(diffs) == 1
+        diff_text = diffs[0].content or ""
+        assert "implemented.txt" in diff_text  # harness-produced change present
+        assert "pre_existing_notes.txt" not in diff_text  # baseline excluded
+        conn.close()
+
+    def test_noop_build_mints_no_diff_and_no_evidence(self, build_workspace):
+        """Blocker 4: an empty/no-op build must not mint implementation evidence."""
+        with transient_adapters({"fake_implementer_build": _NoopImplementer}):
+            result = runner.invoke(app, ["build", "do nothing"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        task = next(iter(store.all_models(Task)))
+        run = next(iter(store.all_models(Run)))
+        assert run.status.value == "succeeded"
+        assert run.task_id == task.id
+        # No workspace change → no DIFF artifact...
+        assert store.artifacts_for_run(run.id, kind=ArtifactKind.DIFF) == []
+        # ...and therefore NO implementation evidence was recorded.
+        evidence_store = __import__(
+            "relay.storage", fromlist=["SqliteEvidenceStore"]
+        ).SqliteEvidenceStore(store)
+        records = evidence_store.records_for_task(task.id)
+        assert all(r.kind is not EvidenceKind.IMPLEMENTATION_PRODUCED for r in records)
+        conn.close()
+
+    def test_read_only_grant_refused_before_spawn(self, build_workspace):
+        """Blocker 4: READ_ONLY_ACCESS build fails typed before any launch."""
+        relay_yaml = build_workspace / "relay.yaml"
+        text = relay_yaml.read_text(encoding="utf-8")
+        relay_yaml.write_text(text.replace("grant: workspace_write", "grant: read_only"), encoding="utf-8")
+
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "attempt read-only build"])
+        assert result.exit_code == 1
+        assert "workspace_write" in result.output
+
+        # Refusal happened before spawn: no run rows persisted at all.
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        assert list(store.all_models(Run)) == []
+        conn.close()
+
+
+class _NoopImplementer(_FakeImplementer):
+    """Same shape as the implementing fake but writes nothing."""
+
+    name = "fake_noop_build"
+
+    def invocation_argv(self, resolved):
+        noop_script = (
+            "import json\n"
+            "print(json.dumps({'type':'item.completed','item':{'id':'m','type':'agent_message','text':'no-op done'}}))\n"
+            "print(json.dumps({'type':'turn.completed'}))\n"
+        )
+        return (resolved.command, "-c", noop_script)
 
 
 class TestG2HygieneAudit:

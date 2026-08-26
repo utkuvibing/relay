@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import json
 
-from relay.agents.base import RunObservation, TokenUsage
+from relay.agents.base import RunObservation, TokenUsage, ToolObservation
 from relay.harness.capabilities import HarnessCapability
 from relay.harness.discovery import ResolvedExecutable
 from relay.harness.errors import HarnessOutputError
 from relay.harness.runtime import HarnessAgent
+from relay.harness.sanitization import redact
 from relay.harness.types import AuthState, ExecutionGrantKind, ExitSemantics
 
 #: Env vars that would flip the harness into API-key billing mode. Codex's
@@ -47,9 +48,12 @@ _CONFLICT = ("CODEX_API_KEY", "CODEX_HOME")
 _SELF_ALLOWED = ("CODEX_HOME",)  # directory pointer, never a secret
 
 _JSONL_EVENT_TURN_COMPLETED = "turn.completed"
+_JSONL_EVENT_TURN_FAILED = "turn.failed"
+_JSONL_EVENT_ERROR = "error"
 _JSONL_EVENT_THREAD_STARTED = "thread.started"
 _JSONL_EVENT_ITEM_COMPLETED = "item.completed"
 _FINAL_ITEM_TYPE = "agent_message"
+_ITEM_COMMAND_EXECUTION = "command_execution"
 
 
 class CodexCLIAdapter(HarnessAgent):
@@ -116,16 +120,22 @@ class CodexCLIAdapter(HarnessAgent):
         return ExitSemantics.UNKNOWN
 
     def parse_output(self, stdout_text: str, stderr_text: str) -> str:
-        """JSONL event stream → final agent message (+ usage capture side-band).
+        """JSONL event stream → final agent message (+ state capture side-band).
 
-        Tolerates unknown event *types* upstream may add; structural drift
-        lands as conformance-fixture revision instead of silent success.
+        Terminal semantics (strict): a stream is successful only when a
+        ``turn.completed`` terminator arrived. ``turn.failed`` and ``error``
+        events fail typed. An agent_message without a completed turn is NOT
+        success — the run ends in a typed failure instead. Unknown future
+        event types are tolerated/skipped; structural drift lands as
+        conformance-fixture revision.
         """
         finals: list[str] = []
-        seen_any_event = False
+        observations: list[ToolObservation] = []
         thread_id: str | None = None
+        reported_model: str | None = None
         input_tokens: int | None = None
         output_tokens: int | None = None
+        turn_completed = False
 
         for line in stdout_text.splitlines():
             line = line.strip()
@@ -141,41 +151,74 @@ class CodexCLIAdapter(HarnessAgent):
                 raise HarnessOutputError(
                     f"{self.name}: harness output could not be decoded"
                 )
-            seen_any_event = True
             event_type = event.get("type")
 
             if event_type == _JSONL_EVENT_THREAD_STARTED:
-                thread_id_value = event.get("thread_id")
-                thread_id = (
-                    thread_id_value if isinstance(thread_id_value, str) else None
-                )
+                value = event.get("thread_id")
+                thread_id = value if isinstance(value, str) else None
             elif event_type == _JSONL_EVENT_TURN_COMPLETED:
+                turn_completed = True
                 usage = event.get("usage")
                 if isinstance(usage, dict):
                     input_tokens = _positive_int(usage.get("input_tokens"))
                     output_tokens = _positive_int(usage.get("output_tokens"))
+            elif event_type == _JSONL_EVENT_TURN_FAILED:
+                error_payload = event.get("error")
+                detail = (
+                    error_payload.get("message", "")
+                    if isinstance(error_payload, dict)
+                    else ""
+                )
+                detail = str(detail)[:200] if detail else "turn failed"
+                raise HarnessOutputError(f"{self.name}: harness turn failed: {detail}")
+            elif event_type == _JSONL_EVENT_ERROR:
+                message = event.get("message")
+                detail = str(message)[:200] if isinstance(message, str) else ""
+                raise HarnessOutputError(
+                    f"{self.name}: harness reported {('error: ' + detail) if detail else 'an error event'}"
+                )
             elif event_type == _JSONL_EVENT_ITEM_COMPLETED and isinstance(
                 event.get("item"), dict
             ):
                 item = event["item"]
-                if item.get("type") == _FINAL_ITEM_TYPE:
+                item_type = item.get("type")
+                if item_type == _FINAL_ITEM_TYPE:
                     text = item.get("text")
-                    if isinstance(text, str):
+                    if isinstance(text, str) and text:
                         finals.append(text)
-            elif event_type == "error":
-                message = event.get("message")
-                detail = message if isinstance(message, str) and message else ""
-                raise HarnessOutputError(
-                    f"{self.name}: harness reported {('error: ' + detail) if detail else 'an error event'}"
-                )
+                elif item_type == _ITEM_COMMAND_EXECUTION:
+                    command_value = item.get("command")
+                    observations.append(
+                        ToolObservation(
+                            kind="shell",
+                            summary=str(item.get("id", ""))[:120],
+                            command=redact(str(command_value or "")[:200]) or None,
+                        )
+                    )
+                else:
+                    # Unknown *item* types normalize as generic harness notes.
+                    observations.append(
+                        ToolObservation(
+                            kind=str(item_type or "unknown")[:60],
+                            summary=str(item.get("id", ""))[:120],
+                        )
+                    )
 
-        if not seen_any_event or not finals:
+        if not turn_completed:
+            raise HarnessOutputError(
+                f"{self.name}: harness stream ended without a completed turn"
+            )
+        if not finals:
             raise HarnessOutputError(
                 f"{self.name}: harness produced no final agent message"
             )
         self._last_thread_id = thread_id
         self._last_input_tokens = input_tokens
         self._last_output_tokens = output_tokens
+        # resolved_model stays None unless the harness itself reported the
+        # effective model (Blocker 5): settings.model is the REQUESTED model.
+        self._last_reported_model = None if reported_model is None else reported_model
+        self._last_observations = observations
         return "\n".join(finals)
 
     def response_usage(self) -> TokenUsage | None:
@@ -192,13 +235,18 @@ class CodexCLIAdapter(HarnessAgent):
     def run_observation(self) -> RunObservation | None:
         info = self._info
         return RunObservation(
-            resolved_model=self._settings.model,
+            # requested model lives in Run.model; resolved stays None unless
+            # the harness itself reports the effective model (Blocker 5).
+            resolved_model=None,
             adapter_version=info.version if info else None,
             backend="harness",
             # external_session_ref intentionally None: C.4 persistence needs
             # an explicit config opt-in that does not exist yet (P7 seam).
             external_session_ref=None,
         )
+
+    def tool_observations(self) -> list[ToolObservation]:
+        return list(getattr(self, "_last_observations", []) or [])
 
     async def probe_auth(self) -> AuthState:
         """Quota-free auth-state check (Q4): `codex login status`.
