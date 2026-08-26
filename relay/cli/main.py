@@ -20,7 +20,8 @@ from relay.agents import (
     AgentRequest,
     AgentRole,
     CliOverrides,
-    get_agent_class,
+    UnknownAgentError,
+    build_agent,
     resolve_settings,
 )
 from relay.agents.errors import AgentError, AgentNotConfigured
@@ -30,7 +31,6 @@ from relay.context import (
     identity_key,
     initialize_workspace,
     load_config,
-    require_api_backed,
     workspace_layout,
 )
 from relay.core.orchestrator import run_ask
@@ -145,20 +145,21 @@ def ask(
     try:
         config = load_config(root)
         agent_cfg = agent_config(config, provider)
-        require_api_backed(provider, agent_cfg)
         settings = resolve_settings(cli=CliOverrides(model=model), yaml_agent=agent_cfg)
 
         conn = _open_db(root)
         try:
-            agent_class = get_agent_class(settings.adapter)
-            agent = agent_class(settings)
+            # G0/R1: registry presence + backend-family validation happen
+            # here; harness adapters additionally resolve their ExecutionGrant
+            # inside run() before any process spawns.
+            agent = build_agent(provider, settings, agent_cfg, workspace_root=root)
             store = SqliteRelayStore(conn)
             writer = EventLogWriter(conn)
             request = AgentRequest(prompt=prompt, role=role)
             outcome = asyncio.run(run_ask(store, writer, agent, request, model=settings.model))
         finally:
             conn.close()
-    except (ConfigError, AgentError, AgentNotConfigured) as exc:
+    except (ConfigError, AgentError, AgentNotConfigured, UnknownAgentError) as exc:
         _out().print(f"[red]ERROR[/red] {exc}")
         raise typer.Exit(code=1) from exc
 

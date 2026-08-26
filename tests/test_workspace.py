@@ -4,8 +4,10 @@ Phase 1 contract under test:
 
 * ``ProjectProfile`` mirrors SPEC §13 exactly — discovered facts only, no
   provider/model/backend fields ever.
-* ``relay.yaml`` is backend-aware: api entries execute, harness entries parse
-  but refuse with an explicit Phase 2 pointer — never silently ignored.
+* ``relay.yaml`` is backend-aware: api entries execute; harness entries parse
+  first-class (with an optional non-secret ``harness:`` profile) and admit
+  adapters through the registry — presence plus backend-family match decide
+  executability, never a hardcoded phase pointer (G0/R1, App. C.1).
 * ``relay init`` is idempotent: canonical-path identity, one Workspace row,
   same id across re-inits, profile refreshed.
 """
@@ -15,6 +17,7 @@ import pytest
 import yaml
 
 from relay.agents.base import AgentRole, BackendType
+from relay.agents.registry import UnknownAgentError, get_agent_class
 from relay.context import (
     ConfigError,
     agent_config,
@@ -23,7 +26,6 @@ from relay.context import (
     initialize_workspace,
     load_config,
     load_profile,
-    require_api_backed,
     workspace_layout,
 )
 from relay.storage import connect, migrate
@@ -106,14 +108,26 @@ class TestRelayYamlConfig:
         assert config.agents["codex"].backend is BackendType.HARNESS
         assert config.agents["claude"].adapter == "claude_code"
 
-    def test_harness_entry_refuses_to_execute(self, tmp_path):
+    def test_api_backend_cannot_carry_harness_block(self, tmp_path):
+        """Family/field coherence: 'harness:' demands backend: harness."""
+        (tmp_path / "relay.yaml").write_text(
+            "agents:\n"
+            "  wrong: {backend: api, adapter: openai, harness: {timeout_seconds: 5}}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="'harness:' block requires"):
+            load_config(tmp_path)
+
+    def test_unregistered_harness_adapter_names_the_adapter(self, tmp_path):
+        """G0/R1: registry absence fails explicitly naming the adapter."""
         (tmp_path / "relay.yaml").write_text(
             "agents:\n  codex: {backend: harness, adapter: codex_cli}\n",
             encoding="utf-8",
         )
-        agent = agent_config(load_config(tmp_path), "codex")
-        with pytest.raises(ConfigError, match="harness runtime arrives in Phase 2"):
-            require_api_backed("codex", agent)
+        agent_cfg = agent_config(load_config(tmp_path), "codex")
+        assert agent_cfg.backend is BackendType.HARNESS
+        with pytest.raises(UnknownAgentError, match="codex_cli"):
+            get_agent_class("codex_cli")
 
     def test_unknown_agent_lists_knowns(self, tmp_path):
         (tmp_path / "relay.yaml").write_text(

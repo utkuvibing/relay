@@ -9,7 +9,6 @@ from relay.context.config import (
     agent_config,
     default_config,
     load_config,
-    require_api_backed,
 )
 from relay.context.workspace import (
     ProjectProfile,
@@ -37,7 +36,6 @@ __all__ = [
     "initialize_workspace",
     "load_config",
     "load_profile",
-    "require_api_backed",
     "save_profile",
     "workspace_layout",
 ]

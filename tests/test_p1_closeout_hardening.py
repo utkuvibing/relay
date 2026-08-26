@@ -18,7 +18,6 @@ from relay.storage.events import EventLogWriter
 from relay.storage.models import EventType, RunStatus
 from relay.storage.store import SqliteRelayStore
 
-
 API_KEY = "sk-closeout-secret"
 
 

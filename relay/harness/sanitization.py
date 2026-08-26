@@ -64,10 +64,11 @@ def _home_prefixes(home: str | None) -> list[str]:
         try:
             norm = os.path.normpath(os.path.expanduser(prefix))
         except Exception:  # noqa: BLE001 - redaction must never raise
-            continue
-        if len(norm) > 2 and not norm.endswith(os.sep):
-            norm += os.sep
-        normalized.append(norm)
+            norm = ""  # unexpandable entry contributes nothing
+        if len(norm) > 2:
+            if not norm.endswith(os.sep):
+                norm += os.sep
+            normalized.append(norm)
     # Longest first so overlapping prefixes collapse to one mask.
     return sorted(set(normalized), key=len, reverse=True)
 
@@ -75,15 +76,12 @@ def _home_prefixes(home: str | None) -> list[str]:
 def _shorten_paths(text: str, home: str | None) -> str:
     result = text
     for prefix in _home_prefixes(home):
-        if prefix.lower() in result.lower():
-            # Lambda replacement: raw strings in ``repl`` are re-parsed for
-            # backreference escapes (a trailing '\' becomes "bad escape").
-            result = re.sub(
-                re.escape(prefix),
-                lambda match: "~" + ("/" if "/" in prefix else "\\"),
-                result,
-                flags=re.IGNORECASE,
-            )
+        if prefix.lower() not in result.lower():
+            continue
+        pattern = re.compile(re.escape(prefix), re.IGNORECASE)
+        # Default-arg binding closes over THIS prefix (B023).
+        replacement = lambda _match, p=prefix: "~" + ("/" if "/" in p else "\\")
+        result = pattern.sub(replacement, result)
     return result
 
 

@@ -96,15 +96,15 @@ class TestAuthStateAndFacts:
 class TestProcessOutcomeTypes:
     @staticmethod
     def _outcome(**overrides):
-        base = dict(
-            exit_code=0,
-            timed_out=False,
-            cancelled=False,
-            stdout=StreamCapture(text="out"),
-            stderr=StreamCapture(text=""),
-            duration_s=0.01,
-            semantics=ExitSemantics.OK,
-        )
+        base = {
+            "exit_code": 0,
+            "timed_out": False,
+            "cancelled": False,
+            "stdout": StreamCapture(text="out"),
+            "stderr": StreamCapture(text=""),
+            "duration_s": 0.01,
+            "semantics": ExitSemantics.OK,
+        }
         base.update(overrides)
         return ProcessOutcome(**base)
 

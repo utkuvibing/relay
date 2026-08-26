@@ -107,7 +107,7 @@ def _record(report, name, clause, condition, detail=""):
 async def _capture_error(awaitable, *expected):
     try:
         await awaitable
-    except expected as exc:  # noqa: BLE001 - deliberate capture boundary
+    except expected as exc:
         return exc
     return None
 
@@ -569,7 +569,7 @@ def _case_b11_unsupported(report, factory, root):
         _record(report, "B11 unsupported capabilities raise explicitly", "C.3/G0",
                 True, "adapter declares every capability — nothing to refuse")
         return
-    required = sorted(missing, key=lambda cap: cap.value)[0]
+    required = min(missing, key=lambda cap: cap.value)
 
     try:
         agent.requires(required)
@@ -640,6 +640,6 @@ def _case_b13_missing_grant(report, factory, root):
 def _capture_type(callable_, exception_type):
     try:
         callable_()
-    except exception_type as exc:  # noqa: BLE001
+    except exception_type as exc:
         return exc
     return None

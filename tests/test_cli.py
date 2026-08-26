@@ -12,12 +12,16 @@ Covered contracts:
 * Crash path: provider failure after Tx 1 ⇒ FAILED run whose prompt stays
   recoverable from the run_input artifact (B.1).
 * Init idempotence: one Workspace row, same id, history preserved.
-* Harness entries refuse with the Phase 2 pointer; never silently ignored.
+* Harness agents route through the generic runtime; unregistered adapters
+  fail by name; registered fakes run end-to-end via the test-only transient
+  seam without touching the production registry (G0/R1, App. C.1).
 * Secret hygiene: the key never lands in DB bytes or CLI output (App. B.3).
 """
 
 import itertools
 import json
+import sys
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -25,6 +29,7 @@ import pytest
 from typer.testing import CliRunner
 
 import relay.agents.openai as openai_mod
+from relay.agents import transient_adapters
 from relay.cli.main import app
 from relay.storage import connect
 from relay.storage.events import EventLogWriter
@@ -221,7 +226,8 @@ class TestInitIdempotenceCLI:
 
 
 class TestHarnessRefusal:
-    def test_harness_agent_errors_with_phase2_pointer(self, workspace):
+    def test_harness_agent_errors_naming_the_missing_adapter(self, workspace):
+        """G0/R1: unregistered harness adapters fail explicitly, by name."""
         (workspace / "relay.yaml").write_text(
             "agents:\n  codex: {backend: harness, adapter: codex_cli}\n",
             encoding="utf-8",
@@ -229,10 +235,72 @@ class TestHarnessRefusal:
         runner.invoke(app, ["init"])
         result = runner.invoke(app, ["ask", "codex", "make a change"])
         assert result.exit_code == 1
-        # rich wraps long lines, so assert on the wording, not a contiguous string.
-        assert "harness-backed" in result.output
-        assert "Phase 2" in result.output
+        # rich wraps long lines, so assert on wording fragments, not strings.
+        assert "unknown agent adapter" in result.output
         assert "codex_cli" in result.output
+
+    def test_backend_family_mismatch_is_a_config_error(self, workspace):
+        """R1#1: api-declared agent + harness-routed adapter cannot wire."""
+        (workspace / "relay.yaml").write_text(
+            "agents:\n"
+            "  impostor: {backend: api, adapter: c7_echo}\n",
+            encoding="utf-8",
+        )
+        runner.invoke(app, ["init"])
+
+        from relay.harness.capabilities import HarnessCapability
+        from relay.harness.runtime import HarnessAgent as _HarnessAgent
+
+        class _C7Echo(_HarnessAgent):
+            name = "c7_echo"
+            capabilities = frozenset({HarnessCapability.READ_ONLY_ACCESS})
+
+            def invocation_argv(self, resolved):
+                return (resolved.command, "-c", "print('unused')")
+
+        with transient_adapters({"c7_echo": _C7Echo}):
+            result = runner.invoke(app, ["ask", "impostor", "x"])
+        assert result.exit_code == 1
+        # rich wraps long lines — assert fragments, never one long string.
+        assert "executes as" in result.output
+        assert "'harness'" in result.output
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+
+    def test_harness_agent_end_to_end_via_transient_registration(self, workspace):
+        """Full ask-flow through the generic runtime using a registered fake.
+
+        The fake NEVER enters AGENTS (G0#3); executable_path comes from
+        relay.yaml's non-secret profile; the prompt rides stdin.
+        """
+        from relay.harness.capabilities import HarnessCapability
+        from relay.harness.runtime import HarnessAgent as _HarnessAgent
+
+        py = Path(sys.executable).as_posix()
+        (workspace / "relay.yaml").write_text(
+            "agents:\n"
+            f"  echoh: {{backend: harness, adapter: c7_echo, "
+            f"harness: {{executable_path: '{py}', timeout_seconds: 20}}}}\n",
+            encoding="utf-8",
+        )
+        runner.invoke(app, ["init"])
+
+        class _C7Echo(_HarnessAgent):
+            name = "c7_echo"
+            capabilities = frozenset({HarnessCapability.READ_ONLY_ACCESS})
+
+            def invocation_argv(self, resolved):
+                return (
+                    resolved.command,
+                    "-c",
+                    "import sys; sys.stdout.write('c7echo:' + sys.stdin.read())",
+                )
+
+        with transient_adapters({"c7_echo": _C7Echo}):
+            result = runner.invoke(
+                app, ["ask", "echoh", "ping-marker"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "c7echo:ping-marker" in result.output
 
     def test_unknown_agent_lists_knowns(self, workspace):
         runner.invoke(app, ["init"])

@@ -86,7 +86,7 @@ class ProcessOutcome:
     stdout: StreamCapture
     stderr: StreamCapture
     duration_s: float
-    semantics: "ExitSemantics"
+    semantics: ExitSemantics
 
 
 class ExitSemantics(str, enum.Enum):

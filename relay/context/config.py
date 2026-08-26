@@ -18,11 +18,6 @@ from relay.harness.types import ExecutionGrantKind
 DEFAULT_AGENT_NAME = "gpt"
 DEFAULT_MODEL = "gpt-4o-mini"
 
-_HARNESS_UNAVAILABLE = (
-    "agent '{name}' is harness-backed (adapter '{adapter}'); "
-    "the harness runtime arrives in Phase 2 (Codex CLI / local tool runtime)"
-)
-
 _MAX_HARNESS_TIMEOUT_S = 3600
 
 
@@ -62,7 +57,7 @@ class AgentConfig(BaseModel):
     harness: HarnessAgentConfig | None = None
 
     @model_validator(mode="after")
-    def _enforce_family_fields(self) -> "AgentConfig":
+    def _enforce_family_fields(self) -> AgentConfig:
         if self.backend is BackendType.API and self.harness is not None:
             raise ValueError("'harness:' block requires 'backend: harness'")
         return self
@@ -121,8 +116,3 @@ def agent_config(config: RelayConfig, name: str) -> AgentConfig:
         return config.agents[name]
     known = ", ".join(sorted(config.agents)) or "(none configured)"
     raise ConfigError(f"unknown agent '{name}' — configured agents: {known}")
-
-
-def require_api_backed(name: str, agent: AgentConfig) -> None:
-    if agent.backend is BackendType.HARNESS:
-        raise ConfigError(_HARNESS_UNAVAILABLE.format(name=name, adapter=agent.adapter))

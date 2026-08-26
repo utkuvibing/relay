@@ -29,10 +29,16 @@ import os
 from pathlib import Path
 
 from relay.agents.base import Agent, AgentRequest, AgentResponse, BackendType
-from relay.agents.errors import AgentError
 from relay.agents.config import AgentSettings
+from relay.agents.errors import AgentError
 from relay.context.config import HarnessAgentConfig
 from relay.harness.capabilities import HarnessCapability, ensure
+from relay.harness.discovery import (
+    ResolvedExecutable,
+    describe_version,
+    probe_version,
+    resolve_executable,
+)
 from relay.harness.env_policy import DEFAULT_CONFLICT_VARIABLES, build_child_env
 from relay.harness.errors import (
     HarnessCancelledError,
@@ -42,17 +48,11 @@ from relay.harness.errors import (
     MissingExecutionGrantError,
 )
 from relay.harness.process import LaunchSpec, execute
-from relay.harness.discovery import (
-    ResolvedExecutable,
-    describe_version,
-    probe_version,
-    resolve_executable,
-)
 from relay.harness.sanitization import redact
 from relay.harness.types import (
-    AuthState,
     DEFAULT_OUTPUT_TEXT_CAP_CHARS,
     DEFAULT_STREAM_LIMIT_BYTES,
+    AuthState,
     ExecutionGrant,
     ExecutionGrantKind,
     ExitSemantics,
@@ -353,5 +353,5 @@ class HarnessAgent(Agent):
             raise HarnessCancelledError(f"{self.name}: run cancelled") from exc
         except AgentError:
             raise
-        except Exception as exc:  # noqa: BLE001 - R4: boundary converts ALL
+        except Exception as exc:
             raise self._translate_exception(self.name, exc) from exc

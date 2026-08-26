@@ -20,7 +20,6 @@ from relay.harness.conformance import (
 from relay.harness.errors import HarnessOutputError
 from relay.harness.types import ExitSemantics
 
-
 HETEROGENEOUS_FAKES = [StructuredFakeHarness, ProseFakeHarness]
 
 

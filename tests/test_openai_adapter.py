@@ -155,7 +155,7 @@ class TestRegistry:
 
     def test_unknown_name_lists_knowns(self):
         with pytest.raises(UnknownAgentError, match="known adapters"):
-            get_agent_class("claude_code")  # arrives in Phase 2 — must be explicit
+            get_agent_class("claude_code")  # unregistered until its P2.3 adapter ships
 
 
 class TestSettingsPrecedence:
