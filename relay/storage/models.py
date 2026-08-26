@@ -94,6 +94,15 @@ class Run(BaseModel):
     input_size: int | None = Field(default=None, description="Prompt size in tokens.")
     output_size: int | None = Field(default=None, description="Completion size in tokens.")
     cost_usd: float | None = None
+    #: App. C.6 seam — additive, nullable, provider-neutral harness facts.
+    #: ``model`` stays the REQUESTED model; these report what actually ran.
+    resolved_model: str | None = Field(default=None, description="Model reported by the backend when known.")
+    adapter_version: str | None = Field(default=None, description="Harness binary/version when discovered.")
+    backend: str | None = Field(default=None, description="Execution-family snapshot (api|harness) at run time.")
+    external_session_ref: str | None = Field(
+        default=None,
+        description="NON-SECRET provider continuation handle; C.4 allowlist only.",
+    )
     started_at: datetime = Field(default_factory=utcnow)
     ended_at: datetime | None = None
 

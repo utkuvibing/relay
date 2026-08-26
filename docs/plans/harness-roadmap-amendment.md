@@ -524,3 +524,55 @@ against the plan's gates:
 Non-goals held: no real adapters, no schema migration, no orchestrator or
 P1 behavior changes, zero credential persistence. Suite: 236 passed / 1 skipped;
 ruff clean.
+
+---
+
+## 16. P2.2 execution record
+
+P2.2 (Codex CLI reference adapter + `relay build`, gate G2) was implemented
+on `feat/p2.2-codex-cli-adapter`. Highlights against the plan's gates:
+
+* **Adapter profile** (`relay/agents/codex_cli.py::CodexCLIAdapter`, registry
+  keys `codex_cli`/`codex`): upstream surface verified against official Codex
+  docs at implementation time — `codex exec --json` JSONL events, stdin-only
+  prompt delivery (`-` sentinel), sandbox flag translation
+  (`read-only` / `workspace-write` / workspace-write + network via `-c`),
+  token usage captured from `turn.completed` (cost stays None), conservative
+  exit semantics (0=OK else UNKNOWN; numerics not version-stable upstream),
+  `failure_modes=()` for the same honesty reason.
+* **Env policy (C.4)**: `CODEX_API_KEY` joins the stripped conflict union;
+  `CODEX_HOME` is a deliberate self-whitelist (directory pointer, not a
+  secret) — it must sit in the adapter's conflict set to be resurrectable.
+  Verified: other adapters' children still strip CODEX_HOME.
+* **App. C.6 seam shipped as SCHEMA_VERSION 2**: four nullable ADD COLUMNs on
+  `runs` (`resolved_model`, `adapter_version`, `backend`,
+  `external_session_ref`); fresh v1 DBs upgrade in place preserving rows;
+  observation mapping leaves api-backed runs byte-identical (no observation ⇒
+  no change). `external_session_ref` always persisted NULL in P2.2 (C.4 opt-in
+  does not exist yet); `thread_id` parsed but not stored.
+* **Auth probe (Q4 resolution)**: `codex login status` output classified into
+  AuthState enum and discarded — no quota, no credential extraction;
+  probe failures map to UNKNOWN.
+* **Offline conformance**: codex-shaped fixture child + a `_CodexHooks`
+  carrier REUSES the real adapter's parser/grant/env declarations through the
+  identical B01–B13 battery; negative control proves a lying profile fails
+  B05. Live smoke exists but is doubly gated (`RELAY_RUN_LIVE_TESTS=1` +
+  discoverable codex); CI cannot activate it (no secrets wired).
+* **G2 closed by `relay build`**: task row + TASK_CREATED → crash-safe
+  run_ask spine → observed JSONL item events recorded as sanitized ToolRun
+  rows (TOOL_COMPLETED) → Relay-owned post-run diff via gated
+  `git add -N`/`git diff HEAD` (intent-to-add so new harness files appear,
+  .relay/relay.yaml excluded) saved as DIFF artifact (ARTIFACT_CREATED) →
+  IMPLEMENTATION_PRODUCED evidence with run provenance. TESTS_PASSED is not
+  minted anywhere (Q3 default NO held). Clean-tree refusal ignores untracked
+  files (init artifacts), refuses modified tracked content only.
+* **G4/G5 re-proven**: B11 typed-refusal and B07/B08 auth-conflict checks ran
+  green against the codex profile via the battery.
+
+Verification at implementation time: full offline suite green
+(see commit message for exact counts); hygiene audit asserts decoy key shapes
+absent from DB/WAL bytes on a polluted parent environment.
+
+Known deferred: worktree-containment mode (clean-tree refusal suffices for
+the reference slice), session-resume consumption (P7 seam), proxy-variable
+whitelisting for network grants (needs explicit C.4 note first).

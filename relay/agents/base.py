@@ -67,6 +67,23 @@ class AgentRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class RunObservation(BaseModel):
+    """Provider-neutral facts a backend reported about its own execution.
+
+    App. C.6 seam: additive, nullable, allowlist-shaped. Field names are
+    deliberately restricted to the C.4/C.6 vocabulary; nothing secret-shaped
+    may ride here (enforced by the persisted-vocabulary hygiene tests).
+    """
+
+    resolved_model: str | None = None
+    adapter_version: str | None = None
+    backend: BackendType | str | None = None
+    external_session_ref: str | None = Field(
+        default=None,
+        description="NON-SECRET continuation handle only when config opts in.",
+    )
+
+
 class AgentResponse(BaseModel):
     """Structured result of one agent run."""
 
@@ -78,6 +95,8 @@ class AgentResponse(BaseModel):
     #: References to artifacts produced during the run (plans, diffs, findings).
     artifact_refs: list[str] = Field(default_factory=list)
     usage: TokenUsage | None = None
+    #: Optional execution observation (harness runs report what actually ran).
+    observation: RunObservation | None = None
 
 
 class Agent(abc.ABC):

@@ -28,7 +28,14 @@ import json
 import os
 from pathlib import Path
 
-from relay.agents.base import Agent, AgentRequest, AgentResponse, BackendType
+from relay.agents.base import (
+    Agent,
+    AgentRequest,
+    AgentResponse,
+    BackendType,
+    RunObservation,
+    TokenUsage,
+)
 from relay.agents.config import AgentSettings
 from relay.agents.errors import AgentError
 from relay.context.config import HarnessAgentConfig
@@ -232,6 +239,21 @@ class HarnessAgent(Agent):
             combined += "\n" + redact(stderr_text.strip())
         return combined
 
+    # -- observation seam (App. C.6) ------------------------------------------
+
+    def response_usage(self) -> TokenUsage | None:
+        """Token usage observed during the last parse; default: none."""
+        return None
+
+    def run_observation(self) -> RunObservation | None:
+        """Allowlist-shaped facts about what actually ran; default: none.
+
+        Real adapters override this to surface C.4-allowlisted harness facts
+        (discovered version, declared auth mode/state). Returning ``None``
+        keeps a run byte-identical to its pre-C.6 shape.
+        """
+        return None
+
     # -- execution ---------------------------------------------------------------
 
     def _prepared_cwd(self) -> Path:
@@ -330,7 +352,13 @@ class HarnessAgent(Agent):
                 output[:DEFAULT_OUTPUT_TEXT_CAP_CHARS]
                 + "\n…[output truncated by Relay]"
             )
-        return AgentResponse(agent=self.name, role=request.role, output=output)
+        return AgentResponse(
+            agent=self.name,
+            role=request.role,
+            output=output,
+            usage=self.response_usage(),
+            observation=self.run_observation(),
+        )
 
     @staticmethod
     def _translate_exception(agent_name: str, exc: Exception) -> AgentError:

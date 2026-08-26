@@ -175,6 +175,115 @@ def ask(
 
 
 @app.command()
+def build(
+    prompt: str = typer.Argument(..., help="What to implement, in quotes."),
+    agent: str | None = typer.Option(
+        None, "--agent", help="Configured harness agent to implement with (default: auto-select)."
+    ),
+    model: str | None = typer.Option(None, "--model", help="Model override (CLI wins)."),
+) -> None:
+    """Implement a change via a configured harness agent; persist diff + evidence."""
+    from relay.cli.render import build_result
+    from relay.core.orchestrator import BuildRefusal, run_build
+    from relay.storage.models import EventLogEntry, EventType, Task
+    from relay.storage.store import SqliteEvidenceStore
+
+    root = Path.cwd()
+    try:
+        config = load_config(root)
+        conn = _open_db(root)
+        try:
+            store = SqliteRelayStore(conn)
+            writer = EventLogWriter(conn)
+
+            if not _worktree_is_clean(root):
+                _out().print(
+                    "[red]ERROR[/red] working tree has uncommitted changes — "
+                    "commit or stash them first (diff integrity)"
+                )
+                raise typer.Exit(code=1)
+
+            candidates = _harness_implementer_candidates(config, store, conn, root)
+            chosen_name = agent or _select_implementer(candidates)
+            agent_cfg = agent_config(config, chosen_name)
+            settings = resolve_settings(cli=CliOverrides(model=model), yaml_agent=agent_cfg)
+            implementer = build_agent(chosen_name, settings, agent_cfg, workspace_root=root)
+
+            task = Task(title=prompt[:200])
+            store.save_model(task)
+            writer.record(
+                EventLogEntry(
+                    type=EventType.TASK_CREATED,
+                    content=f"task created for build: {task.title}",
+                    references=[f"task:{task.id}"],
+                )
+            )
+
+            request = AgentRequest(prompt=prompt, role=AgentRole.IMPLEMENTER, task_id=task.id)
+            outcome = asyncio.run(
+                run_build(
+                    store,
+                    writer,
+                    SqliteEvidenceStore(store),
+                    implementer,
+                    request,
+                    workspace_root=root,
+                    model=settings.model,
+                    agent_name=chosen_name,
+                )
+            )
+        finally:
+            conn.close()
+    except (
+        ConfigError,
+        AgentError,
+        AgentNotConfigured,
+        UnknownAgentError,
+        BuildRefusal,
+    ) as exc:
+        _out().print(f"[red]ERROR[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    build_result(task=outcome.task, outcome=outcome)
+
+
+def _worktree_is_clean(root: Path) -> bool:
+    """Refuse builds whose *tracked* content diverges from HEAD."""
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0 and not result.stdout.strip()
+
+
+def _harness_implementer_candidates(config, store, conn, root) -> list[str]:
+    """Configured agents whose adapter executes as HARNESS (family-blind)."""
+    names = []
+    for name, agent_cfg in config.agents.items():
+        if agent_cfg.backend.value != "harness":
+            continue
+        names.append(name)
+    return sorted(names)
+
+
+def _select_implementer(candidates: list[str]) -> str:
+    if not candidates:
+        raise ConfigError(
+            "no harness-backed agent is configured — add one to relay.yaml, e.g.\n"
+            "agents:\n"
+            "  codex: {backend: harness, adapter: codex_cli}"
+        )
+    if len(candidates) > 1:
+        listed = ", ".join(candidates)
+        raise ConfigError(f"multiple harness agents configured — pick one with --agent: {listed}")
+    return candidates[0]
+
+
+@app.command()
 def status() -> None:
     """Show workspace state and whether each agent is configured."""
     from relay.cli.render import status as render_status
