@@ -24,7 +24,7 @@ relay why 18
 
 | Phase | Scope | State |
 |---|---|---|
-| P0 | Specification freeze — core abstractions in code | ✅ |
+| P0 | Specification freeze — core abstractions in code | ✅ hardened |
 | P1 | Single-agent runtime (`relay init`, `relay ask`, SQLite) | ⬜ |
 | P2 | Codex / local tool runtime | ⬜ |
 | P3+ | See SPEC §27 roadmap | ⬜ |

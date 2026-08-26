@@ -1,17 +1,27 @@
 """Deterministic task lifecycle owned by Relay — never by an LLM.
 
-SPEC reference: §6 (State Machine), §33 (Success Criteria — Reliability).
+SPEC reference: §6 (State Machine), §33 (Reliability); Appendix A (hardening).
+
+Two pillars:
+
+* **Evidence, not claims.** The machine accepts NO evidence arguments from
+  callers. It reads provenance-backed ``EvidenceRecord`` objects from the
+  ``EvidenceStore`` it is bound to at construction. An ``EvidenceKind``
+  enum in an agent's hand is a claim; only a stored record is proof.
+
+* **Policy-gated completion.** Human approval is mandatory only when policy
+  requires it; the direct ``REVIEWING -> DONE`` path still demands review +
+  verification evidence and proof that no approvals are pending.
 
 A model saying "everything is complete" carries zero authority here.
-A transition is granted only when the edge exists AND every piece of
-evidence it requires has actually been produced and recorded.
 """
 
 from __future__ import annotations
 
 import enum
-from collections.abc import Iterable
 from dataclasses import dataclass
+
+from relay.core.evidence import EvidenceKind, EvidenceStore
 
 
 class TaskState(str, enum.Enum):
@@ -28,19 +38,16 @@ class TaskState(str, enum.Enum):
     DONE = "done"
 
 
-class EvidenceKind(str, enum.Enum):
-    """Verification artifacts Relay must hold before granting a transition.
-
-    These correspond to hard gates (SPEC §6): tests pass, review passes,
-    required approvals granted. An agent's claim is not evidence.
-    """
-
-    CONTEXT_COLLECTED = "context_collected"
-    PLAN_PRODUCED = "plan_produced"
-    IMPLEMENTATION_PRODUCED = "implementation_produced"
-    TESTS_PASSED = "tests_passed"
-    REVIEW_PASSED = "review_passed"
-    APPROVAL_GRANTED = "approval_granted"
+# Re-exported for backward compatibility with Phase 0 consumers.
+__all__ = [
+    "EvidenceKind",
+    "IllegalTransitionError",
+    "MissingEvidenceError",
+    "StateMachineError",
+    "TaskState",
+    "TaskStateMachine",
+    "Transition",
+]
 
 
 @dataclass(frozen=True)
@@ -70,18 +77,34 @@ TRANSITIONS: dict[TaskState, tuple[Transition, ...]] = {
     ),
     # FAIL → back to implementation (SPEC §6 diagram).
     TaskState.VERIFYING: (
+        # Entering review demands recorded test proof.
         Transition(TaskState.REVIEWING, frozenset({EvidenceKind.TESTS_PASSED})),
         Transition(TaskState.IMPLEMENTING),
     ),
     # FIX_REQUIRED → back to implementation (SPEC §6 diagram).
     TaskState.REVIEWING: (
+        # Gated path: a human must explicitly approve.
         Transition(
             TaskState.APPROVAL_REQUIRED,
             frozenset({EvidenceKind.REVIEW_PASSED}),
         ),
+        # Direct path (SPEC Appendix A.3): allowed only when policy needs no
+        # human sign-off — and even then it demands full verification:
+        # recorded tests + recorded review + relay-attested empty approval queue.
+        Transition(
+            TaskState.DONE,
+            frozenset(
+                {
+                    EvidenceKind.TESTS_PASSED,
+                    EvidenceKind.REVIEW_PASSED,
+                    EvidenceKind.NO_PENDING_APPROVALS,
+                }
+            ),
+        ),
         Transition(TaskState.IMPLEMENTING),
     ),
-    # No task closes without explicit approval evidence.
+    # Gated completion: no task closes without explicit human approval
+    # recorded as evidence produced by `human:*`.
     TaskState.APPROVAL_REQUIRED: (
         Transition(TaskState.DONE, frozenset({EvidenceKind.APPROVAL_GRANTED})),
     ),
@@ -103,7 +126,7 @@ class IllegalTransitionError(StateMachineError):
 
 
 class MissingEvidenceError(StateMachineError):
-    """The edge exists but required verification evidence is absent."""
+    """The edge exists but trusted evidence for its gates is not in the store."""
 
     def __init__(
         self,
@@ -116,19 +139,37 @@ class MissingEvidenceError(StateMachineError):
         self.missing = missing
         names = ", ".join(sorted(e.value for e in missing))
         super().__init__(
-            f"Transition {current.value} -> {target.value} blocked, missing evidence: {names}"
+            f"Transition {current.value} -> {target.value} blocked, "
+            f"missing stored evidence: {names}"
         )
 
 
 class TaskStateMachine:
     """Per-task guard over the transition table.
 
-    Holds the current state and grants or refuses transitions based on
-    recorded evidence — never on agent claims.
+    Bound to one ``task_id`` and one trusted ``EvidenceStore``. Transitions
+    are granted only when every piece of evidence an edge requires has been
+    *recorded in the store for this task* — never because a caller passed
+    enum values around.
+
+    The rework loops VERIFYING → IMPLEMENTING and REVIEWING → IMPLEMENTING
+    stay ungated so tests-failed / fix-required cycles are always available.
     """
 
-    def __init__(self, state: TaskState = TaskState.CREATED) -> None:
+    def __init__(
+        self,
+        *,
+        task_id: str,
+        store: EvidenceStore,
+        state: TaskState = TaskState.CREATED,
+    ) -> None:
+        self._task_id = task_id
+        self._store = store
         self._state = state
+
+    @property
+    def task_id(self) -> str:
+        return self._task_id
 
     @property
     def state(self) -> TaskState:
@@ -138,34 +179,54 @@ class TaskStateMachine:
     def is_terminal(self) -> bool:
         return not TRANSITIONS[self._state]
 
+    @property
+    def store(self) -> EvidenceStore:
+        return self._store
+
     def available_transitions(self) -> tuple[Transition, ...]:
         return TRANSITIONS[self._state]
 
-    def can_advance(self, target: TaskState, evidence: Iterable[EvidenceKind] = ()) -> bool:
+    def transition(self, target: TaskState) -> Transition:
+        """Move to ``target`` if the edge is legal and the store holds proof."""
+        edge = self._resolve(target)
+        self._state = target
+        return edge
+
+    def can_transition(self, target: TaskState) -> bool:
+        """Pure check — reports feasibility without mutating state."""
         try:
-            self._check(target, evidence)
+            self._resolve(target)
             return True
         except StateMachineError:
             return False
 
-    def advance(
-        self,
-        target: TaskState,
-        evidence: Iterable[EvidenceKind] = (),
-    ) -> TaskState:
-        """Move to ``target`` if the edge is legal and evidence suffices."""
-        self._check(target, evidence)
-        self._state = target
-        return self._state
+    def missing_evidence_for(self, target: TaskState) -> set[EvidenceKind]:
+        """Which kinds of stored evidence still block this edge?
 
-    def _check(self, target: TaskState, evidence: Iterable[EvidenceKind]) -> Transition:
+        Raises only ``IllegalTransitionError`` (no such edge); an existing
+        but blocked edge yields its gap set instead of raising.
+        """
+        edge = self._lookup_edge(target)
+        return set(edge.required_evidence) - self._recorded_kinds()
+
+    def _resolve(self, target: TaskState) -> Transition:
+        edge = self._lookup_edge(target)
+        missing = edge.required_evidence - self._recorded_kinds()
+        if missing:
+            raise MissingEvidenceError(self._state, target, missing)
+        return edge
+
+    def _lookup_edge(self, target: TaskState) -> Transition:
         candidates = [t for t in TRANSITIONS[self._state] if t.target is target]
         if not candidates:
             raise IllegalTransitionError(self._state, target)
+        return candidates[0]
 
-        transition = candidates[0]
-        held = set(evidence)
-        missing = transition.required_evidence - held
-        if missing:
-            raise MissingEvidenceError(self._state, target, missing)
-        return transition
+    def _recorded_kinds(self) -> frozenset[EvidenceKind]:
+        # Defense in depth: filter by task binding client-side too, so a
+        # misbehaving custom store cannot leak cross-task evidence in.
+        return frozenset(
+            record.kind
+            for record in self._store.records_for_task(self._task_id)
+            if record.task_id == self._task_id
+        )

@@ -1,5 +1,9 @@
-"""Domain records: the vocabulary Relay persists (SPEC §5/§14/§15)."""
+"""Domain records: the vocabulary Relay persists (SPEC §5/§14/§15; App. A)."""
 
+import pytest
+from pydantic import ValidationError
+
+from relay.core.evidence import EvidenceKind
 from relay.core.permissions import Action
 from relay.core.state_machine import TaskState
 from relay.storage.models import (
@@ -8,6 +12,8 @@ from relay.storage.models import (
     Decision,
     DecisionStatus,
     EventLogEntry,
+    EventType,
+    EvidenceRecord,
     Message,
     MessageType,
     Room,
@@ -95,12 +101,89 @@ class TestMessageAndEventLog:
             task_id="m5-1-3",
             sender="claude",
             recipient="codex",
-            type=MessageType.REVIEW_FINDING,
+            type=EventType.MESSAGE_SENT,
             content="Missing pagination guard.",
             references=["src/foo.py:42-71"],
         )
         assert entry.sequence is None  # store assigns it on insert
         assert entry.references == ["src/foo.py:42-71"]
+
+
+class TestSystemEventsAreDistinctFromConversation:
+    """App. A.2: the event log speaks system vocabulary; MessageType stays conversational."""
+
+    def test_event_type_covers_required_system_events(self):
+        required = {
+            "TASK_CREATED",
+            "STATE_TRANSITIONED",
+            "AGENT_RUN_STARTED",
+            "AGENT_RUN_FINISHED",
+            "MESSAGE_SENT",
+            "ARTIFACT_CREATED",
+            "EVIDENCE_RECORDED",
+            "TOOL_REQUESTED",
+            "TOOL_COMPLETED",
+            "APPROVAL_REQUESTED",
+            "APPROVAL_GRANTED",
+            "APPROVAL_REJECTED",
+            "DECISION_PROPOSED",
+            "DECISION_ACCEPTED",
+            "DECISION_REJECTED",
+        }
+        assert required <= {event.name for event in EventType}
+
+    def test_event_and_message_vocabularies_are_disjoint(self):
+        event_values = {event.value for event in EventType}
+        message_values = {message.value for message in MessageType}
+        assert event_values.isdisjoint(message_values)
+
+    def test_message_type_covers_conversation_semantics(self):
+        conversational = {"opinion", "challenge", "rebuttal", "final_position", "synthesis"}
+        assert conversational <= {m.value for m in MessageType}
+
+    def test_event_log_rejects_message_types(self):
+        with pytest.raises(ValidationError):
+            EventLogEntry(
+                room_id="r1",
+                sender="claude",
+                recipient="deepseek",
+                type=MessageType.CHALLENGE,  # conversation enum in a system slot
+                content="...",
+            )
+
+
+class TestEvidenceRecord:
+    def test_ids_timestamps_and_producer_auto_contract(self):
+        record = EvidenceRecord(
+            kind=EvidenceKind.TESTS_PASSED,
+            task_id="t1",
+            tool_run_id="tool-pytest",
+            produced_by="relay:test-runner",
+        )
+        assert record.id
+        assert record.created_at.tzinfo is not None
+        assert record.run_id is None and record.artifact_id is None
+
+    def test_records_are_frozen(self):
+        record = EvidenceRecord(kind=EvidenceKind.CONTEXT_COLLECTED, task_id="t1", produced_by="relay")
+        with pytest.raises(ValidationError):
+            record.task_id = "t2"  # type: ignore[misc]
+
+    def test_producer_is_required(self):
+        with pytest.raises(ValidationError):
+            EvidenceRecord(kind=EvidenceKind.CONTEXT_COLLECTED, task_id="t1")  # type: ignore[call-arg]
+
+    def test_roundtrips_through_json_with_kind_and_linkage(self):
+        record = EvidenceRecord(
+            kind=EvidenceKind.REVIEW_PASSED,
+            task_id="t1",
+            run_id="run-review",
+            produced_by="agent:claude",
+        )
+        restored = EvidenceRecord.model_validate_json(record.model_dump_json())
+        assert restored == record
+        assert restored.kind is EvidenceKind.REVIEW_PASSED
+        assert restored.run_id == "run-review"
 
 
 class TestRunObservability:

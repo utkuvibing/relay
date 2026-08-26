@@ -14,7 +14,7 @@ from __future__ import annotations
 import enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Action(str, enum.Enum):
@@ -79,7 +79,16 @@ class PermissionDecision(BaseModel):
 
 
 class PermissionGate:
-    """Single choke point through which every tool call must pass."""
+    """Single choke point through which every tool call must pass.
+
+    Binding invariant for Phase 2+ (SPEC §17/§19): all future tool
+    execution takes exactly ONE public path — ``PermissionGate.check()``.
+    Executors may act only on outcome ``allow``; ``needs_approval`` blocks
+    until a human records an :class:`~relay.storage.models.Approval`;
+    ``never`` is unconditional. No tool runner may bypass, wrap around, or
+    pre-execute before the gate. The Phase 2 executor must be built on
+    this contract, not beside it.
+    """
 
     def __init__(self, policies: dict[Action, Policy] | None = None) -> None:
         #: Overrides win over defaults; unspecified actions keep secure defaults.
@@ -95,3 +104,27 @@ class PermissionGate:
             policy=policy,
             outcome=_OUTCOME_BY_POLICY[policy],  # type: ignore[arg-type]
         )
+
+
+class CompletionPolicy(BaseModel):
+    """Whether a reviewed task may finish WITHOUT explicit human approval.
+
+    SPEC §19 intent, made conditional (App. A.3): safe/read-only or
+    policy-approved workflows may complete directly after review; anything
+    else must traverse APPROVAL_REQUIRED and record human approval.
+
+    Secure default: ``require_human_approval=True`` — no task completes
+    without an explicit human decision unless policy explicitly relaxes it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    require_human_approval: bool = True
+
+    def cleared(self, pending_approvals: int) -> bool:
+        """True iff Relay may attest ``NO_PENDING_APPROVALS`` for a task.
+
+        Both conditions are mandatory: policy must not demand a human, AND
+        no approval request may be sitting in the queue.
+        """
+        return not self.require_human_approval and pending_approvals <= 0

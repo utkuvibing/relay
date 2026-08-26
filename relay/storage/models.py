@@ -15,8 +15,9 @@ import enum
 import uuid
 from datetime import UTC, datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from relay.core.evidence import EvidenceKind
 from relay.core.permissions import Action
 from relay.core.state_machine import TaskState
 
@@ -215,8 +216,64 @@ class ToolRun(BaseModel):
     ended_at: datetime | None = None
 
 
+class EventType(str, enum.Enum):
+    """System-history events for the append-only log (SPEC §15, App. A.2).
+
+    Strictly distinct from :class:`MessageType`: this vocabulary describes
+    what Relay's machinery did (state changes, runs, tool calls, approvals,
+    decisions). Conversation content between agents travels on ``Message``
+    with a ``MessageType`` and appears in the log only as a MESSAGE_SENT
+    marker.
+    """
+
+    TASK_CREATED = "task_created"
+    STATE_TRANSITIONED = "state_transitioned"
+    AGENT_RUN_STARTED = "agent_run_started"
+    AGENT_RUN_FINISHED = "agent_run_finished"
+    MESSAGE_SENT = "message_sent"
+    ARTIFACT_CREATED = "artifact_created"
+    EVIDENCE_RECORDED = "evidence_recorded"
+    TOOL_REQUESTED = "tool_requested"
+    TOOL_COMPLETED = "tool_completed"
+    APPROVAL_REQUESTED = "approval_requested"
+    APPROVAL_GRANTED = "approval_granted"
+    APPROVAL_REJECTED = "approval_rejected"
+    DECISION_PROPOSED = "decision_proposed"
+    DECISION_ACCEPTED = "decision_accepted"
+    DECISION_REJECTED = "decision_rejected"
+
+
+class EvidenceRecord(BaseModel):
+    """Immutable proof that verification happened (SPEC §6, App. A.1).
+
+    A ``kind`` value in a caller's hand is a claim; a provenance-backed
+    record inside an ``EvidenceStore`` is proof. Stores refuse records
+    whose kind demands linkage fields (run, tool run) or a producer
+    prefix they may not attest — see ``relay.core.evidence``.
+
+    Frozen: evidence, once recorded, never mutates.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str = Field(default_factory=new_id)
+    kind: EvidenceKind
+    task_id: str
+    run_id: str | None = Field(default=None, description="Agent Run that produced it.")
+    tool_run_id: str | None = Field(default=None, description="ToolRun that produced it.")
+    artifact_id: str | None = Field(default=None, description="Artifact backing it.")
+    produced_by: str = Field(
+        description="Producer identity: 'agent:<name>', 'human:<name>' or 'relay:<component>'.",
+    )
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class EventLogEntry(BaseModel):
-    """Append-only event; history is rebuildable from these (SPEC §15).
+    """Append-only system event; history is rebuildable from these (SPEC §15).
+
+    ``type`` uses the system-level :class:`EventType` vocabulary — never
+    conversation semantics. Agent messages appear here only as
+    MESSAGE_SENT markers pointing at the Message record.
 
     ``sequence`` is assigned by the store on insert, never by callers.
     """
@@ -226,7 +283,7 @@ class EventLogEntry(BaseModel):
     task_id: str | None = None
     sender: str | None = None
     recipient: str | None = None
-    type: MessageType
+    type: EventType
     content: str
     references: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)

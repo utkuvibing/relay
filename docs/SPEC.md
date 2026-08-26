@@ -1794,3 +1794,62 @@ agent babysitting
 ```
 
 olmalıdır.
+
+---
+
+# Appendix A — Phase 0 Hardening Amendments
+
+Normative amendments ratified during Phase 0 hardening. They refine —
+never weaken — the guarantees above.
+
+## A.1 Evidence is first-class (amends §6, §33)
+
+* An `EvidenceKind` value in a caller's hand is a **claim**, not proof.
+* Proof is an immutable `EvidenceRecord` (id, kind, task_id, run_id?,
+  tool_run_id?, artifact_id?, produced_by, created_at) written into an
+  append-only `EvidenceStore`.
+* `TaskStateMachine` is bound to `(task_id, store)` at construction and
+  accepts **no evidence arguments**; transitions resolve gates exclusively
+  from store records scoped to the task.
+* Provenance contract: `TESTS_PASSED` requires `tool_run_id`;
+  `REVIEW_PASSED`, `PLAN_PRODUCED`, and `IMPLEMENTATION_PRODUCED` require
+  `run_id`. Incomplete evidence is rejected at the store boundary.
+* Producer conventions: approval evidence may only be produced by
+  `human:*`; `NO_PENDING_APPROVALS` only by `relay:*`. Agent-authored
+  approval or policy evidence cannot enter the store.
+
+## A.2 System events are distinct from conversation messages (amends §15)
+
+* `EventLogEntry.type` uses a dedicated system vocabulary (`EventType`):
+  task_created, state_transitioned, agent_run_started/finished,
+  message_sent, artifact_created, evidence_recorded, tool_requested/
+  completed, approval_requested/granted/rejected,
+  decision_proposed/accepted/rejected.
+* `MessageType` remains exclusively conversational: opinion, challenge,
+  rebuttal, final_position, synthesis, review_finding.
+* The two vocabularies are disjoint by test. Agent conversation appears
+  in the log only as MESSAGE_SENT markers referencing Message records.
+
+## A.3 Final human approval is policy-driven (amends §6)
+
+Both paths are legal out of REVIEWING:
+
+```text
+REVIEWING → APPROVAL_REQUIRED → DONE   (requires APPROVAL_GRANTED)
+REVIEWING → DONE                       (requires TESTS_PASSED
+                                        + REVIEW_PASSED
+                                        + NO_PENDING_APPROVALS)
+```
+
+* `CompletionPolicy.require_human_approval` defaults to **true**.
+* Relay may attest `NO_PENDING_APPROVALS` only when policy does not
+  demand a human AND no approval request is pending.
+* Safety invariant: if policy requires human approval, DONE is
+  unreachable without explicit `human:*`-produced approval evidence.
+
+## A.4 Tool execution has exactly one public path (amends §17/§19)
+
+Binding for Phase 2+: every tool execution flows through
+`PermissionGate.check()`. Executors act only on outcome `allow`;
+`needs_approval` blocks until a human Approval exists; `never` is
+absolute. No executor may bypass or pre-execute before the gate.

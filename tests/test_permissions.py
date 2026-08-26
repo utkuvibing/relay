@@ -1,8 +1,12 @@
-"""Permission defaults are a security contract (SPEC §18/§19)."""
+"""Permission defaults are a security contract (SPEC §18/§19; App. A.3/A.4)."""
+
+import pytest
+from pydantic import ValidationError
 
 from relay.core.permissions import (
     DEFAULT_POLICIES,
     Action,
+    CompletionPolicy,
     PermissionGate,
     Policy,
     ToolRequest,
@@ -27,6 +31,24 @@ class TestDefaults:
 
     def test_every_action_has_a_policy(self):
         assert set(DEFAULT_POLICIES) == set(Action)
+
+
+class TestCompletionPolicy:
+    """Conditional final approval (App. A.3): secure default, explicit relaxation."""
+
+    def test_default_requires_human_approval(self):
+        policy = CompletionPolicy()
+        assert policy.require_human_approval is True
+        assert policy.cleared(pending_approvals=0) is False
+
+    def test_relaxed_policy_clears_only_when_queue_is_empty(self):
+        policy = CompletionPolicy(require_human_approval=False)
+        assert policy.cleared(pending_approvals=0) is True
+        assert policy.cleared(pending_approvals=1) is False
+
+    def test_policy_is_frozen(self):
+        with pytest.raises(ValidationError):
+            CompletionPolicy().require_human_approval = False  # type: ignore[misc]
 
 
 class TestGateOutcomes:
