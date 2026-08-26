@@ -12,6 +12,10 @@ Relay is not a model. Relay is the layer that:
 - refuses to close a task until verification gates pass.
 
 ```bash
+relay init
+relay ask gpt "Analyze this repository"
+relay status
+relay history
 relay discuss "Should this service use Redis?"
 relay build "Add authentication"
 relay review
@@ -25,9 +29,14 @@ relay why 18
 | Phase | Scope | State |
 |---|---|---|
 | P0 | Specification freeze — core abstractions in code | ✅ hardened |
-| P1 | Single-agent runtime (`relay init`, `relay ask`, SQLite) | ⬜ |
-| P2 | Codex / local tool runtime | ⬜ |
+| P1 | Single-agent runtime (`relay init`, `relay ask`, SQLite) — first **API-backed** runtime (OpenAI-compatible HTTP) per SPEC App. B.4; harness-backed agents (Codex CLI, Claude Code) arrive in Phase 2 | ✅ |
+| P2 | Codex / local tool runtime — first subscription-backed (harness) adapter | ⬜ |
 | P3+ | See SPEC §27 roadmap | ⬜ |
+
+Runs are persisted crash-safely: the prompt lands as a `run_input` artifact
+before any provider call, so it survives failures by construction
+(SPEC App. B.1). Secrets live only in the environment (`OPENAI_API_KEY`);
+`relay status` reports "configured / not configured" and nothing more.
 
 ## Development
 
