@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from relay.agents.base import BackendType
+from relay.harness.types import ExecutionGrantKind
 
 DEFAULT_AGENT_NAME = "gpt"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -21,6 +22,29 @@ _HARNESS_UNAVAILABLE = (
     "agent '{name}' is harness-backed (adapter '{adapter}'); "
     "the harness runtime arrives in Phase 2 (Codex CLI / local tool runtime)"
 )
+
+_MAX_HARNESS_TIMEOUT_S = 3600
+
+
+class HarnessAgentConfig(BaseModel):
+    """Non-secret per-agent harness profile (SPEC §27 P2.1, App. C.2/C.4).
+
+    Everything here is a fact about *how* to invoke the harness binary;
+    credentials stay environment-only (App. B.3) and never appear here.
+    ``grant=None`` means "defer to the adapter default" — an adapter without
+    a default cannot run until config supplies one (G0/R1).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    executable_path: str | None = Field(
+        default=None,
+        description="Explicit binary location; discovery falls back to PATH.",
+    )
+    extra_args: list[str] = Field(default_factory=list)
+    timeout_seconds: float = Field(default=300, gt=0, le=_MAX_HARNESS_TIMEOUT_S)
+    grant: ExecutionGrantKind | None = None
+    auth_probe: bool = True
 
 
 class AgentConfig(BaseModel):
@@ -35,6 +59,13 @@ class AgentConfig(BaseModel):
         default=None,
         description="API-family only; never credentials.",
     )
+    harness: HarnessAgentConfig | None = None
+
+    @model_validator(mode="after")
+    def _enforce_family_fields(self) -> "AgentConfig":
+        if self.backend is BackendType.API and self.harness is not None:
+            raise ValueError("'harness:' block requires 'backend: harness'")
+        return self
 
 
 class RelayConfig(BaseModel):
