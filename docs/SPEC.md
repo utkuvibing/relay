@@ -177,12 +177,21 @@ relay ask claude "Critique this plan"
         ▼                 ▼                    ▼
      Agents             Tools               Storage
         │                 │                    │
-   ┌────┼─────┐      ┌────┼─────┐        SQLite / files
-   │    │     │      │    │     │
- GPT Claude DeepSeek Git Shell GitHub
-          │
-        Codex
+   ┌────┴─────┐      ┌────┼─────┐        SQLite / files
+   │          │      │    │     │
+API-backed  Harness-backed
+adapters    adapters/harnesses
+GPT Claude  Codex CLI · Claude Code · Antigravity CLI
+DeepSeek …  (internal tools run inside the harness,
+             governed by Execution Grants — App. C.5)
 ```
+
+İki execution family vardır (Appendix B.2): API-backed adapter'lar Relay'ın
+çözdüğü environment-only credentials ile model API'lerine konuşur;
+harness-backed adapter'lar kendi authentication'ına sahip CLI process'leridir
+ve iç tool'larını Relay interception'ı olmadan da çalıştırabilir — bunlar
+Execution Grant + compensating controls ile yönetilir; per-tool enforcement
+iddiası yapılmaz (Appendix C.4/C.5).
 
 ---
 
@@ -359,6 +368,9 @@ review = PASS
 required approvals = granted
 ```
 
+Bu kural harness-backed agent'ların sözlü tamamlama beyanlarına da birebir
+uygulanır — model/harness'in "done" demesi kanıt değildir (Appendix C.7).
+
 ---
 
 # 7. Agent Abstraction
@@ -373,19 +385,23 @@ class Agent:
         ...
 ```
 
-Adapter'lar:
+Adapter'lar iki execution family'ye ayrılır (Appendix B.2):
 
 ```text
-OpenAIAdapter
-AnthropicAdapter
-DeepSeekAdapter
-CodexCLIAdapter
-ClaudeCodeAdapter
-OpenCodeAdapter
-LocalModelAdapter
+API-family adapters     OpenAIAdapter, AnthropicAdapter,
+                        DeepSeekAdapter, LocalModelAdapter
+
+Harness-family adapters CodexCLIAdapter, ClaudeCodeAdapter,
+                        Google subscription-path adapter (expected:
+                        Antigravity CLI), OpenCodeAdapter ve
+                        gelecek harness'lar
 ```
 
-Relay'ın geri kalanı hangi provider'ın kullanıldığını bilmek zorunda kalmamalıdır.
+Bütün harness adapter'ları tek bir generic harness runtime + contract
+paylaşır (Appendix C.2); her yeni harness core'a değil, kendi adapter
+paketine eklenir.
+
+Relay'ın geri kalanı hangi provider'ın kullanıldığını bilmek zorunda kalmamalıdır; core yalnızca execution family (api | harness), backend, capability ve role kavramlarını görür — vendor/product isimleri yalnızca adapter modülleri ve config değerlerinde yaşar (Appendix C.1).
 
 ---
 
@@ -427,6 +443,11 @@ roles:
 ```
 
 Böylece provider kolayca değiştirilebilir.
+
+Config'teki `codex`, `claude` vb. isimler config instance adıdır —
+protocol/selection vocabulary'si asla değildir. Rol seçimi role +
+capability üzerinden yapılır; model seçimi ortogonal kalır
+(Appendix C.3/C.7).
 
 ---
 
@@ -749,6 +770,12 @@ email
 
 eklenebilir.
 
+Bu liste Relay'ın KENDİSİNİN çalıştırdığı tool'ları tanımlar. External
+harness'lar kendi iç shell/filesystem/git tool'larını Relay'in per-action
+interception'ı olmadan da çalıştırabilir; o durumda yetki Execution Grant
+sözleşmesiyle verilir ve compensating controls devreye girer
+(Appendix C.5).
+
 ---
 
 # 18. Permissions
@@ -773,7 +800,20 @@ permissions:
   destructive_shell: never
 ```
 
-Her tool call Relay permission layer'ından geçmelidir.
+Permission boundary iki katmandır (Appendix C.5):
+
+* **Grant tier (her zaman zorunlu):** bir run'a hangi execution capability'nin
+  verileceğine (read-only access / workspace-write / network / dangerous Relay
+  actions) Relay policy karar verir — `auto` / `ask` / `never` outcomes aynen
+  geçerlidir. Relay-owned executor'daki her tool call `PermissionGate.check()`
+  üzerinden geçer.
+* **Mediation tier (koşullu):** harness fine-grained tool/approval event
+  stream'i sunuyorsa Relay bunları mediate eder; sunmuyorsa Relay elinde
+  olmayan per-tool enforcement'i iddia ETMEZ — worktree containment,
+  pre/post repository-state snapshot, diff evidence gibi compensating
+  controls kullanılır.
+
+No harness bypasses Relay authorization merely because it owns its internal tools.
 
 ---
 
@@ -1021,7 +1061,7 @@ Her agent run için:
 ```text
 agent
 role
-model
+model (requested)
 start/end
 input size
 output size
@@ -1031,6 +1071,12 @@ cost
 ```
 
 tutulmalıdır.
+
+Harness-backed run'lar için ek alanlar Appendix C.6 seam'idir:
+resolved/reported model ve harness/adapter version — hepsi nullable ve
+provider-neutral; `Run.model` requested model olarak kalır. usage/cost
+opsiyonelliği korunur (Appendix B.2); credentials/session secrets asla
+kaydedilmez (Appendix C.4).
 
 Örnek:
 
@@ -1125,27 +1171,46 @@ relay ask gpt "Analyze this repository"
 
 ---
 
-# Phase 2 — Codex / Local Tool Runtime
+# Phase 2 — Generic Harness Runtime
 
 Amaç:
 
-Relay'ın gerçek repository üzerinde çalışabilmesi.
+Subscription-backed (harness) coding agent'ları provider'a özgü varsayımlar
+olmadan koordine etmek. Mimari kelime dağarcığı provider isimleri değildir;
+her harness bir adaptördür ve hepsi tek bir generic runtime paylaşır
+(Appendix C.2).
 
 Implement:
 
-* Codex CLI adapter,
-* shell tool,
-* filesystem tools,
-* git tools,
-* permissions.
+* P2.1 — Generic harness contract + process runtime + conformance suite:
+  subprocess lifecycle; executable discovery & version inspection;
+  working-directory control; timeout & cancellation; structured-output
+  parsing where supported; stdout/stderr normalization; persisted-error
+  sanitization; exit-code semantics; capability declaration; auth-state
+  detection without credential extraction; child-process environment
+  policy; crash-safe integration with the P1 orchestrator/store;
+  normalized artifacts/evidence; session/resume seam; offline
+  fake-harness conformance tests (Appendix C.2–C.5).
+* P2.2 — Codex CLI reference adapter (first subscription-backed runtime).
+* P2.3 — Claude Code adapter.
+* P2.4 — Google's current subscription-backed CLI adapter — expected to be
+  Antigravity CLI unless current official documentation establishes
+  otherwise (Appendix C.1). Product names are adapter-specific.
+* Optional P2.5 — Gemini CLI compatibility only where still defensible;
+  it is never the architectural abstraction for Google.
 
-Exit gate:
+Exit gates:
 
-```bash
-relay build "Make a small code change"
-```
+1. `relay build "Make a small code change"` çalıştırıldığında yapılandırılmış
+   harness diff ve tool/output evidence'ı Relay'a geri getirmeli
+   (ARTIFACT/EVIDENCE kayıtlarıyla).
 
-Codex'i çalıştırıp diff ve tool evidence'ı Relay'a geri getirmeli.
+2. **Second-real-harness gate:** ikinci gerçek harness, P2.1 sözleşmesini
+   kullanarak core abstractions'a dokunmadan entegre olabilmelidir.
+
+3. **Auth-conflict gate:** ebeveyn ortamda başka sağlayıcıya ait API
+   anahtarları olsa bile harness çocuk süreci bunları görmemeli
+   (Appendix C.4 test matrix).
 
 ---
 
@@ -1171,6 +1236,12 @@ Exit gate:
 
 Model yanlışlıkla "done" dese bile gerekli verification olmadan task kapanmamalı.
 
+Harness-backed agent'ların ürettiği gözlemler ("implementation complete",
+"tests passed", "review passed", "task done") yalnızca claim taşıyan
+artifact/evidence ADAYI olarak girer; state transition yalnızca
+EvidenceStore'daki provenance-backed kayıtlardan çözülür — TESTS_PASSED
+hâlâ Relay-scoped tool_run_id ister (Appendix A.1, C.7).
+
 ---
 
 # Phase 4 — Multi-Agent Messaging
@@ -1184,15 +1255,20 @@ Implement:
 * message bus,
 * sender/recipient semantics,
 * agent roles,
-* conversation persistence.
+* conversation persistence,
+* heterogeneous execution families day one — API-backed ↔ harness-backed
+  kombinasyonları birinci sınıftır (Appendix C.7).
 
 Exit gate:
 
 ```text
 Agent A → Agent B → Agent A
+Agent A (api) → Agent B (harness) → Agent C (farklı bir harness)
 ```
 
-tartışması insan copy-paste'i olmadan yapılabilmeli.
+tartışması insan copy-paste'i olmadan yapılabilmeli. Routing logical agent
+identity, role, backend family ve capability üzerinden çalışır; hardcoded
+provider branching test-dışı desendir (Appendix C.7).
 
 ---
 
@@ -1210,6 +1286,11 @@ decision
 review
 debug
 ```
+
+Protocol'lar participant taleplerini role + required capability olarak
+ifade eder (planner, critic, adversarial reviewer, domain expert …);
+somut provider/model seçimi protocol metninden bağımsızdır ve ortogonaldir
+(Appendix C.7).
 
 Exit gate:
 
@@ -1229,11 +1310,11 @@ Bugünkü manuel workflow'un tamamen otomatikleşmesi.
 
 ```text
 Plan
-→ Codex
-→ Tests
+→ Implementer
+→ Verification
 → Reviewer
-→ FIX
-→ Codex
+→ Fix
+→ Implementer
 → Reviewer
 → PASS
 ```
@@ -1244,6 +1325,11 @@ Implement:
 * automatic fix packet generation,
 * max loop count,
 * final verification.
+
+Implementer/reviewer/planner rolleri bağımsız değiştirilebilir configured
+agents'tır — Codex, Claude Code, Google harness (beklenen: Antigravity CLI)
+veya future compatible adapter. Orchestration deterministic ve
+capability-based'dir (Appendix C.3/C.7); provider-name branching yoktur.
 
 Exit gate:
 
@@ -1277,6 +1363,12 @@ Room:
 
 saklar.
 
+Room membership identity mantıksal agent identity'dir (backend swap'lerinde
+stabil). Harness'e özgü mutable durum (external_session_ref gibi non-secret
+referanslar) run/task seviyesinde ve Appendix C.4 allowlist'ine uygun tutulur.
+Resume önce session_resume capability'sini görür; capability yoksa Context
+Engine reconstruction ile dürüst fresh-run yapılır (Appendix C.7).
+
 Exit gate:
 
 Bir room günler sonra yeniden açıldığında çalışma state'i devam etmeli.
@@ -1304,6 +1396,10 @@ evidence
 rebuttal
 decision
 ```
+
+Graph node'ları optionally backend family / harness version attribute'u
+taşıyabilir (Appendix C.7); producer kimlikleri zaten EvidenceRecord
+provenance'ının parçasıdır.
 
 Exit gate:
 
@@ -1334,6 +1430,11 @@ query room
 approve action
 inspect status
 ```
+
+Server serialization capability-aware agent descriptor'ları döndürür.
+Remote client'lardan gelen permission istekleri CLI ile birebir aynı
+PermissionGate'ten geçer; transport hiçbir ek ayrıcalık vermez
+(Appendix C.5/C.7).
 
 Exit gate:
 
@@ -1380,27 +1481,39 @@ Chat:
 → Relay review
 ```
 
+Kullanıcı dili product adı geçse bile Relay selection'ı role + capability
+düzeyinde çözer ("adversarial reviewer", "implementer with workspace_write")
+ve bunu registry/config üzerinden logical agent'lara map eder. Bu örnekler
+UX illüstrasyonudur; routing vocabulary'si değildir (Appendix C.7).
+
 Exit gate:
 
 Kullanıcı modeller arasında manuel prompt taşımadan bütün workflow'u conversational interface üzerinden yönetebilmeli.
 
 ---
 
-# Phase 11 — Provider Expansion
+# Phase 11 — Adapter Ecosystem & Certification
 
-Adapters:
+> Reframing (Appendix C.8): heterogeneous backends (api + harness families)
+> artık Phase 2'den itibaren mevcut olduğu için eski "Provider Expansion"
+> scope'u conceptually emekli edilmiştir; farklı ad, aynı amacın
+> büyütülmüş halidir.
 
-```text
-OpenAI
-Anthropic
-DeepSeek
-Codex CLI
-Claude Code
-OpenCode
-OpenAI-compatible local APIs
-```
+Purpose:
 
-Bu aşamadan sonra yeni provider eklemek core değişikliği gerektirmemeli.
+* additional API providers,
+* additional harnesses (subscription-backed CLI agents),
+* local runtimes,
+* adapter × harness-version × OS compatibility matrix,
+* conformance suite (offline fakes mandatory, live smoke opt-in),
+* capability certification & honest-declaration auditing,
+* credential-hygiene audit per adapter.
+
+Exit gate:
+
+Yeni bir compliant provider/harness workflow/state-machine/core protocol
+mimarisine ZERO modification ile entegre olabilmeli — import-direction
+architecture testleriyle zorlanır (Appendix C.8).
 
 ---
 
@@ -1458,7 +1571,10 @@ relay/
 │   │   ├── openai.py
 │   │   ├── anthropic.py
 │   │   ├── deepseek.py
-│   │   └── codex_cli.py
+│   │   ├── harness_runtime.py    # generic harness contract + process runtime (P2.1)
+│   │   ├── codex_cli.py
+│   │   ├── claude_code.py
+│   │   └── antigravity_cli.py    # product names live ONLY in adapters (App. C.1)
 │   │
 │   ├── context/
 │   │   ├── workspace.py
@@ -1508,11 +1624,11 @@ relay build "Make this small repository change"
 1. workspace detected
 2. repository context collected
 3. planner creates task packet
-4. Codex implements
+4. configured implementer executes (any harness or API adapter)
 5. tests run
 6. reviewer receives diff
 7. reviewer returns PASS/FIX
-8. FIX automatically goes back to Codex
+8. FIX automatically goes back to the implementer
 9. final result persisted
 10. user receives summary
 ```
@@ -1624,7 +1740,8 @@ Bir modelin sözlü "PASS" demesi verification yerine geçmemeli.
 
 ### Provider independence
 
-Bir model/provider değiştirildiğinde workflow bozulmamalı.
+Bir model/provider değiştirildiğinde workflow bozulmamalı — execution
+family'ler arasında (api ↔ harness) geçiş dahil.
 
 ### Transparency
 
@@ -1668,7 +1785,7 @@ P1  Core + Storage
  ↓
 P2  Single Agent
  ↓
-P3  Codex + Tools
+P3  Generic Harness Runtime
  ↓
 P4  State Machine
  ↓
@@ -1686,7 +1803,7 @@ P10 Server
  ↓
 P11 MCP / Chat Interface
  ↓
-P12 Provider Expansion
+P12 Adapter Ecosystem & Certification
  ↓
 P13 TUI
 ```
@@ -1854,6 +1971,14 @@ Binding for Phase 2+: every tool execution flows through
 `needs_approval` blocks until a human Approval exists; `never` is
 absolute. No executor may bypass or pre-execute before the gate.
 
+Scope refinement (harness era): this invariant binds every tool
+execution performed BY Relay or through Relay-owned executors.
+External harnesses execute their own internal tools inside their own
+process; those fall under the grant-tier authorization of Appendix C.5
+plus compensating controls — never a bypass. Wherever an action IS
+representable to Relay (tool/approval events surfaced by the harness),
+the gate remains mandatory.
+
 ---
 
 # Appendix B — Phase 1 Amendments
@@ -1881,9 +2006,12 @@ API-backed       OpenAI-compatible HTTP, Anthropic API, DeepSeek API,
                  local OpenAI-compatible servers
 Harness-backed   Codex CLI using its own ChatGPT/account authentication,
                  Claude Code using its own subscription/account
-                 authentication, Gemini CLI and other official
-                 subscription-aware clients, future local/external
-                 agent harnesses
+                 authentication, Google's current subscription-backed
+                 terminal agent path (expected: Antigravity CLI —
+                 product names are adapter-specific facts, App. C.1),
+                 Gemini CLI only where still defensible (enterprise
+                 license / API-key paths), future local/external agent
+                 harnesses such as OpenCode
 ```
 
 The core `Agent` abstraction assumes nothing about transport:
@@ -1906,9 +2034,217 @@ usage data at all.
 
 ## B.4 Roadmap note (amends §27 ordering labels)
 
-P1 delivers the first **API-backed** adapter. Phase 2 — Codex CLI /
-local tool runtime — is the first **subscription-backed (harness)**
-adapter. Claude Code, Gemini CLI, and further official harnesses arrive
-via later provider expansion (§27 Phase 11 spirit). The api/harness
+P1 delivers the first **API-backed** adapter. Phase 2 delivers the
+**Generic Harness Runtime** — the first **subscription-backed (harness)**
+execution support — as provider-neutral work packages (contract +
+process runtime + conformance suite first; then per-harness reference
+adapters). Downstream roadmap consequences (P3–P11 + certification
+reframing) are normatively amended in Appendix C. The api/harness
 separation above is fixed now so configuration represents backend type
 without schema redesign later.
+
+---
+
+# Appendix C — Generic Harness Runtime Amendments (ratified before Phase 2)
+
+Normative amendments covering harness-backed execution from Phase 2
+onward. They refine — never weaken — prior appendices and §27.
+
+## C.1 Execution-family vocabulary and product naming (amends §7, App. B.2/B.4)
+
+Core vocabulary is: execution family (api | harness), adapter, backend,
+capability, role. Vendor product names (Codex, Claude Code, Antigravity
+CLI, Gemini CLI, OpenCode) exist ONLY in adapter modules, configuration
+values, and their tests — never in core module names, state-machine
+logic, routing, or protocol definitions. Provider URL/product pivots
+must be absorbable by editing adapter packages alone.
+
+Current knowledge frozen here for planning purposes (verify against
+official docs at implementation time): Google serves consumer
+subscription terminal-agent usage through Antigravity CLI (successor
+surface to Gemini CLI for AI Pro/Ultra/individual accounts since June
+2026); Gemini CLI persists for enterprise licensing and paid API-key
+access. Therefore the Google subscription-path adapter targets
+Antigravity CLI; Gemini CLI remains an optional compatibility candidate
+only.
+
+## C.2 Generic harness contract (amends §7, enables §27 Phase 2)
+
+Every harness adapter implements the same contract — discoverable
+executable + version inspection; declared capabilities; managed
+subprocess lifecycle (spawn/pumps/graceful→hard terminate); pinned
+working directory; timeouts/cancellation with normalized run status;
+stdout/stderr normalization; best-effort structured-output parsing;
+sanitized persisted errors; exit-code semantics profile;
+capability-gated feature use; session/resume seam (may be explicitly
+unsupported); environment policy (C.4); crash-safe persistence
+identical to P1 ordering (input artifact before spawn). Adapters that
+fail lifecycle MUST leave the canonical store consistent with any other
+failed run.
+
+## C.3 Capability contract (extends §7/§17 selection vocabulary)
+
+Capabilities are typed, declared statically by each adapter, and queried
+by core — code asks WHAT a harness can do, never WHICH vendor it
+belongs to.
+
+Candidate set (closed for extension across releases; additions require
+an appendix note): structured_output, read_only_access,
+workspace_write, shell_execution, git_operations, tool_event_stream,
+approval_event_stream, session_resume, model_selection,
+resolved_model_reporting, token_usage_reporting, diff_reporting,
+network_access.
+
+Rules:
+
+* Unsupported capability ⇒ explicit typed failure
+  (`UnsupportedCapability`) at request validation time. Silent
+  degradation is forbidden.
+* Capability declarations feed authorization (C.5) and selection
+  (§27 P4/P5): routing and protocol engines match on
+  (role, required_capabilities, backend_family), not provider names.
+* Declared-but-broken capabilities fail adapter conformance
+  certification (Adapter Ecosystem & Certification, §27 Phase 11), not
+  merely review.
+
+## C.4 Authentication & environment trust boundary (preserves App. B.3)
+
+Binding rule: **Relay invokes the harness. The harness owns
+authentication.**
+
+Relay must not: read browser/session tokens; copy subscription
+credentials; persist OAuth/session credentials; impersonate provider
+login flows; convert subscription authentication into Relay-owned
+credentials.
+
+Environment isolation for harness child processes:
+
+* Children receive an explicit ALLOWLIST baseline (OS-required
+  variables: PATH/HOME-USERPROFILE/TEMP/TMP/system roots/locale) — not
+  the raw parent environment.
+* Every adapter declares its `conflict_variables` — provider auth
+  variables that would flip the harness into another billing/auth mode
+  (e.g. the OpenAI pair for Codex CLI; the Anthropic triple for Claude
+  Code; Gemini/Google API variables for the Google adapter). Relay
+  strips ALL adapters' conflict sets from every harness child
+  environment by default; an adapter may whitelist a variable only for
+  itself, deliberately, in its profile.
+* Relay-resolved API credentials are never forwarded into any harness
+  child process. An unrelated provider key in Relay's parent
+  environment must never alter harness billing mode — enforced by an
+  auth-conflict test matrix (a fake harness echoes its received
+  environment; assertions are data, not prose).
+
+Persistable harness facts (allowlist — everything else is forbidden):
+
+* adapter identity/name, discovered executable label + version;
+* configured auth mode IF safely observable (e.g. "subscription",
+  "api_key" as declared by the harness itself);
+* auth_state ∈ {authenticated, unauthenticated, unknown};
+* a NON-SECRET external session reference when a provider exposes one
+  AND config explicitly opts in (field name `external_session_ref`;
+  never a secret-shaped value).
+
+Prohibited from persistence: tokens, cookies, OAuth artifacts, account
+identifiers usable for login, anything derived from scraping login
+state. Hygiene enforcement lives in the existing persisted-vocabulary
+tests, extended to new models.
+
+## C.5 Permission boundary — two tiers (refines §17/§18/§19; amends App. A.4 wording)
+
+Trust boundary, stated exactly:
+
+1. **Grant tier (always enforced, non-overridable):** a harness run
+   starts only with an Execution Grant chosen by Relay policy — at
+   minimum one of read_only_access / workspace_write /
+   workspace_write+network, translated onto harness-native restriction
+   flags where available and into Relay-side containment where not.
+   Dangerous Relay actions (install_dependencies, git_push,
+   destructive_shell, merge_pr …) appear in the grant decision with
+   their existing policy outcomes auto/ask/never. There is NO way for a
+   run to obtain a capability whose governing policy is `never`, and no
+   harness bypasses Relay authorization by owning its internal tools.
+2. **Mediation tier (conditional):** where a harness exposes
+   tool/approval event streams, Relay mediates them — events map onto
+   ToolRun records and approvals flow through existing human-approval
+   mechanics (A.3). Where a harness exposes none, Relay DOES NOT CLAIM
+   per-tool enforcement; it records observed outcomes only.
+
+Compensating controls for unmediated internals (required wherever tier
+2 is absent and writes/shell/network are granted): dedicated
+worktree/clone containment; pre/post repository-state snapshots;
+post-run diff extraction as DIFF artifact; sanitization of captured
+errors (C.4); explicit evidence that verification ran through
+Relay-owned channels.
+
+Wording amendment to A.4: the single-path invariant continues to bind
+every tool execution performed BY Relay or through Relay-owned
+executors; harness-internal tool execution falls under this appendix's
+grant tier. The gate remains mandatory whenever an action/permission is
+representable — owning internal tools never confers bypass rights.
+
+## C.6 Run/persistence model seam (extends §14/§25; no gratuitous change)
+
+Frozen P1 `Run.model` stays as REQUESTED model. Additive, nullable,
+provider-neutral columns planned before harness loops need them:
+`resolved_model` (reported by harness when known), `adapter_version`
+(harness binary/version), `external_session_ref` (C.4 allowlist), plus
+`backend` (snapshot of execution family at run time) for audit
+symmetry. SQLite migration = ADD COLUMN only; historical rows
+unchanged. Any richer backend metadata is deferred and, if ever
+required, arrives as a strict, redaction-checked JSON column — never
+free-form secrets.
+
+## C.7 Roadmap consequences (annotates §27 P3–P10)
+
+* P3: harness-emitted statements (implementation complete / tests
+  passed / task done) enter ONLY as claim-bearing artifacts and
+  evidence candidates — TESTS_PASSED still requires a Relay-scoped
+  tool_run_id; REVIEW_PASSED / IMPLEMENTATION_PRODUCED still require
+  run_id. State transitions resolve exclusively from the EvidenceStore.
+  Verification gates remain authoritative.
+* P4: bus supports heterogeneous pairs day one (api→harness,
+  harness→other harness, planner-api→implementer-harness→reviewer-*);
+  routing keys are identity/role/backend_family/capability.
+  Hard-coded provider branching is a test-forbidden pattern.
+* P5: discussion protocols request roles + required capabilities;
+  binding to concrete adapters happens through config/selection, never
+  protocol text.
+* P6: automated loop is provider-neutral: Plan → Implementer →
+  Verification → Reviewer → Fix → Implementer → Reviewer → PASS;
+  implementer/reviewer/planner roles are independently replaceable;
+  candidate selection is deterministic over capabilities +
+  availability + auth_state.
+* P7: room member identity = logical agent id (stable across backend
+  swaps); harness-specific mutable facts live on runs/tasks;
+  resumability honors session_resume capability else reconstructs via
+  the Context Engine (fresh run, honest discontinuity).
+* P8: provenance graph nodes may carry backend family/harness version.
+* P9: server serialization includes capability-aware descriptors;
+  remote permission requests traverse the identical core gate
+  (transport grants no privileges).
+* P10: chat/MCP-facing selection queries role + capability (e.g.
+  "adversarial reviewer with review-pass history"), resolves agents via
+  the registry.
+
+## C.8 Phase 11 reframing (amends §27 Phase 11)
+
+Old scope ("Provider Expansion": OpenAI / Anthropic / DeepSeek /
+Codex CLI / Claude Code / OpenCode / local APIs) is conceptually
+retired: heterogeneous backends arrive with Phase 2, BEFORE multi-agent
+orchestration (Phase 4). Replaced by **Adapter Ecosystem &
+Certification** (build-order label `P12` in §35):
+
+* more API providers; more harnesses; local runtimes;
+* adapter × harness-version × OS compatibility matrix;
+* conformance suite upgrades (offline fakes mandatory; live smoke
+  opt-in);
+* capability certification & honest-declaration auditing;
+* credential-hygiene audit per adapter;
+* admission criterion: a compliant provider/harness integrates with
+  ZERO modifications to workflow/state-machine/core-protocol code
+  (enforced by import-direction architecture tests).
+
+Exit gate: a brand-new compliant adapter (third-party-authored is
+ideal) passes certification without touching relay/core, relay/storage,
+or the bus.
