@@ -1,11 +1,24 @@
-"""Agent contract: provider-agnostic, role-aware (SPEC §7/§8)."""
+"""Agent contract: provider-agnostic, role-aware (SPEC §7/§8, App. B.2).
+
+Seam-proof extensions (Phase 1, requirement 6): the interface must admit a
+future harness adapter (Codex CLI, Claude Code) with zero core-domain-model
+edits — usage is fully optional, serialization carries no transport fields,
+and ``backend`` is the only declaration an adapter family makes.
+"""
 
 import asyncio
 
 import pytest
 from pydantic import ValidationError
 
-from relay.agents.base import Agent, AgentRequest, AgentResponse, AgentRole, TokenUsage
+from relay.agents.base import (
+    Agent,
+    AgentRequest,
+    AgentResponse,
+    AgentRole,
+    BackendType,
+    TokenUsage,
+)
 
 
 class EchoAgent(Agent):
@@ -74,3 +87,69 @@ class TestResponseContract:
             error="provider timeout",
         )
         assert response.status == "error"
+
+
+class TestTokenUsageOptionality:
+    """App. B.2: usage/cost are optional; harness runs may carry none."""
+
+    def test_token_usage_all_fields_optional(self):
+        usage = TokenUsage()
+        assert usage.input_tokens is None
+        assert usage.output_tokens is None
+        assert usage.cost_usd is None
+
+    def test_response_with_none_usage_flows_cleanly(self):
+        response = AgentResponse(agent="codex", role=AgentRole.IMPLEMENTER, output="done")
+        assert response.usage is None
+        restored = AgentResponse.model_validate_json(response.model_dump_json())
+        assert restored == response
+
+    def test_cost_none_survives_serialization(self):
+        usage = TokenUsage(input_tokens=10, output_tokens=20, cost_usd=None)
+        restored = TokenUsage.model_validate_json(usage.model_dump_json())
+        assert restored.cost_usd is None
+
+    def test_request_response_serialize_without_transport_fields(self):
+        request = AgentRequest(prompt="p", role=AgentRole.RESEARCHER)
+        response = AgentResponse(agent="claude", role=AgentRole.RESEARCHER, output="o")
+        for dump in (request.model_dump(), response.model_dump()):
+            assert not ({"api_key", "url", "headers", "auth", "token"} & set(dump))
+
+
+class FakeHarnessAgent(Agent):
+    """The future Codex CLI / Claude Code adapter, proven against today's seam.
+
+    Pure-Python canned response: no HTTP, no subprocess, no session code.
+    It declares its family with one ClassVar and nothing else changes.
+    """
+
+    name = "fake_harness"
+    backend = BackendType.HARNESS
+
+    async def run(self, request: AgentRequest) -> AgentResponse:
+        return AgentResponse(
+            agent=self.name,
+            role=request.role,
+            output=f"harness handled: {request.prompt}",
+            usage=None,  # subscription-backed runs carry no usage data
+        )
+
+
+class TestHarnessFamilyDeclaration:
+    """One ClassVar declares the family; the interface stays identical."""
+
+    def test_harness_backend_declared_without_interface_changes(self):
+        assert FakeHarnessAgent.backend is BackendType.HARNESS
+        assert Agent.backend is BackendType.API  # default unchanged
+
+    def test_fake_harness_answers_offline(self):
+        async def scenario():
+            response = await FakeHarnessAgent().run(
+                AgentRequest(prompt="analyze", role=AgentRole.RESEARCHER)
+            )
+            return response
+
+        response = asyncio.run(scenario())
+        assert response.output == "harness handled: analyze"
+        assert response.usage is None  # cost_usd=None flows cleanly
+        assert response.status == "ok"
