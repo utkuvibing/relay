@@ -11,8 +11,9 @@ Pydantic-validated at the boundary; usage maps onto the transport-neutral
 table, and harness runs may carry no usage at all).
 
 Secrets: the API key is read from the environment at call time and exists
-only in process memory (App. B.3). Errors are actionable: 401 names the
-environment variable, 429 names the rate limit.
+only in process memory (App. B.3). Persistable errors are deliberately
+sanitized: provider response bodies and validation details never enter error
+messages that may be written to Relay history.
 """
 
 from __future__ import annotations
@@ -28,11 +29,6 @@ from relay.agents.errors import AgentError, AgentNotConfigured
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _TIMEOUT_SECONDS = 120.0
-
-
-# --------------------------------------------------------------------------
-# Wire envelope — validated at the boundary, then discarded.
-# --------------------------------------------------------------------------
 
 
 class _ChatMessage(BaseModel):
@@ -66,7 +62,7 @@ class OpenAICompatibleAgent(Agent):
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._settings = settings or AgentSettings(adapter=self.name)
-        #: Injectable for offline tests (MockTransport); owned by the caller.
+        #: Injectable for offline tests/callers. Ownership stays with the caller.
         self._client = client
 
     def _endpoint(self) -> str:
@@ -82,6 +78,12 @@ class OpenAICompatibleAgent(Agent):
             )
         return key
 
+    async def _post(self, payload: dict, headers: dict[str, str]) -> httpx.Response:
+        if self._client is not None:
+            return await self._client.post(self._endpoint(), json=payload, headers=headers)
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+            return await client.post(self._endpoint(), json=payload, headers=headers)
+
     async def run(self, request: AgentRequest) -> AgentResponse:
         api_key = self._api_key()
         payload = {
@@ -91,10 +93,7 @@ class OpenAICompatibleAgent(Agent):
         headers = {"Authorization": f"Bearer {api_key}"}
 
         try:
-            async with self._client or httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
-                response = await client.post(
-                    self._endpoint(), json=payload, headers=headers
-                )
+            response = await self._post(payload, headers)
         except httpx.TimeoutException as exc:
             raise AgentError(f"{self.name}: provider timed out after {_TIMEOUT_SECONDS}s") from exc
         except httpx.ConnectError as exc:
@@ -102,7 +101,7 @@ class OpenAICompatibleAgent(Agent):
                 f"{self.name}: cannot reach {self._endpoint()} — check the base URL / network"
             ) from exc
         except httpx.HTTPError as exc:
-            raise AgentError(f"{self.name}: HTTP transport failure: {exc}") from exc
+            raise AgentError(f"{self.name}: HTTP transport failure") from exc
 
         if response.status_code == 401:
             raise AgentError(
@@ -114,15 +113,12 @@ class OpenAICompatibleAgent(Agent):
                 f"{self.name}: rate limited (429) — retry later or lower concurrency"
             )
         if response.status_code >= 400:
-            raise AgentError(
-                f"{self.name}: provider returned HTTP {response.status_code}: "
-                f"{response.text[:300]}"
-            )
+            raise AgentError(f"{self.name}: provider returned HTTP {response.status_code}")
 
         try:
             body = _ChatCompletion.model_validate(response.json())
         except ValueError as exc:
-            raise AgentError(f"{self.name}: malformed provider response: {exc}") from exc
+            raise AgentError(f"{self.name}: malformed provider response") from exc
 
         if not body.choices or body.choices[0].message.content is None:
             raise AgentError(f"{self.name}: provider returned no completion content")
@@ -132,7 +128,6 @@ class OpenAICompatibleAgent(Agent):
             usage = TokenUsage(
                 input_tokens=body.usage.prompt_tokens,
                 output_tokens=body.usage.completion_tokens,
-                # cost_usd stays None: Phase 1 has no pricing table (App. B.2).
             )
         return AgentResponse(
             agent=self.name,

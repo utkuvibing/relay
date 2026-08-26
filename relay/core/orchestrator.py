@@ -9,8 +9,7 @@ Two-phase persistence, in this exact order:
 2. **Provider call** — strictly after Tx 1. Nothing here is persisted.
 3. **Final Tx — success or failure.** Success records the ``run_output``
    artifact plus ``SUCCEEDED``/``AGENT_RUN_FINISHED``; failure records
-   ``FAILED``/``AGENT_RUN_FINISHED`` with the error text in the event content
-   and no output artifact.
+   ``FAILED``/``AGENT_RUN_FINISHED`` with a sanitized error and no output artifact.
 
 Family-blind by App. B.2: API- and harness-backed adapters flow through this
 exact code. No ``Message`` rows and no ``Task`` — a one-shot ask is not
@@ -22,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from relay.agents.base import Agent, AgentRequest, AgentResponse
+from relay.agents.errors import AgentError
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     Artifact,
@@ -37,11 +37,22 @@ from relay.storage.store import SqliteRelayStore
 
 @dataclass(frozen=True)
 class AskOutcome:
-    """Everything one ``ask`` produced, persisted and returned."""
-
     run: Run
     response: AgentResponse | None = None
     error: str | None = None
+
+
+def _persistable_error(exc: Exception) -> str:
+    """Return only error text safe to persist and render.
+
+    Adapter-authored ``AgentError`` messages are part of the sanitized public
+    contract. Arbitrary implementation exceptions may contain request bodies,
+    credentials, paths, or other sensitive runtime details, so only their type
+    crosses the persistence boundary.
+    """
+    if isinstance(exc, AgentError):
+        return str(exc)
+    return f"unexpected agent failure ({type(exc).__name__})"
 
 
 async def run_ask(
@@ -53,12 +64,7 @@ async def run_ask(
     model: str | None = None,
     agent_name: str | None = None,
 ) -> AskOutcome:
-    """Execute one agent run with crash-safe persistence; never raises.
-
-    Any provider failure (network, auth, adapter bug) lands as a FAILED run
-    with the error in the finished event — the caller cannot lose history by
-    throwing.
-    """
+    """Execute one agent run with crash-safe persistence; never raises."""
     run = Run(
         agent=agent_name or agent.name,
         role=request.role,
@@ -66,7 +72,7 @@ async def run_ask(
         status=RunStatus.RUNNING,
     )
 
-    with store.transaction():  # Tx 1 — committed before any provider I/O
+    with store.transaction():
         store.save_model(run)
         input_artifact = store.save_model(
             Artifact(kind=ArtifactKind.RUN_INPUT, run_id=run.id, content=request.prompt)
@@ -81,19 +87,19 @@ async def run_ask(
 
     try:
         response = await agent.run(request)
-    except Exception as exc:  # noqa: BLE001 - deliberate: every provider failure (network, auth,
-        # adapter bug) must land as a persisted FAILED run, never as lost history.
+    except Exception as exc:  # noqa: BLE001 - all failures must become durable run history.
+        safe_error = _persistable_error(exc)
         failed = run.model_copy(update={"status": RunStatus.FAILED, "ended_at": utcnow()})
-        with store.transaction():  # failure Tx
+        with store.transaction():
             store.update_model(failed)
             writer.record(
                 EventLogEntry(
                     type=EventType.AGENT_RUN_FINISHED,
-                    content=f"agent '{run.agent}' failed: {exc}",
+                    content=f"agent '{run.agent}' failed: {safe_error}",
                     references=[f"run:{run.id}"],
                 )
             )
-        return AskOutcome(run=failed, error=str(exc))
+        return AskOutcome(run=failed, error=safe_error)
 
     usage = response.usage
     succeeded = run.model_copy(
@@ -105,7 +111,7 @@ async def run_ask(
             "ended_at": utcnow(),
         }
     )
-    with store.transaction():  # success Tx
+    with store.transaction():
         store.update_model(succeeded)
         output_artifact = store.save_model(
             Artifact(kind=ArtifactKind.RUN_OUTPUT, run_id=run.id, content=response.output)

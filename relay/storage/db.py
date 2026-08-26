@@ -3,13 +3,7 @@
 SPEC reference: §14 (Persistent Memory), §15 (Event Log); Appendix B.1.
 
 Schema contract: ``relay.storage.models`` is the single source of truth.
-Tables are generated from that vocabulary — field names there are the
-schema here. Container-typed fields (lists, dicts, nested models) are
-stored as JSON columns named ``<field>_json``.
-
-Append-only history is enforced *at the database level*: triggers abort
-any UPDATE or DELETE against ``event_log`` and ``evidence_records``.
-Omitting the Python methods is never the enforcement mechanism.
+Append-only history is enforced at the database level with triggers.
 """
 
 from __future__ import annotations
@@ -26,12 +20,11 @@ def _append_only_triggers() -> list[str]:
     statements: list[str] = []
     for table in _APPEND_ONLY_TABLES:
         for action in ("UPDATE", "DELETE"):
-            trigger = (
+            statements.append(
                 f"CREATE TRIGGER IF NOT EXISTS {table}_no_{action.lower()} "
                 f"BEFORE {action} ON {table} BEGIN "
                 f"SELECT RAISE(ABORT, '{table} is append-only'); END;"
             )
-            statements.append(trigger)
     return statements
 
 
@@ -82,9 +75,7 @@ _V1_STATEMENTS: tuple[str, ...] = (
         ended_at TEXT
     )
     """,
-    """
-    CREATE INDEX idx_runs_status ON runs(status)
-    """,
+    "CREATE INDEX idx_runs_status ON runs(status)",
     """
     CREATE TABLE messages (
         id TEXT PRIMARY KEY,
@@ -109,9 +100,7 @@ _V1_STATEMENTS: tuple[str, ...] = (
         created_at TEXT NOT NULL
     )
     """,
-    """
-    CREATE INDEX idx_artifacts_run ON artifacts(run_id)
-    """,
+    "CREATE INDEX idx_artifacts_run ON artifacts(run_id)",
     """
     CREATE TABLE decisions (
         id TEXT PRIMARY KEY,
@@ -168,9 +157,7 @@ _V1_STATEMENTS: tuple[str, ...] = (
         created_at TEXT NOT NULL
     )
     """,
-    """
-    CREATE INDEX idx_evidence_task_kind ON evidence_records(task_id, kind)
-    """,
+    "CREATE INDEX idx_evidence_task_kind ON evidence_records(task_id, kind)",
     """
     CREATE TABLE event_log (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,23 +171,14 @@ _V1_STATEMENTS: tuple[str, ...] = (
         created_at TEXT NOT NULL
     )
     """,
-    """
-    CREATE INDEX idx_event_task ON event_log(task_id)
-    """,
+    "CREATE INDEX idx_event_task ON event_log(task_id)",
     *_append_only_triggers(),
 )
-
 
 _MIGRATIONS: dict[int, tuple[str, ...]] = {1: _V1_STATEMENTS}
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    """Open a Relay database in autocommit mode with explicit transactions.
-
-    Callers manage transaction boundaries with :meth:`SqliteRelayStore.transaction`
-    rather than sqlite3's implicit begin-on-write; this keeps the two-phase
-    run persistence in ``relay.core.orchestrator`` crash-safe.
-    """
     conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -210,15 +188,22 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 
 def migrate(conn: sqlite3.Connection) -> int:
-    """Apply pending migrations in order; returns resulting schema version."""
+    """Apply each schema version atomically; returns resulting version."""
     current = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if current > SCHEMA_VERSION:
         msg = f"database schema v{current} is newer than this Relay build (v{SCHEMA_VERSION})"
         raise sqlite3.DatabaseError(msg)
 
     for version in range(current + 1, SCHEMA_VERSION + 1):
-        for statement in _MIGRATIONS[version]:
-            conn.execute(statement)
-        conn.execute(f"PRAGMA user_version = {version}")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for statement in _MIGRATIONS[version]:
+                conn.execute(statement)
+            conn.execute(f"PRAGMA user_version = {version}")
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
         current = version
     return current
