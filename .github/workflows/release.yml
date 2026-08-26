@@ -15,16 +15,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v10
 
       - name: Set up Python
         run: uv python install 3.13
 
       - name: Sync dependencies
-        run: uv sync --frozen --python 3.13
+        run: uv sync --frozen --extra dev --python 3.13
 
       - name: Run tests
         run: uv run --python 3.13 pytest
@@ -45,7 +45,7 @@ jobs:
           .release-smoke/bin/relay --help
 
       - name: Upload release distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: relay-release-dist
           path: dist/*
@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download distributions
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: relay-release-dist
           path: dist
