@@ -51,7 +51,13 @@ def _mask_credential_assignments(text: str) -> str:
 
 
 def _home_prefixes(home: str | None) -> list[str]:
-    """Candidate home prefixes to shorten (never raise on odd values)."""
+    """Candidate home prefixes to shorten, independent of the host OS syntax.
+
+    Harness output may contain Windows paths while Relay itself is running on
+    POSIX (CI, remote runners, WSL) or vice versa.  Never normalize a foreign
+    path only through ``os.path`` and then assume the host separator; retain
+    slash and backslash variants so redaction is transport/platform neutral.
+    """
     candidates: list[str] = []
     if home:
         candidates.append(home)
@@ -59,18 +65,31 @@ def _home_prefixes(home: str | None) -> list[str]:
         value = os.environ.get(key)
         if value:
             candidates.append(value)
-    normalized: list[str] = []
+
+    variants: set[str] = set()
     for prefix in candidates:
         try:
-            norm = os.path.normpath(os.path.expanduser(prefix))
+            expanded = os.path.expanduser(prefix).rstrip("/\\")
         except Exception:  # noqa: BLE001 - redaction must never raise
-            norm = ""  # unexpandable entry contributes nothing
-        if len(norm) > 2:
-            if not norm.endswith(os.sep):
-                norm += os.sep
-            normalized.append(norm)
+            expanded = ""
+        if len(expanded) <= 2:
+            continue
+
+        # Keep the supplied spelling and both separator renderings.  This is
+        # deliberate: ``ntpath`` semantics should not depend on Relay running
+        # on Windows, and POSIX paths remain valid under the same treatment.
+        bases = {
+            expanded,
+            expanded.replace("\\", "/"),
+            expanded.replace("/", "\\"),
+        }
+        for base in bases:
+            if len(base) > 2:
+                variants.add(base + "/")
+                variants.add(base + "\\")
+
     # Longest first so overlapping prefixes collapse to one mask.
-    return sorted(set(normalized), key=len, reverse=True)
+    return sorted(variants, key=len, reverse=True)
 
 
 def _shorten_paths(text: str, home: str | None) -> str:
@@ -79,9 +98,8 @@ def _shorten_paths(text: str, home: str | None) -> str:
         if prefix.lower() not in result.lower():
             continue
         pattern = re.compile(re.escape(prefix), re.IGNORECASE)
-        # Default-arg binding closes over THIS prefix (B023).
-        replacement = lambda _match, p=prefix: "~" + ("/" if "/" in p else "\\")
-        result = pattern.sub(replacement, result)
+        replacement = "~\\" if prefix.endswith("\\") else "~/"
+        result = pattern.sub(lambda _match, r=replacement: r, result)
     return result
 
 
