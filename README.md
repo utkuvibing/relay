@@ -30,7 +30,7 @@ relay why 18
 |---|---|---|
 | P0 | Specification freeze — core abstractions in code | ✅ hardened |
 | P1 | Single-agent runtime (`relay init`, `relay ask`, SQLite) — first **API-backed** runtime (OpenAI-compatible HTTP) per SPEC App. B.4; harness-backed agents arrive in Phase 2 | ✅ |
-| P2 | **Generic harness runtime** (SPEC §27 Phase 2 + App. C): process runtime + conformance suite (P2.1); adapters — Codex CLI (P2.2), Claude Code (P2.3), Google subscription path, expected Antigravity CLI (P2.4) | ⬜ |
+| P2 | **Generic harness runtime** (SPEC §27 Phase 2 + App. C): P2.1 ✅ process runtime + capability model + offline conformance suite (G0–G3); adapters pending — Codex CLI (P2.2), Claude Code (P2.3), Google subscription path, expected Antigravity CLI (P2.4) | 🔶 |
 | P3+ | See SPEC §27 roadmap | ⬜ |
 
 Runs are persisted crash-safely: the prompt lands as a `run_input` artifact

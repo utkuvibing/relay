@@ -499,3 +499,28 @@ This amendment was applied in the same session that produced it
 
 No code was changed and no implementation work for Phase 2 was started;
 sections §0–§12 above are the pre-application audit/drafts exactly as planned.
+
+---
+
+## 15. P2.1 execution record
+
+P2.1 (generic harness contract + process runtime + conformance suite) was
+implemented as commits C1-C7 on main; C8 is this docs sync. Highlights
+against the plan's gates:
+
+* G0 executability separation: `build_agent` validates registry presence +
+  backend-family match before construction; test fakes reach flows only via
+  the context-scoped `transient_adapters` seam (production registry frozen,
+  hygiene-tested).
+* G1 adapter independence: the full battery runs against both heterogeneous
+  fakes (JSONL-event vs prose/noisy with disjoint exit numerics and declared
+  `failure_modes`).
+* G2 tree termination: POSIX process groups + Windows ctypes Job Object
+  kill-on-close with taskkill fallback; tombstone-heartbeat check proves no
+  descendant survives timeout.
+* G3 error boundary: `HarnessAgent.run()` remains the single sanitized
+  conversion point; fault-injection matrix asserts raw exceptions never escape.
+
+Non-goals held: no real adapters, no schema migration, no orchestrator or
+P1 behavior changes, zero credential persistence. Suite: 236 passed / 1 skipped;
+ruff clean.
