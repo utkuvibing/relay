@@ -30,6 +30,19 @@ class AgentRole(str, enum.Enum):
     MODERATOR = "moderator"
 
 
+class BackendType(str, enum.Enum):
+    """How an agent executes (SPEC Appendix B.2/B.3).
+
+    API adapters may resolve credentials from environment/config; harness
+    adapters own their login/session entirely and are invoked through
+    their supported CLI/process interface. The Agent abstraction assumes
+    nothing beyond this declaration.
+    """
+
+    API = "api"
+    HARNESS = "harness"
+
+
 class TokenUsage(BaseModel):
     """Observability data per run (SPEC §25)."""
 
@@ -76,6 +89,9 @@ class Agent(abc.ABC):
 
     #: Provider-facing name used in configs, e.g. "gpt", "claude", "codex".
     name: ClassVar[str]
+
+    #: Execution family declared by each adapter (Appendix B.2/B.3).
+    backend: ClassVar[BackendType] = BackendType.API
 
     @abc.abstractmethod
     async def run(self, request: AgentRequest) -> AgentResponse:

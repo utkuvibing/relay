@@ -134,6 +134,11 @@ class ArtifactKind(str, enum.Enum):
     TEST_RESULT = "test_result"
     PROPOSAL = "proposal"
     REVIEW_FINDING = "review_finding"
+    #: Canonical record of what entered / came out of one agent run
+    #: (SPEC Appendix B.1). Lifecycle events reference these instead of
+    #: carrying prompt/response payloads, and remain pure lifecycle markers.
+    RUN_INPUT = "run_input"
+    RUN_OUTPUT = "run_output"
     OTHER = "other"
 
 

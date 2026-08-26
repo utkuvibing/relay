@@ -1853,3 +1853,62 @@ Binding for Phase 2+: every tool execution flows through
 `PermissionGate.check()`. Executors act only on outcome `allow`;
 `needs_approval` blocks until a human Approval exists; `never` is
 absolute. No executor may bypass or pre-execute before the gate.
+
+---
+
+# Appendix B — Phase 1 Amendments
+
+Normative amendments ratified at the start of Phase 1
+(Single-Agent Runtime). They refine — never weaken — the guarantees of §27.
+
+## B.1 Run input/output are first-class artifacts (amends §5/§15)
+
+* One-shot agent exchanges are not conversation-bus traffic;
+  `MessageType` is untouched by them.
+* What enters and leaves a run persists as first-class artifacts with
+  kinds `run_input` / `run_output` (`ArtifactKind.RUN_INPUT`,
+  `RUN_OUTPUT`), tied to the Run.
+* Lifecycle events (`AGENT_RUN_STARTED`, `AGENT_RUN_FINISHED`) remain
+  pure lifecycle markers: they reference the run/artifact ids and must
+  never carry prompt or response payloads as their canonical record.
+
+## B.2 Execution families (amends §7)
+
+Relay agents fall into two execution families:
+
+```text
+API-backed       OpenAI-compatible HTTP, Anthropic API, DeepSeek API,
+                 local OpenAI-compatible servers
+Harness-backed   Codex CLI using its own ChatGPT/account authentication,
+                 Claude Code using its own subscription/account
+                 authentication, Gemini CLI and other official
+                 subscription-aware clients, future local/external
+                 agent harnesses
+```
+
+The core `Agent` abstraction assumes nothing about transport:
+no assumption that an agent is HTTP-backed, API-key authenticated,
+billed per token, or invoked through a model API. `TokenUsage` fields
+are optional; `cost_usd` may remain `None`; harness runs may carry no
+usage data at all.
+
+## B.3 Authentication ownership (amends §7/§18)
+
+* API adapters may resolve credentials from environment/config.
+* Harness adapters own their login/session/authentication entirely.
+* Relay never scrapes, copies, persists, proxies, or reinterprets
+  subscription session credentials.
+* Relay invokes authenticated harnesses only through their supported
+  CLI/process interface.
+* Credentials/secrets come from environment variables only; user
+  configuration files hold non-secret provider facts (backend type,
+  adapter name, model, base URL) and must never contain keys/tokens.
+
+## B.4 Roadmap note (amends §27 ordering labels)
+
+P1 delivers the first **API-backed** adapter. Phase 2 — Codex CLI /
+local tool runtime — is the first **subscription-backed (harness)**
+adapter. Claude Code, Gemini CLI, and further official harnesses arrive
+via later provider expansion (§27 Phase 11 spirit). The api/harness
+separation above is fixed now so configuration represents backend type
+without schema redesign later.

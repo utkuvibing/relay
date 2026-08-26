@@ -3,12 +3,15 @@
 import pytest
 from pydantic import ValidationError
 
+from relay.agents.base import AgentRequest, AgentResponse, AgentRole, TokenUsage
 from relay.core.evidence import EvidenceKind
 from relay.core.permissions import Action
 from relay.core.state_machine import TaskState
 from relay.storage.models import (
     Approval,
     ApprovalStatus,
+    Artifact,
+    ArtifactKind,
     Decision,
     DecisionStatus,
     EventLogEntry,
@@ -199,3 +202,41 @@ class TestRunObservability:
         restored = ToolRun.model_validate_json(tool_run.model_dump_json())
         assert restored.tool == "git.diff"
         assert restored.arguments == {"ref": "HEAD"}
+
+
+class TestRunIOArtifacts:
+    """Phase 1 amendment: run I/O persists as first-class artifacts (App. B.1)."""
+
+    def test_run_input_and_output_kinds_exist(self):
+        assert ArtifactKind.RUN_INPUT.value == "run_input"
+        assert ArtifactKind.RUN_OUTPUT.value == "run_output"
+
+    def test_run_io_artifacts_are_tied_to_a_run(self):
+        run = Run(agent="gpt", role=AgentRole.RESEARCHER)
+        prompt_artifact = Artifact(kind=ArtifactKind.RUN_INPUT, run_id=run.id, content="prompt")
+        output_artifact = Artifact(kind=ArtifactKind.RUN_OUTPUT, run_id=run.id, content="answer")
+        assert prompt_artifact.run_id == output_artifact.run_id == run.id
+        assert prompt_artifact.content == "prompt"
+
+    def test_run_output_without_usage_is_valid(self):
+        # App. B.2: usage/cost are optional; harness-backed runs may carry none.
+        artifact = Artifact(kind=ArtifactKind.RUN_OUTPUT, run_id="r1", content="answer")
+        assert artifact.model_dump_json()
+
+
+class TestTokenUsageIsOptional:
+    """Transport-neutral Agent layer (SPEC App. B.2)."""
+
+    def test_token_usage_all_fields_optional(self):
+        usage = TokenUsage()
+        assert usage.input_tokens is None
+        assert usage.output_tokens is None
+        assert usage.cost_usd is None
+
+    def test_agent_request_response_have_no_transport_fields(self):
+        request = AgentRequest(prompt="p", role=AgentRole.RESEARCHER)
+        dump = request.model_dump()
+        forbidden = {"api_key", "url", "headers", "auth", "model", "cost"}
+        assert not (forbidden & set(dump))
+        response = AgentResponse(agent="gpt", role=AgentRole.RESEARCHER, output="o", usage=None)
+        assert not (forbidden & set(response.model_dump()))
