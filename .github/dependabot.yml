@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions current: Dependabot updates the full
+  # commit SHA (and its "# vX.Y.Z" version comment) whenever upstream
+  # releases a newer action version.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
