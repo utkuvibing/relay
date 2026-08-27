@@ -238,6 +238,17 @@ M5 Phase 1
 
 Room aynı konu üzerinde günler sonra devam edebilir.
 
+Room üyeliği named **logical seat**'lerdir: her seat bir role bağlıdır ve bir
+configured binding aracılığıyla konfigüre edilmiş bir logical agent'a bağlanır;
+seat'in kimliği model/backend değişse bile stabil kalır ve workflow metni asla
+somut provider adına referans vermez. Yukarıdaki listede her member satırı bir
+seat + role gösterir; GPT/Claude/Codex/DeepSeek etiketleri o seat'lere bind
+edilmiş config instance'lardır (model/backend fact'leri) — yani bir "member"
+provider değildir, seat'tir (Appendix D.2). Bir Room ek olarak kalıcı bir
+sohbet beslemesidir (chronological feed): mesajlar, kayıtlar ve insan katılımı
+aynı geçmişte yaşar — Room bir transient execution batch'i değil, uzun ömürlü
+koordinasyon yüzeyidir (Appendix D.1/D.11).
+
 ---
 
 ## Task
@@ -371,6 +382,14 @@ required approvals = granted
 Bu kural harness-backed agent'ların sözlü tamamlama beyanlarına da birebir
 uygulanır — model/harness'in "done" demesi kanıt değildir (Appendix C.7).
 
+Bu şema bilinçli olarak KUCUK kalır: Room tartışma-first akışında otomatik
+yürütme yalnızca İNSANIN açık plan freeze/kabul kararından sonra başlar; bu
+sınır zaten PLAN_READY → IMPLEMENTING kenarına biner (Appendix D.3). Bir
+katılımcının clarification beklemesi gibi aşama-içi bekleme durumları kanonik
+TaskState DEĞİLDİR — runtime/dispatch koşuludur ve ileride bir execution
+substate olarak temsil edilebilir (Appendix D.6). Bu ek için state machine'e
+yeni durum eklenmez.
+
 ---
 
 # 7. Agent Abstraction
@@ -476,6 +495,16 @@ Moderator
 Fakat modeller serbest biçimde sonsuza kadar konuşmayacaktır.
 
 Her discussion bir protocol tarafından sınırlandırılır.
+
+Inter-agent mesajlaşma aynı zamanda **tipli ve adresli**dir: her mesaj bir
+message type taşır, alıcısı bir logical agent veya roldür, blocking /
+non-blocking olarak sınıflandırılır ve ilgili plan/decision/finding/artifact
+kayıtlarına referans verebilir. Kim kime ne amaçla yazabilir communication
+policy tarafından belirlenir — serbest otonom grup sohbeti yoktur
+(Appendix D.5–D.7). Konuşma asla sessizce kanonik state'i mutasyona
+uğratmaz; sonuç doğuran değişimler Relay tarafından açıkça Decision / Plan
+revizyonu / Finding / Approval kaydına promote edilir (Appendix D.4). Principle: **Conversation is coordination input, not workflow
+authority.**
 
 ---
 
@@ -600,6 +629,15 @@ Amaç:
 * düşük token maliyeti,
 * daha az distraction,
 * daha doğru agent output'u.
+
+Room çalışmasında Context Engine'in ikinci sorumluluğu **katılımcı
+başına task context'i yeniden kurmaktır**: aktif (en son kabul edilen)
+plan ve onun supersession zinciri, kabul edilmiş kararlar, çözülmemiş
+blocking communication'lar, ilgili inter-agent notlar, güncel reviewer
+findings, ilgili artifacts/diffs/evidence ve Room geçmişinden seçilmiş
+alıntılar — hepsi canonical store'dan türetilir. Katılımcılar varsayılan
+olarak bütün Room transcriptine bağımlı OLAMAZ; external harness session
+resume bir optimizasyondur, source of truth değildir (Appendix D.10).
 
 ---
 
@@ -1257,7 +1295,18 @@ Implement:
 * agent roles,
 * conversation persistence,
 * heterogeneous execution families day one — API-backed ↔ harness-backed
-  kombinasyonları birinci sınıftır (Appendix C.7).
+  kombinasyonları birinci sınıftır (Appendix C.7),
+* typed inter-agent messages — Phase-0 conversational çekirdeği
+  (opinion/challenge/rebuttal/final_position/synthesis/review_finding)
+  üzerine Appendix D.5 uzantıları: clarification_request,
+  clarification_response, proposal, note; blocking-ness mesaj metadata'sıdır
+  (Appendix D.6),
+* mesajların plan/decision/finding/artifact referansları taşıması — sonuç
+  doğuran mesajlar bu referanslar üzerinden canonical kayıtlara promote
+  edilir (Appendix D.4),
+* chronological Room feed'in persisted mesaj + event log'dan üretilen
+  zaman sıralı görünümü — heterojen katılımcılar (api agent, harness agent,
+  insan, Relay system) aynı feed'de yaşar (Appendix D.1/D.11).
 
 Exit gate:
 
@@ -1269,6 +1318,19 @@ Agent A (api) → Agent B (harness) → Agent C (farklı bir harness)
 tartışması insan copy-paste'i olmadan yapılabilmeli. Routing logical agent
 identity, role, backend family ve capability üzerinden çalışır; hardcoded
 provider branching test-dışı desendir (Appendix C.7).
+
+Kabul şartları (Appendix D.11):
+
+* api ↔ harness trafik aynı protocol ve aynı mesaj vokabülerini kullanır;
+  provider'a özgü message routing yoktur.
+* Bir blocking clarification, ilgili stage'i yanıt gelene kadar duraklatır;
+  bekleme yeni bir TaskState eklemeden modellenir (D.6).
+* Non-blocking not, göndericinin akışını kesmez ve alıcının ilerideki
+  reconstructed context'inde görünür (D.10).
+* Mesaj kayıtları sender/recipient (logical agent veya role)/room/task/type/
+  blocking/references provenance alanlarını taşır (D.5).
+* Konuşma trafiği kanonik state'e sessiz yazma yapamaz — bunu kanıtlayan
+  testler D.8 invariant'larını P4'te doğrular.
 
 ---
 
@@ -1291,6 +1353,25 @@ Protocol'lar participant taleplerini role + required capability olarak
 ifade eder (planner, critic, adversarial reviewer, domain expert …);
 somut provider/model seçimi protocol metninden bağımsızdır ve ortogonaldir
 (Appendix C.7).
+
+## Communication policy ve bütçeler (Appendix D.7/D.11)
+
+Protocol'lar iletişim izinlerini ve bütçelerini tanımlayan bir katman
+taşır; katılımcılar role, capability ve logical agent configuration ile
+seçilir — asla provider/model adıyla:
+
+* allowed sender → recipient ilişkileri (hangi seat hangi seat'e yazabilir),
+* her pair için allowed message purposes/types (ör. implementer → planner:
+  clarification_request + proposal; implementer → reviewer: yalnızca note),
+* blocking clarification round-trip bütçeleri (stage başına),
+* toplam inter-agent mesaj/loop bütçeleri (task/stage başına),
+* loop detection ve non-convergence'da insana escalation,
+* micro-communication'ın yalnızca protocol-sınırlı stage'ler içinde
+  var olması — "free autonomous group chat" bu phase'te mümkün değildir.
+
+Söz dizimi burada dondurulmaz (P5 implementasyon kararıdır); normatif olan:
+**kimin kime, ne semantik amaçla, hangi bütçeyle yazabileceği
+policy-kontrolüdür** (Appendix D.7).
 
 Exit gate:
 
@@ -1325,6 +1406,43 @@ Implement:
 * automatic fix packet generation,
 * max loop count,
 * final verification.
+
+Bu otomatik yürütme yalnızca kabul edilmiş (frozen) bir canonical planın
+varlığında başlar; tartışma-first akışında bu sınır insanın açık
+"plan freeze & execute" geçişidir (Appendix D.3).
+
+## Bounded micro-interactions inside stages (Appendix D.6/D.11)
+
+Dış (outer) workflow yukarıdaki gibi birebir kalır; dispatch ve stage
+ilerleme kararları daima Relay'dedir. Stage'lerin İÇİNDE, policy ve bütçe
+kontrolünde tipli mikro-etkileşimlere (bounded micro-interactions — küçük
+sınırlı mikro-döngüler/micro-loops oluşturabilir) izin verilir. Amaçları:
+belirsizliği çözmek, varsayımları challenge etmek, implementation tercihlerini
+açıklamak, yerel plan sapması talep etmek — dış döngüyü ikame etmek değil:
+
+```text
+Implementer ↔ Planner   clarification_request/response
+Reviewer   ↔ Implementer question / response
+Reviewer   → Planner     challenge → Decision
+Fixer      → Planner     plan-conflict proposal → Decision (+ plan revision)
+```
+
+Örnek: Reviewer bir bulguyu Planner'a taşır; Planner karar üretir
+(DECISION-n) ve gerekiyorsa PLAN-(n+1) önceki planı "supersedes"
+ilişkisiyle devralır; Implementer yeni canonical context'e karşı devam
+eder. Mikro-döngüler dış döngünün YERİNİ GEÇMEZ — sadece onu besler.
+
+Kabul şartları:
+
+1. Mikro-iletişim kanonik state'i sessizce mutasyona uğratamaz (D.4).
+2. Sonuç doğuran değişimler Decisions / Plan revizyonları olarak promote
+   edilir; promotion append-only kayıt üretir (§15).
+3. Communication bütçeleri non-convergent döngüleri durdurur; tükenme
+   durumunda insana escalation olur (D.7).
+4. Dış deterministik loop her koşulda kontrolde kalır — stage tamamlanma
+   kararı hâlâ EvidenceStore'dan çözülür (A.1/C.7).
+5. İnsan otomasyonu interrupt edebilir, role'e hitap edebilir ve
+   escalate edebilir (D.9).
 
 Implementer/reviewer/planner rolleri bağımsız değiştirilebilir configured
 agents'tır — Codex, Claude Code, Google harness (beklenen: Antigravity CLI)
@@ -1362,6 +1480,28 @@ Room:
 * artifacts
 
 saklar.
+
+## Persistent Room model (Appendix D.11)
+
+P7 Room'u kalıcı "AI group chat" haline getirir — sadece transient bir
+execution protocol'ü değil. Ek gereksinimler:
+
+* stable logical Room members/seats; seat→agent binding provider/model'den
+  bağımsız ve rebind-edilebilir (Appendix D.2),
+* persistent Room history: mesajlar, feed, insan katılımı ve Relay system
+  mesajları oturum kapatıp açmaya rağmen yaşar (Appendix D.1),
+* canonical plan/decision/finding ilişki ağı — frozen plan'lar, onların
+  supersedes zincirleri, kararlar ve findings Room state'inin parçasıdır
+  (Appendix D.3),
+* hedefli kullanıcı mesajları: insan belirli bir role/agent'e hitap
+  edebilir (@planner / @reviewer tarzı; söz dizimi P7 product kararıdır,
+  App. D.9),
+* her katılımcı için Context Engine reconstruction: ROLE · TASK · CURRENT
+  PLAN · RELEVANT DECISIONS · CONSTRAINTS · CURRENT FINDINGS · RELEVANT
+  ARTIFACTS/FILES — transcript replay'i değil (Appendix D.10),
+* external session continuation yalnızca session_resume capability'si
+  destekleniyorsa kullanılır; resume yoksa canonical kayıtlardan fresh-run
+  reconstruction dürüstçe yapılır (App. C.7 normatif kabulünü korur).
 
 Room membership identity mantıksal agent identity'dir (backend swap'lerinde
 stabil). Harness'e özgü mutable durum (external_session_ref gibi non-secret
@@ -1724,6 +1864,21 @@ Relay şudur:
 
 Bu boundary korunmalıdır.
 
+## Product north star
+
+A Relay Room is a persistent group conversation with a user-selected AI team:
+the user develops an idea interactively with a Planner, freezes that discussion
+into a canonical executable plan, and lets Relay automatically coordinate
+implementation, verification, review, and fix loops. Agents may exchange
+bounded, typed messages to resolve ambiguity or challenge prior work — but
+conversation never silently becomes workflow state; consequential exchanges are
+promoted into explicit canonical plans, decisions, findings, artifacts, or
+evidence (Appendix D). Two normative compressions of this model:
+
+> **Conversation is coordination input, not workflow authority.**
+
+> **Agent collaboration is bounded and typed, not free-form autonomous chatter.**
+
 ---
 
 # 33. Success Criteria
@@ -1779,34 +1934,38 @@ V1'de özellikle hedeflenmeyecek:
 Kesin uygulama sırası:
 
 ```text
-P0  Specification
+P0  Specification Freeze
  ↓
-P1  Core + Storage
+P1  Single-Agent Runtime
  ↓
-P2  Single Agent
+P2  Generic Harness Runtime
  ↓
-P3  Generic Harness Runtime
+P3  Deterministic Task State Machine
  ↓
-P4  State Machine
+P4  Multi-Agent Messaging (communication bus)
  ↓
-P5  Implementation / Review Loop
+P5  Discussion Protocols (communication policy & budgets)
  ↓
-P6  Multi-Agent Bus
+P6  Automated Implementation Review Loop (semantic execution loop)
  ↓
-P7  Discussion Protocols
+P7  Rooms & Long-Lived Context (persistent Room model)
  ↓
-P8  Rooms
+P8  Decision Provenance
  ↓
-P9  Decision Provenance
+P9  Relay Server
  ↓
-P10 Server
+P10 MCP / Chat Interface Integration
  ↓
-P11 MCP / Chat Interface
+P11 Adapter Ecosystem & Certification
  ↓
-P12 Adapter Ecosystem & Certification
- ↓
-P13 TUI
+P12 TUI
 ```
+
+P-labels are the §27 Phase numbers — the operative convention used by exit
+gates, commit history, and status reporting. Pre-harness drafts numbered the
+order differently; where older prose or artifacts diverge, §27 numbering is
+authoritative. The bus/protocols phases precede the automated loop because
+the loop consumes them as infrastructure.
 
 Özellikle:
 
@@ -1942,8 +2101,11 @@ never weaken — the guarantees above.
   message_sent, artifact_created, evidence_recorded, tool_requested/
   completed, approval_requested/granted/rejected,
   decision_proposed/accepted/rejected.
-* `MessageType` remains exclusively conversational: opinion, challenge,
-  rebuttal, final_position, synthesis, review_finding.
+* `MessageType` remains exclusively conversational: the Phase-0 frozen set
+  (opinion, challenge, rebuttal, final_position, synthesis, review_finding),
+  extended additively from Phase 4 onward per Appendix D.5
+  (clarification_request, clarification_response, proposal, note) — still
+  never a carrier for system events.
 * The two vocabularies are disjoint by test. Agent conversation appears
   in the log only as MESSAGE_SENT markers referencing Message records.
 
@@ -2195,7 +2357,7 @@ unchanged. Any richer backend metadata is deferred and, if ever
 required, arrives as a strict, redaction-checked JSON column — never
 free-form secrets.
 
-## C.7 Roadmap consequences (annotates §27 P3–P10)
+## C.7 Roadmap consequences (annotates §27 P3–P10; extended by Appendix D.11 for Room & communication semantics)
 
 * P3: harness-emitted statements (implementation complete / tests
   passed / task done) enter ONLY as claim-bearing artifacts and
@@ -2233,7 +2395,7 @@ Old scope ("Provider Expansion": OpenAI / Anthropic / DeepSeek /
 Codex CLI / Claude Code / OpenCode / local APIs) is conceptually
 retired: heterogeneous backends arrive with Phase 2, BEFORE multi-agent
 orchestration (Phase 4). Replaced by **Adapter Ecosystem &
-Certification** (build-order label `P12` in §35):
+Certification** (§27 Phase 11):
 
 * more API providers; more harnesses; local runtimes;
 * adapter × harness-version × OS compatibility matrix;
@@ -2248,3 +2410,411 @@ Certification** (build-order label `P12` in §35):
 Exit gate: a brand-new compliant adapter (third-party-authored is
 ideal) passes certification without touching relay/core, relay/storage,
 or the bus.
+
+---
+
+# Appendix D — Relay Room & Bounded Inter-Agent Communication Amendments
+
+Normative amendments defining the intended **Relay Room** experience and the
+**bounded inter-agent communication model** from Phase 4 onward. They refine —
+never weaken — §§1–37 and Appendices A–C. Nothing here adds a task state,
+changes evidence or permission semantics, freezes UI syntax, or introduces
+provider-specific concepts into core protocol vocabulary.
+
+## D.1 Product north star and normative principles
+
+A Relay Room is a persistent group conversation with a user-selected AI team.
+The user develops an idea interactively with a Planner, freezes that discussion
+into a canonical executable plan, and lets Relay automatically coordinate
+implementation, verification, review, and fix loops. Agents exchange bounded,
+typed messages to resolve ambiguity or challenge prior work; consequential
+exchanges are promoted into explicit canonical plans, decisions, findings,
+artifacts, or evidence.
+
+Normative compressions (restated from §32):
+
+> **Conversation is coordination input, not workflow authority.**
+
+> **Agent collaboration is bounded and typed, not free-form autonomous chatter.**
+
+The user-facing mental model is *managing an AI team*, not *sending prompts to
+several independent models*. A Room UI would typically pair a seat roster
+(role → bound logical agent → activity state) with one chronological feed of
+messages, canonical records, and human/system entries. Such sketches are
+illustrative only; the contracts below are normative, and no UI wording in this
+appendix is frozen.
+
+Relay remains exactly what §2 says it is — the coordination/authorization layer.
+The Room experience changes what RELAY COORDINATES (seats, plans, bounded
+agent-to-agent exchanges), never WHO OWNS STATE or AUTHORITY.
+
+## D.2 Seats are configuration; roles are protocol
+
+A Room exposes named **seats** (Planner, Implementer, Reviewer, Fixer; optional
+Verifier / Researcher / Domain Expert). Each seat binds to a configured
+logical agent:
+
+```text
+Planner      → claude        (api-family config instance)
+Implementer  → codex-cli     (harness-family config instance)
+Reviewer     → gpt           (api-family config instance)
+Fixer        → claude-code   (harness-family config instance)
+```
+
+Product names above are configuration-time instance values (App. C.1) used for
+illustration only.
+
+Definitions, used consistently throughout this appendix:
+
+* A **logical seat** is a stable logical place in a Room — a role slot that
+  persists across rebinding and backend swaps.
+* A **binding** assigns a configured agent to that seat. It is a
+  configuration/runtime fact.
+* A **logical agent** is the configured instance a binding points to; its
+  provider, model, and backend are properties OF THE BINDING — never protocol
+  semantics and never part of the seat's identity.
+
+* Workflow, state machine, protocols, and routing speak ONLY role +
+  capability + logical-agent identity (§8, C.3, C.7). Seat→agent bindings are
+  runtime/config choices — never protocol semantics.
+* Rebinding a seat to a different logical agent (different model OR different
+  backend family) must not change workflow behavior; selection stays
+  deterministic over capabilities + availability + auth_state (C.7 P6).
+* Core vocabulary gains NO provider concepts from this appendix (C.1 holds).
+
+## D.3 Discussion-first Rooms and the canonical plan contract
+
+A Room does NOT begin autonomous execution. Its initial mode is human-led
+discussion — primarily with the Planner — where clarifications, constraints,
+scope, assumptions, risks, and unresolved questions are worked out over an
+unbounded amount of useful time.
+
+The expected flow:
+
+```text
+User → Planner discussion → clarifications/constraints/scope
+     → structured plan → explicit plan freeze → automatic execution
+```
+
+During this stage the Planner helps transform an incomplete idea into a
+durable implementation brief containing, where applicable: goal, scope,
+non-goals, assumptions, architectural decisions, constraints, implementation
+units, acceptance gates, tests, risks, unresolved questions.
+
+Autonomous execution begins only on an EXPLICIT transition (e.g.
+"Freeze Plan & Execute"). Exact wording is UX; the semantic boundary is
+normative:
+
+> **Discussion must never implicitly start implementation.**
+
+The freeze/accept decision belongs to the HUMAN. The Planner may prepare,
+propose, and revise plan artifacts inside the discussion, but it cannot accept
+its own plan into canonical state and cannot start execution by itself. The
+explicit human freeze maps onto the existing `PLAN_READY → IMPLEMENTING`
+edge of §6 — no new TaskState is introduced. Standalone entry points such as
+`relay build "..."` are themselves explicit human initiation; the
+discussion-first discipline governs Room-led workflows.
+
+A frozen plan becomes a canonical Room/Task artifact (`ArtifactKind.PLAN`
+today), referenced as PLAN-n:
+
+```text
+PLAN-17 accepted by the human freeze decision
+```
+
+Downstream agents operate against the canonical plan plus associated decisions
+— NOT against an uncontrolled replay of the full conversational transcript
+(D.10).
+
+Supersession is first-class: a consequential follow-up may promote into
+DECISION-n and/or PLAN-(n+1) carrying an explicit "supersedes PLAN-n"
+relationship (`DecisionStatus.SUPERSEDED` already models this shape); agents
+resume against the NEW canonical context. Plan-history chains are append-only:
+revisions create new records, they do not rewrite accepted ones (§15).
+
+## D.4 Conversation is not state
+
+> **Conversation may inform canonical state, but conversation is not canonical
+> state.**
+
+Plain agent messages NEVER silently mutate: the accepted plan, task state,
+decisions, approval state, evidence, role assignments, or permission/protocol
+policy. This holds by construction, via guarantees that already exist:
+
+* state transitions resolve exclusively from provenance-backed EvidenceStore
+  records (A.1, C.7);
+* approval evidence comes only from `human:*` producers (A.1/A.3);
+* permissions change only through Relay policy and PermissionGate (§18, C.5);
+* canonical history is append-only (§15).
+
+Most conversation needs NO promotion — questions receive answers,
+explanations inform their readers, notes persist as context. Only
+consequential, state-affecting exchanges require promotion into explicit
+canonical records:
+
+```text
+Message → Proposal / Clarification / Challenge → Resolution
+        → canonical Decision and/or Plan revision
+        → updated participant context
+```
+
+An agent saying "yes, that sounds good" is not by itself a hidden workflow
+mutation. When an exchange IS consequential, Relay performs promotion
+explicitly (Decision, Plan revision, Finding, Approval, Artifact, Evidence
+record, task/workflow transition); each promotion is a new append-only record
+with provenance. Promotion is Relay's act — never a side effect of messages.
+
+## D.5 Typed inter-agent messages
+
+Inter-agent communication is first-class data (§5 Message). The Phase-0
+frozen conversational set remains; required communication purposes are
+reconciled against it and extended ONLY where semantically necessary:
+
+| Required purpose | Disposition | Notes |
+|---|---|---|
+| question / clarification_request | NEW: `clarification_request` | blocking-capable |
+| answer / clarification_response | NEW: `clarification_response` | pairs with request |
+| proposal (incl. local deviation from current plan) | NEW: `proposal` | distinct from opinion: targets adoption of a change |
+| challenge (assumptions, findings, prior work) | EXISTS: `challenge` | unchanged |
+| note (non-blocking information for a later participant) | NEW: `note` | never blocks |
+| finding | EXISTS: `review_finding` | unchanged |
+| blocker | metadata, NOT an enum value | any blocking-flagged challenge/proposal/finding |
+| plan_revision_request | `proposal` referencing the target plan revision | no separate enum |
+| decision_response | answer class (`rebuttal` / `final_position`, or `clarification_response`) chosen by exchange shape | reuses existing vocabulary |
+
+Blocking-ness is per-message metadata, never implied by type alone (D.6).
+This table fixes CONCEPTS, not spellings: identifiers are shown in lowercase
+concept form (matching today's persisted message-type values); final enum
+member names, casing, and storage values are left to P4 implementation. The
+enum may evolve further, provided the disjointness invariant of A.2 holds and
+extensions remain additive.
+
+Message records carry enough routing/provenance information to identify:
+sender logical agent; recipient logical agent OR role; room; task; message
+type; whether the message blocks execution (and its budget accounting key
+where relevant); references to related plans/decisions/findings/artifacts/
+evidence where applicable; timestamp. The existing `Message` fields
+(sender/recipient/room_id/task_id/type/content/references/created_at) stand;
+additions land additively when Phase 4 implements them (same additive-only
+discipline as C.6).
+
+EventType/MessageType disjointness (A.2) is untouched: agent conversation
+still appears in the event log only as MESSAGE_SENT markers referencing
+Message records.
+
+Illustrative end-to-end promotion:
+
+```text
+Implementer → Planner (proposal):  "C4 specifies one normalization registry.
+  Bundle-specific registries preserve the same public interface while reducing
+  special cases. May I use that design instead?"
+Planner → Implementer:             "Yes — bundle-specific registries, but keep
+  the public interface and the fold-local-state constraint."
+Relay promotes the exchange  → DECISION-24 (accepted constraint-resolved design)
+                             → PLAN-18 supersedes PLAN-17
+Implementer resumes against the new canonical context.
+```
+
+## D.6 Blocking vs non-blocking communication
+
+Two classes:
+
+**Blocking clarification** — the current participant cannot safely continue
+without an answer ("I cannot choose between these two schema interpretations
+without changing the accepted contract.").
+
+```text
+IMPLEMENTER → WAITING_FOR_CLARIFICATION → planner response
+            → optional Decision / Plan revision → IMPLEMENTER CONTINUES
+```
+
+The WAITING element in the diagram above is drawn as illustration only: it is
+a RUNTIME EXECUTION CONDITION, not a canonical TaskState and not a proposed
+enum member. The frozen §6 state machine is untouched; waiting is a
+stage-internal scheduler/dispatch condition that a later implementation phase
+MAY represent as an execution/dispatch substate. Resolution authority stays
+with Relay — a blocked stage resumes only when the answer (and any promoted
+canonical record) exists, never because an agent asserts continuation.
+Blocking round-trips count against budgets (D.7); unanswered/blocked stages
+escalate to the human rather than spinning silently.
+
+**Non-blocking note** — the participant continues immediately ("This
+compatibility shim is intentional because v1 databases must migrate in
+place."); the NOTE becomes available context for its recipient later through
+Context Engine reconstruction (D.10).
+
+Micro-loops formed by these exchanges live INSIDE the deterministic outer
+workflow (D.11 P6) — they never replace it.
+
+## D.7 Communication policy and boundedness
+
+Relay must not become an uncontrolled autonomous group chat. Who may contact
+whom, for what semantic reason, and with what budget is POLICY-controlled.
+Configuration/protocols can express constraints equivalent to:
+
+```text
+implementer: → planner:  [clarification_request, proposal]   # blocking allowed
+             → reviewer: [note]
+reviewer:    → implementer: [clarification_request, challenge]
+             → planner:  [challenge]
+fixer:       → planner:  [proposal, clarification_request]
+             → reviewer: [clarification_request]
+```
+
+(The tree above is illustrative; exact syntax is deferred to P5.) Invariants:
+
+* support maximum blocking-clarification round-trips per stage and maximum
+  total inter-agent messages per task/stage;
+* loop detection applies to agent↔agent traffic (§24 Anti-Loop conditions —
+  repeated arguments, no new evidence, max rounds, budget exceeded);
+* when communication cannot converge, escalate to the HUMAN instead of
+  continuing;
+* policy violations are rejected/degraded explicitly by Relay — never
+  silently re-routed around policy.
+
+Exhausting any budget is a deterministic event: it triggers escalation, not a
+silent extension. Budgets are never auto-increased mid-task, and forbidden
+exchanges cannot be re-sent under another type to evade accounting.
+
+No arbitrary unbounded agent-to-agent conversation exists anywhere in the
+model: free-form debate survives ONLY inside protocol-bounded stages (§9–§11),
+and Room micro-communication survives only inside policy budgets —
+**agent collaboration is bounded and typed, not free-form autonomous
+chatter** (D.1).
+
+## D.8 No hidden authority transfer
+
+Inter-agent communication never grants new authority. Through conversation
+agents may NOT:
+
+* change their own permissions;
+* assign themselves another role;
+* approve their own privileged action;
+* declare their own claims authoritative evidence;
+* mark verification evidence satisfied;
+* silently alter protocol/policy;
+* bypass Relay routing;
+* bypass PermissionGate / Execution Grants (A.4/C.5).
+
+Existing evidence, approval, permission, and state-machine guarantees remain
+authoritative. Each failure mode above is either impossible by construction
+or a conformance defect that P4/P5 acceptance tests must demonstrate closed.
+
+## D.9 User participation
+
+The human remains a first-class Room participant. Product phases must make
+the following possible without re-defining protocol semantics here:
+
+* address a specific role/agent (illustrative UX: "@reviewer Is this really a
+  blocker?", "@planner Evaluate the reviewer finding without expanding scope.",
+  "@implementer Why did you choose this approach?");
+* interrupt automatic execution;
+* ask the Planner to reconsider a finding; ask the Reviewer to justify a
+  blocker;
+* request a plan revision;
+* pause/resume execution;
+* replace/rebind a logical agent seat (config-level operation, D.2);
+* inspect decisions/artifacts/evidence generated from agent exchanges
+  (`relay why <decision>`, `relay inspect <task>` already promise this).
+
+Addressing/intervention syntax belongs to later product phases (P7+); the Room
+architecture defined above must not make this interaction impossible.
+
+Human intervention never bypasses evidence, approval, or permission contracts.
+A message typed into Room chat is ordinary Message traffic; asking an agent in
+chat does not mint evidence, and requesting a gated action still traverses
+PermissionGate with its existing outcomes. Approvals enter canonical state
+only through the existing approval mechanics with `human:*` producers
+(A.1/A.3) — participating in a Room grants human or agent alike no parallel
+pipeline around these contracts.
+
+## D.10 Context Engine consequence
+
+Participants receive RECONSTRUCTED, task-relevant context — selected from the
+canonical store, not unlimited chat replay:
+
+ROLE · TASK · CURRENT PLAN (latest accepted) · plan supersession chain ·
+ACCEPTED DECISIONS · UNRESOLVED BLOCKING COMMUNICATION · RELEVANT INTER-AGENT
+NOTES · CURRENT REVIEWER FINDINGS · RELEVANT ARTIFACTS/DIFFS · EVIDENCE ·
+relevant Room history excerpts.
+
+The full Room transcript is NEVER the default participant input; agents MUST
+NOT depend on receiving it (§12 states the same contract).
+
+External harness session resume remains an optimization built on the C.2 seam
+and C.4-allowlisted `external_session_ref`. If resume is unavailable,
+unsupported, expired, or unsafe, Relay reconstructs context from canonical
+records and starts a FRESH backend run — the honest-discontinuity rule of
+C.7 P7 stands. External session state — including any successfully resumed
+session — is never canonical; the canonical store remains the source of truth.
+
+## D.11 Roadmap consequences (extends App. C.7; annotates §27 P4–P7)
+
+**P4 — Messaging / communication bus.** Establishes first-class heterogeneous
+communication between API-backed agents, harness-backed agents, and humans /
+Relay system senders. Acceptance requirements:
+
+* logical-agent-to-logical-agent messages;
+* typed messages (D.5 vocabulary incl. additions, A.2 disjointness preserved);
+* task/room references and routing/provenance fields on every record;
+* blocking vs non-blocking semantics carried on messages (D.6);
+* references to plans/decisions/findings/artifacts where applicable (D.5);
+* API ↔ harness messaging through the SAME protocol; routing keys stay
+  identity/role/backend_family/capability; provider-specific message routing
+  remains a test-forbidden pattern (C.7 P4 upheld);
+* chronological Room feed renderable purely from persisted messages +
+  event log — making the Room feed technically possible here, realized as a
+  product surface later (P7).
+
+**P5 — Protocols.** Protocols define protocol-level COMMUNICATION PERMISSIONS
+AND BUDGETS. Participants are selected by role, capability, and logical-agent
+configuration — never provider/model name (C.7 P5 upheld). Design
+requirements:
+
+* allowed sender → recipient relationships (seat/pair level, D.7);
+* allowed message purposes/types per relationship;
+* blocking-clarification budgets (round-trips per stage);
+* loop/message budgets per task/stage; loop detection;
+* escalation behavior when communication cannot converge;
+* policy-controlled micro-communication only inside protocol-governed stages
+  (discussion protocols and execution-loop stages alike).
+
+P5 exists precisely to prevent free autonomous group chat: an unconstrained
+sender→recipient edge, purpose set, or budget is a conformance defect.
+
+**P6 — Semantic execution loop.** Outer loop unchanged verbatim:
+
+```text
+Plan → Implementer → Verification → Reviewer → PASS
+Reviewer findings → Fixer → Implementer/patch → Verification → Reviewer → PASS
+```
+
+Bounded micro-interactions may occur INSIDE stages (Implementer ↔ Planner
+clarification; Reviewer ↔ Implementer question/response; Reviewer → Planner
+challenge → Decision; Fixer → Planner plan-conflict proposal). Acceptance
+criteria must prove:
+
+* micro-communication cannot silently mutate canonical state (D.4);
+* consequential changes become Decisions / Plan revisions (D.3/D.4);
+* communication budgets stop non-convergent loops (D.7);
+* the outer deterministic loop remains in control (stage completion still
+  resolves exclusively from the EvidenceStore);
+* the human can interrupt/escalate (D.9).
+
+**P7 — Persistent Rooms / context.** Realizes the persistent "AI group chat"
+Room model. Explicit requirements:
+
+* stable logical Room members/seats across sessions (D.2);
+* role bindings independent of provider/model (model ≠ role / backend ≠ role);
+* persistent Room history surviving session boundaries;
+* canonical plan/decision/finding relationships — frozen plans, their
+  supersedes chains, and decision graphs as first-class Room state (D.3);
+* targeted user messages to a specific participant (D.9);
+* Context Engine reconstruction for each participant (D.10);
+* safe external-session continuation when supported (C.2/C.4 seams honored);
+* fresh-run reconstruction from canonical records when resume is unavailable
+  (C.7 P7 honesty rule).
+
+P7 is the phase where the Room becomes persistent across sessions rather than
+only a transient execution protocol — completing the product north star of
+D.1 under all frozen guarantees.
