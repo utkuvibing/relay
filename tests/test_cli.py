@@ -229,19 +229,20 @@ class TestHarnessRefusal:
     def test_harness_agent_errors_naming_the_missing_adapter(self, workspace):
         """G0/R1: unregistered harness adapters fail explicitly, by name.
 
-        P2.3 note: ``claude_code`` is registered now — the refusal premise is
-        pinned with the still-unregistered ``antigravity_cli`` name.
+        P2.4 note: ``antigravity_cli`` is registered now — the refusal
+        premise is pinned with the stable synthetic ``future_cli`` placeholder
+        (grilled decision Q-b).
         """
         (workspace / "relay.yaml").write_text(
-            "agents:\n  agy: {backend: harness, adapter: antigravity_cli}\n",
+            "agents:\n  fut: {backend: harness, adapter: future_cli}\n",
             encoding="utf-8",
         )
         runner.invoke(app, ["init"])
-        result = runner.invoke(app, ["ask", "agy", "make a change"])
+        result = runner.invoke(app, ["ask", "fut", "make a change"])
         assert result.exit_code == 1
         # rich wraps long lines, so assert on wording fragments, not strings.
         assert "unknown agent adapter" in result.output
-        assert "antigravity_cli" in result.output
+        assert "future_cli" in result.output
 
     def test_backend_family_mismatch_is_a_config_error(self, workspace):
         """R1#1: api-declared agent + harness-routed adapter cannot wire."""
