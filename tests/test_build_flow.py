@@ -431,9 +431,11 @@ class TestTaskLifecycle:
         plan_run = next(r for r in runs if r.role == "planner")
         impl_run = next(r for r in runs if r.role == "implementer")
 
-        # The task ended the slice machine-persisted at IMPLEMENTED.
+        # The task ended blocked at VERIFYING: P3.1's workspace has no
+        # verification config (P3.2 contract — absent config blocks honestly,
+        # nothing implementation-shaped or test-shaped is minted past it).
         task = next(iter(store.all_models(Task)))
-        assert task.state is TaskState.IMPLEMENTED
+        assert task.state is TaskState.VERIFYING
 
         # The evidence ledger holds every kind the machine demanded, with
         # honest provenance: plan evidence points at the planning run,
@@ -461,6 +463,7 @@ class TestTaskLifecycle:
         assert "task state: context_ready -> plan_ready" in contents
         assert "task state: plan_ready -> implementing" in contents
         assert "task state: implementing -> implemented" in contents
+        assert "task state: implemented -> verifying" in contents
 
         # The implement prompt was built from the frozen plan artifact (D.3):
         # downstream agents operate against the canonical plan.
@@ -512,6 +515,155 @@ class TestTaskLifecycle:
             asyncio.run(
                 run_build(store, writer, evidence, agent, request, workspace_root=build_workspace)
             )
+        conn.close()
+
+
+def _with_verification(build_workspace, program: str, args: str) -> None:
+    """Append a top-level verification block to the fixture relay.yaml."""
+    relay_yaml = build_workspace / "relay.yaml"
+    relay_yaml.write_text(
+        relay_yaml.read_text(encoding="utf-8")
+        + "verification:\n"
+        + f"  program: {program}\n"
+        + f"  args: {args}\n",
+        encoding="utf-8",
+    )
+
+
+class TestVerification:
+    """P3.2: Relay grades the exam — frozen plan Q-c/Q-f contract."""
+
+    def test_pass_reaches_reviewing_with_provenance(self, build_workspace):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING
+
+        records = evidence.records_for_task(task.id)
+        passed = next(r for r in records if r.kind is EvidenceKind.TESTS_PASSED)
+        assert passed.produced_by == "relay:verification"
+        tool_run = store.load_model(ToolRun, passed.tool_run_id)
+        assert tool_run is not None
+        assert tool_run.tool == "verification"
+        assert tool_run.parent_run_id is None  # Relay-owned (D5)
+        assert tool_run.status.value == "succeeded"
+        artifact = store.load_model(Artifact, passed.artifact_id)
+        assert artifact.kind is ArtifactKind.TEST_RESULT
+        assert "exit=0" in (artifact.content or "")
+
+        writer = EventLogWriter(conn)
+        contents = [e.content for e in writer.all() if e.type is EventType.STATE_TRANSITIONED]
+        assert "task state: implemented -> verifying" in contents
+        assert "task state: verifying -> reviewing" in contents
+        conn.close()
+
+    def test_failure_loops_back_to_implementing(self, build_workspace):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "import sys; sys.exit(3)"]'
+        )
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output  # run succeeded; lifecycle reworked
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING  # honest rework loop
+
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.TESTS_PASSED not in kinds  # a failed exam mints nothing
+
+        # The failed exam's output is reachable through the ToolRun's
+        # result_ref (the artifact is Relay-owned: no run_id of its own).
+        verify_rows = [t for t in store.all_models(ToolRun) if t.tool == "verification"]
+        assert len(verify_rows) == 1 and verify_rows[0].status.value == "failed"
+        result_artifact = store.load_model(Artifact, verify_rows[0].result_ref)
+        assert result_artifact.kind is ArtifactKind.TEST_RESULT
+        assert "exit=3" in (result_artifact.content or "")
+
+        writer = EventLogWriter(conn)
+        contents = [e.content for e in writer.all() if e.type is EventType.STATE_TRANSITIONED]
+        assert "task state: verifying -> implementing" in contents
+        conn.close()
+
+    def test_unresolvable_program_blocks_at_verifying(self, build_workspace):
+        _with_verification(build_workspace, "definitely-not-a-binary-xyz", "[]")
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.VERIFYING  # blocked, never "tests failed"
+
+        rows = [t for t in store.all_models(ToolRun) if t.tool == "verification"]
+        assert len(rows) == 1
+        assert rows[0].status.value == "failed"
+        assert rows[0].error is not None and "not found" in rows[0].error
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.TESTS_PASSED not in kinds
+        conn.close()
+
+    def test_missing_config_blocks_at_verifying(self, build_workspace):
+        """No verification block at all: the §27 gap is visible, nothing minted."""
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.VERIFYING
+        rows = [t for t in store.all_models(ToolRun) if t.tool == "verification"]
+        assert rows == []
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.TESTS_PASSED not in kinds
+        conn.close()
+
+    def test_child_env_strips_parent_secrets(self, build_workspace, monkeypatch):
+        """C.4 discipline extends to Relay's own executions: the verification
+        child sees the baseline-stripped environment, not the parent's."""
+        monkeypatch.setenv("DECOY_TEST_TOKEN", "sk-decoy-live-key-9f2c4e7a1b8d5f3e")
+        probe = "import os; print(os.environ.get('DECOY_TEST_TOKEN', 'absent'))"
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), f'["-c", {json.dumps(probe)}]'
+        )
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        passed = next(
+            r for r in evidence.records_for_task(task.id) if r.kind is EvidenceKind.TESTS_PASSED
+        )
+        artifact = store.load_model(Artifact, passed.artifact_id)
+        assert "absent" in (artifact.content or "")
+        assert "sk-decoy" not in (artifact.content or "")
         conn.close()
 
 

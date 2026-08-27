@@ -63,12 +63,30 @@ class AgentConfig(BaseModel):
         return self
 
 
+class VerificationConfig(BaseModel):
+    """One Relay-owned verification command (SPEC §27 Phase 3, App. A.1).
+
+    Executed through the permission gate as a Relay-owned ToolRun with
+    workspace-root cwd and a bounded timeout; the implementer never grades
+    its own exam. Exit code is the only verdict.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    program: str = Field(min_length=1, description="Executable resolved via PATH.")
+    args: list[str] = Field(default_factory=list)
+    timeout_seconds: float = Field(default=300, gt=0, le=_MAX_HARNESS_TIMEOUT_S)
+
+
 class RelayConfig(BaseModel):
     """The full parsed ``relay.yaml``; unknown top-level fields are rejected."""
 
     model_config = ConfigDict(extra="forbid")
 
     agents: dict[str, AgentConfig]
+    #: P3.2 — Relay-scoped verification (frozen plan Q-c): typed argv, never
+    #: a free-form shell string. Absent → builds block honestly in VERIFYING.
+    verification: VerificationConfig | None = None
 
 
 class ConfigError(ValueError):
