@@ -16,8 +16,8 @@ Phase 1 contract under test:
 import pytest
 import yaml
 
+from relay.agents.antigravity_cli import AntigravityCLIAdapter
 from relay.agents.base import AgentRole, BackendType
-from relay.agents.claude_code import ClaudeCodeAgent
 from relay.agents.registry import UnknownAgentError, get_agent_class
 from relay.context import (
     ConfigError,
@@ -122,18 +122,19 @@ class TestRelayYamlConfig:
     def test_unregistered_harness_adapter_names_the_adapter(self, tmp_path):
         """G0/R1: registry absence fails explicitly naming the adapter.
 
-        P2.3: ``claude_code`` IS registered now, so the G0 refusal is pinned
-        with a still-unregistered harness name instead.
+        P2.4: ``antigravity_cli`` IS registered now, so the G0 refusal is
+        pinned with the stable synthetic placeholder ``future_cli`` instead
+        (grilled decision Q-b: ends the per-release rename churn).
         """
         (tmp_path / "relay.yaml").write_text(
-            "agents:\n  agy: {backend: harness, adapter: antigravity_cli}\n",
+            "agents:\n  fut: {backend: harness, adapter: future_cli}\n",
             encoding="utf-8",
         )
-        agent_cfg = agent_config(load_config(tmp_path), "agy")
+        agent_cfg = agent_config(load_config(tmp_path), "fut")
         assert agent_cfg.backend is BackendType.HARNESS
-        assert get_agent_class("claude_code") is ClaudeCodeAgent  # P2.3: registered
-        with pytest.raises(UnknownAgentError, match="antigravity_cli"):
-            get_agent_class("antigravity_cli")
+        assert get_agent_class("antigravity_cli") is AntigravityCLIAdapter  # P2.4: registered
+        with pytest.raises(UnknownAgentError, match="future_cli"):
+            get_agent_class("future_cli")
 
     def test_unknown_agent_lists_knowns(self, tmp_path):
         (tmp_path / "relay.yaml").write_text(

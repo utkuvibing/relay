@@ -105,6 +105,7 @@ def _default_relay_yaml() -> str:
         "# Phase 2: harness-backed adapters own their own authentication.\n"
         "# codex:  {backend: harness, adapter: codex_cli}\n"
         "# claude: {backend: harness, adapter: claude_code}\n"
+        "# agy:    {backend: harness, adapter: antigravity_cli}\n"
     )
 
 

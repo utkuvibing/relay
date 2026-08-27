@@ -41,6 +41,7 @@ AGENTS: dict[str, type[Agent]] = {
 
 #: Harness-family adapters (P2.2). Product names live ONLY here, in the
 #: adapter modules themselves, and in config values — never in core (C.1).
+from relay.agents.antigravity_cli import AntigravityCLIAdapter
 from relay.agents.claude_code import ClaudeCodeAgent
 from relay.agents.codex_cli import CodexCLIAdapter
 
@@ -49,6 +50,10 @@ AGENTS["codex_cli"] = CodexCLIAdapter
 AGENTS["codex"] = CodexCLIAdapter
 
 AGENTS["claude_code"] = ClaudeCodeAgent
+
+AGENTS["antigravity_cli"] = AntigravityCLIAdapter
+#: Familiar alias: the binary name users actually type.
+AGENTS["agy"] = AntigravityCLIAdapter
 
 
 class UnknownAgentError(ValueError):

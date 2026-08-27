@@ -343,6 +343,42 @@ class TestDiffProvenance:
         assert list(store.all_models(Run)) == []
         conn.close()
 
+    def test_read_only_only_adapter_refuses_build_typed_and_named(self, build_workspace):
+        """P2.4 K3 refusal parity: the antigravity adapter ships READ_ONLY-only
+        (frozen plan Q4 — no per-invocation clamp flag exists upstream), so a
+        build configured with it fails typed, naming the adapter and the grant.
+        G2 machinery stays family-blind. Run-level failures persist as failed
+        runs (CLI convention), so the product assertions are: failed Run row,
+        no DIFF artifact, no IMPLEMENTATION_PRODUCED evidence."""
+        relay_yaml = build_workspace / "relay.yaml"
+        text = relay_yaml.read_text(encoding="utf-8")
+        relay_yaml.write_text(
+            text.replace("adapter: fake_implementer_build", "adapter: antigravity_cli"),
+            encoding="utf-8",
+        )
+        # antigravity_cli lives in the production registry — no transient layer.
+
+        result = runner.invoke(app, ["build", "attempt antigravity build"])
+        assert result.exit_code == 0, result.output  # run-level failure, not CLI error
+        assert "antigravity_cli" in result.output
+        assert "WORKSPACE_WRITE" in result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        runs = list(store.all_models(Run))
+        assert len(runs) == 1
+        assert runs[0].status.value == "failed"
+        assert store.artifacts_for_run(runs[0].id, kind=ArtifactKind.DIFF) == []
+        evidence_store = __import__(
+            "relay.storage", fromlist=["SqliteEvidenceStore"]
+        ).SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        records = evidence_store.records_for_task(task.id)
+        assert all(r.kind is not EvidenceKind.IMPLEMENTATION_PRODUCED for r in records)
+        conn.close()
+
 
 class _NoopImplementer(_FakeImplementer):
     """Same shape as the implementing fake but writes nothing."""
