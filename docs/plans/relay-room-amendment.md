@@ -168,3 +168,40 @@ Applied in this session/commit on main:
 
 No files under `relay/` or `tests/` were touched; no product/implementation
 work started.
+
+---
+
+## 8. Consistency-hardening pass (PR #5 prep — adversarial audit)
+
+Second docs-only pass performed on the dedicated amendment branch
+(`docs/room-coordination-amendment`, created from `origin/main`). Fixes
+below resolve real inconsistencies found by re-auditing; nothing normative
+was weakened and no code was touched.
+
+| # | Inconsistency found | Fix applied |
+|---|---|---|
+| 1 | §5 feed cross-ref pointed to App. D.7 (policy), feed semantics live in D.1/D.11-P4 | Cross-ref corrected to D.11 |
+| 2 | §5 "member" wording could read as member = provider | Rewritten: members ARE seats; model names shown are config instances bound to seats (model/backend facts) |
+| 3 | D.2 lacked crisp seat/binding/logical-agent definitions (seat↔session confusion possible) | Added definitional block: seat = stable role slot; binding = configured assignment; provider/model/backend are properties of the binding, never protocol semantics |
+| 4 | Freeze actor implicit — Planner self-freeze conceivable | D.3 + §6: freeze/accept is a HUMAN decision mapping onto existing PLAN_READY → IMPLEMENTING edge; direct CLI entry points (`relay build`) count as explicit initiation themselves |
+| 5 | D.4 mutation list missed protocol policy; flow implied every message → Decision | List extended to permission/protocol policy; added "most conversation needs NO promotion"; generalized promotion flow ending in updated participant context; promotion is Relay's act |
+| 6 | Mixed enum casing (`CLARIFICATION_REQUEST` vs `clarification_request`) looked like conflicting definitions | Unified to lowercase concept identifiers (matches persisted message-type value style); final enum naming explicitly left to P4 implementation; Phase-0 vocabulary untouched |
+| 7 | D.6 WAITING_FOR_CLARIFICATION could read as a proposed lifecycle state | Relabeled: illustration of a RUNTIME EXECUTION CONDITION — not a canonical TaskState, not an enum member; frozen §6 untouched |
+| 8 | Micro-interaction purpose list absent in P6 phase text; dispatch authority unstated there | P6 preamble now states Relay owns dispatch/stage progression and enumerates purposes (resolve ambiguity / challenge assumptions / explain choices / request local deviations); micro-loop vs micro-interaction bridge defined once |
+| 9 | Budget exhaustion behavior under-specified (silent increase conceivable) | D.7: exhaustion is deterministic → escalation, never silent extension or type-swapping to evade accounting |
+| 10 | "protocol stages" phrase in P5 could wrongly exclude execution-loop stages | Broadened to "protocol-governed stages (discussion protocols and execution-loop stages alike)" |
+| 11 | Human chat power unbounded in principle (chat could read as parallel approval pipeline) | D.9: Room messages never bypass evidence/approval/permission contracts; approvals still require existing mechanics with `human:*` producers (A.1/A.3) |
+| 12 | D.10: resume-fallback covered unavailable/out-of-sync only; external-session canonicity implicit; minor redundancy with §12 | Now covers unavailable/unsupported/expired/unsafe → fresh backend run; external session state (incl. resumed sessions) never canonical; redundancy with §12 removed |
+| 13 | §12 said "blocking questions"; rest of amendment says blocking communication | Terminology aligned to "unresolved blocking communication" |
+
+Post-pass verification: all Appendix D.x references resolve; §27 ↔ §35 ↔
+README phase rows agree (single numbering scheme; only legitimate
+"Phase 12/P12 TUI" remains); code fences balanced; no duplicate normative
+statements (principle echoes worded identically); pytest/ruff run clean on
+the branch (counts reported in PR description).
+
+Non-blocking open design questions carried into implementation phases:
+config surface for communication policy (P5), storage of paused stages /
+crash-safety for blocking waits (P6), escalation UX (P5/P6), sender naming
+for human/system participants re-using A.1 producer conventions (P4),
+minimum viable addressing syntax (P7).

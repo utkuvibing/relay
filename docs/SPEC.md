@@ -238,15 +238,16 @@ M5 Phase 1
 
 Room aynı konu üzerinde günler sonra devam edebilir.
 
-Room üyeliği named **seat**'lerdir: her seat bir role bağlıdır ve çalışma
-zamanında konfigüre edilmiş bir logical agent'a bind edilir; seat→agent
-bağlamı model/backend değişse bile stabil kalır ve workflow metni asla
-somut provider adına referans vermez. Yukarıdaki isimler config instance
-örnekleridir, protocol kelime dağarcığı değildir (Appendix D.2). Bir Room
-ek olarak kalıcı bir sohbet beslemesidir (chronological feed): mesajlar,
-kayıtlar ve insan katılımı aynı geçmişte yaşar — Room bir transient
-execution batch'i değil, uzun ömürlü koordinasyon yüzeyidir
-(Appendix D.1/D.7).
+Room üyeliği named **logical seat**'lerdir: her seat bir role bağlıdır ve bir
+configured binding aracılığıyla konfigüre edilmiş bir logical agent'a bağlanır;
+seat'in kimliği model/backend değişse bile stabil kalır ve workflow metni asla
+somut provider adına referans vermez. Yukarıdaki listede her member satırı bir
+seat + role gösterir; GPT/Claude/Codex/DeepSeek etiketleri o seat'lere bind
+edilmiş config instance'lardır (model/backend fact'leri) — yani bir "member"
+provider değildir, seat'tir (Appendix D.2). Bir Room ek olarak kalıcı bir
+sohbet beslemesidir (chronological feed): mesajlar, kayıtlar ve insan katılımı
+aynı geçmişte yaşar — Room bir transient execution batch'i değil, uzun ömürlü
+koordinasyon yüzeyidir (Appendix D.1/D.11).
 
 ---
 
@@ -382,12 +383,12 @@ Bu kural harness-backed agent'ların sözlü tamamlama beyanlarına da birebir
 uygulanır — model/harness'in "done" demesi kanıt değildir (Appendix C.7).
 
 Bu şema bilinçli olarak KUCUK kalır: Room tartışma-first akışında otomatik
-yürütme yalnızca açık plan kabulünden sonra başlar; bu sınır zaten
-PLAN_READY → IMPLEMENTING kenarına biner (Appendix D.3). Bir katılımcının
-clarification beklemesi gibi aşama-içi bekleme durumları kanonik TaskState
-DEĞİLDİR — runtime/dispatch koşuludur ve ileride bir execution substate
-olarak temsil edilebilir (Appendix D.6). Bu ek için state machine'e yeni
-durum eklenmez.
+yürütme yalnızca İNSANIN açık plan freeze/kabul kararından sonra başlar; bu
+sınır zaten PLAN_READY → IMPLEMENTING kenarına biner (Appendix D.3). Bir
+katılımcının clarification beklemesi gibi aşama-içi bekleme durumları kanonik
+TaskState DEĞİLDİR — runtime/dispatch koşuludur ve ileride bir execution
+substate olarak temsil edilebilir (Appendix D.6). Bu ek için state machine'e
+yeni durum eklenmez.
 
 ---
 
@@ -502,8 +503,8 @@ kayıtlarına referans verebilir. Kim kime ne amaçla yazabilir communication
 policy tarafından belirlenir — serbest otonom grup sohbeti yoktur
 (Appendix D.5–D.7). Konuşma asla sessizce kanonik state'i mutasyona
 uğratmaz; sonuç doğuran değişimler Relay tarafından açıkça Decision / Plan
-revizyonu / Finding / Approval kaydına promote edilir (Appendix D.4).
-Principle: **conversation is coordination input, not workflow authority.**
+revizyonu / Finding / Approval kaydına promote edilir (Appendix D.4). Principle: **Conversation is coordination input, not workflow
+authority.**
 
 ---
 
@@ -631,12 +632,12 @@ Amaç:
 
 Room çalışmasında Context Engine'in ikinci sorumluluğu **katılımcı
 başına task context'i yeniden kurmaktır**: aktif (en son kabul edilen)
-plan, superseded-plan ilişkileri, kabul edilmiş kararlar, açık blocking
-sorular, ilgili inter-agent notlar, güncel reviewer findings, ilgili
-artifacts/diffs/evidence ve Room geçmişinden seçilmiş alıntılar — hepsi
-canonical store'dan türetilir. Katılımcılar varsayılan olarak bütün Room
-transcriptine bağımlı OLAMAZ; external harness session resume bir
-optimizasyondur, source of truth değildir (Appendix D.10).
+plan ve onun supersession zinciri, kabul edilmiş kararlar, çözülmemiş
+blocking communication'lar, ilgili inter-agent notlar, güncel reviewer
+findings, ilgili artifacts/diffs/evidence ve Room geçmişinden seçilmiş
+alıntılar — hepsi canonical store'dan türetilir. Katılımcılar varsayılan
+olarak bütün Room transcriptine bağımlı OLAMAZ; external harness session
+resume bir optimizasyondur, source of truth değildir (Appendix D.10).
 
 ---
 
@@ -1412,8 +1413,12 @@ varlığında başlar; tartışma-first akışında bu sınır insanın açık
 
 ## Bounded micro-interactions inside stages (Appendix D.6/D.11)
 
-Dış döngü yukarıdaki gibi birebir kalır. Stage'lerin İÇİNDE, policy ve
-bütçe kontrolünde tipli mikro-etkileşimlere izin verilir:
+Dış (outer) workflow yukarıdaki gibi birebir kalır; dispatch ve stage
+ilerleme kararları daima Relay'dedir. Stage'lerin İÇİNDE, policy ve bütçe
+kontrolünde tipli mikro-etkileşimlere (bounded micro-interactions — küçük
+sınırlı mikro-döngüler/micro-loops oluşturabilir) izin verilir. Amaçları:
+belirsizliği çözmek, varsayımları challenge etmek, implementation tercihlerini
+açıklamak, yerel plan sapması talep etmek — dış döngüyü ikame etmek değil:
 
 ```text
 Implementer ↔ Planner   clarification_request/response
@@ -2459,6 +2464,16 @@ Fixer        → claude-code   (harness-family config instance)
 Product names above are configuration-time instance values (App. C.1) used for
 illustration only.
 
+Definitions, used consistently throughout this appendix:
+
+* A **logical seat** is a stable logical place in a Room — a role slot that
+  persists across rebinding and backend swaps.
+* A **binding** assigns a configured agent to that seat. It is a
+  configuration/runtime fact.
+* A **logical agent** is the configured instance a binding points to; its
+  provider, model, and backend are properties OF THE BINDING — never protocol
+  semantics and never part of the seat's identity.
+
 * Workflow, state machine, protocols, and routing speak ONLY role +
   capability + logical-agent identity (§8, C.3, C.7). Seat→agent bindings are
   runtime/config choices — never protocol semantics.
@@ -2492,6 +2507,14 @@ normative:
 
 > **Discussion must never implicitly start implementation.**
 
+The freeze/accept decision belongs to the HUMAN. The Planner may prepare,
+propose, and revise plan artifacts inside the discussion, but it cannot accept
+its own plan into canonical state and cannot start execution by itself. The
+explicit human freeze maps onto the existing `PLAN_READY → IMPLEMENTING`
+edge of §6 — no new TaskState is introduced. Standalone entry points such as
+`relay build "..."` are themselves explicit human initiation; the
+discussion-first discipline governs Room-led workflows.
+
 A frozen plan becomes a canonical Room/Task artifact (`ArtifactKind.PLAN`
 today), referenced as PLAN-n:
 
@@ -2515,8 +2538,8 @@ revisions create new records, they do not rewrite accepted ones (§15).
 > state.**
 
 Plain agent messages NEVER silently mutate: the accepted plan, task state,
-decisions, approvals, evidence, role assignments, or permission policy. This
-holds by construction, via guarantees that already exist:
+decisions, approval state, evidence, role assignments, or permission/protocol
+policy. This holds by construction, via guarantees that already exist:
 
 * state transitions resolve exclusively from provenance-backed EvidenceStore
   records (A.1, C.7);
@@ -2524,17 +2547,22 @@ holds by construction, via guarantees that already exist:
 * permissions change only through Relay policy and PermissionGate (§18, C.5);
 * canonical history is append-only (§15).
 
-Promotion path for consequential exchanges:
+Most conversation needs NO promotion — questions receive answers,
+explanations inform their readers, notes persist as context. Only
+consequential, state-affecting exchanges require promotion into explicit
+canonical records:
 
 ```text
-message → proposal/clarification/challenge → explicit resolution
-        → Decision → optional Plan revision → updated canonical context
+Message → Proposal / Clarification / Challenge → Resolution
+        → canonical Decision and/or Plan revision
+        → updated participant context
 ```
 
 An agent saying "yes, that sounds good" is not by itself a hidden workflow
-mutation. Relay performs promotion explicitly (Decision, Plan revision,
-Finding, Approval, Artifact, Evidence record, task/workflow transition), each
-promotion being a new append-only record with provenance.
+mutation. When an exchange IS consequential, Relay performs promotion
+explicitly (Decision, Plan revision, Finding, Approval, Artifact, Evidence
+record, task/workflow transition); each promotion is a new append-only record
+with provenance. Promotion is Relay's act — never a side effect of messages.
 
 ## D.5 Typed inter-agent messages
 
@@ -2544,19 +2572,21 @@ reconciled against it and extended ONLY where semantically necessary:
 
 | Required purpose | Disposition | Notes |
 |---|---|---|
-| question / clarification_request | NEW `CLARIFICATION_REQUEST` | blocking-capable |
-| answer / clarification_response | NEW `CLARIFICATION_RESPONSE` | pairs with request |
-| proposal (incl. local deviation from current plan) | NEW `PROPOSAL` | distinct from OPINION: targets adoption of a change |
-| challenge (assumptions, findings, prior work) | EXISTS (`CHALLENGE`) | unchanged |
-| note (non-blocking information for a later participant) | NEW `NOTE` | never blocks |
-| finding | EXISTS (`REVIEW_FINDING`) | unchanged |
+| question / clarification_request | NEW: `clarification_request` | blocking-capable |
+| answer / clarification_response | NEW: `clarification_response` | pairs with request |
+| proposal (incl. local deviation from current plan) | NEW: `proposal` | distinct from opinion: targets adoption of a change |
+| challenge (assumptions, findings, prior work) | EXISTS: `challenge` | unchanged |
+| note (non-blocking information for a later participant) | NEW: `note` | never blocks |
+| finding | EXISTS: `review_finding` | unchanged |
 | blocker | metadata, NOT an enum value | any blocking-flagged challenge/proposal/finding |
-| plan_revision_request | `PROPOSAL` referencing the target plan revision | no separate enum |
-| decision_response | answer class (`REBUTTAL`/`FINAL_POSITION`, or `CLARIFICATION_RESPONSE`) chosen by exchange shape | reuses existing vocabulary |
+| plan_revision_request | `proposal` referencing the target plan revision | no separate enum |
+| decision_response | answer class (`rebuttal` / `final_position`, or `clarification_response`) chosen by exchange shape | reuses existing vocabulary |
 
 Blocking-ness is per-message metadata, never implied by type alone (D.6).
-This table fixes CONCEPTS, not spellings: the final implementation-time enum
-may evolve further, provided the disjointness invariant of A.2 holds and
+This table fixes CONCEPTS, not spellings: identifiers are shown in lowercase
+concept form (matching today's persisted message-type values); final enum
+member names, casing, and storage values are left to P4 implementation. The
+enum may evolve further, provided the disjointness invariant of A.2 holds and
 extensions remain additive.
 
 Message records carry enough routing/provenance information to identify:
@@ -2598,14 +2628,15 @@ IMPLEMENTER → WAITING_FOR_CLARIFICATION → planner response
             → optional Decision / Plan revision → IMPLEMENTER CONTINUES
 ```
 
-WAITING_FOR_CLARIFICATION is conceptual: it does NOT add a canonical TaskState.
-The frozen §6 state machine is untouched; waiting is a stage-internal
-execution/scheduler condition that a later implementation phase MAY represent
-as an execution/dispatch substate. Resolution authority stays with Relay — a
-blocked stage resumes only when the answer (and any promoted canonical record)
-exists, never because an agent asserts continuation. Blocking round-trips
-count against budgets (D.7); unanswered/blocked stages escalate to the human
-rather than spinning silently.
+The WAITING element in the diagram above is drawn as illustration only: it is
+a RUNTIME EXECUTION CONDITION, not a canonical TaskState and not a proposed
+enum member. The frozen §6 state machine is untouched; waiting is a
+stage-internal scheduler/dispatch condition that a later implementation phase
+MAY represent as an execution/dispatch substate. Resolution authority stays
+with Relay — a blocked stage resumes only when the answer (and any promoted
+canonical record) exists, never because an agent asserts continuation.
+Blocking round-trips count against budgets (D.7); unanswered/blocked stages
+escalate to the human rather than spinning silently.
 
 **Non-blocking note** — the participant continues immediately ("This
 compatibility shim is intentional because v1 databases must migrate in
@@ -2641,9 +2672,15 @@ fixer:       → planner:  [proposal, clarification_request]
 * policy violations are rejected/degraded explicitly by Relay — never
   silently re-routed around policy.
 
+Exhausting any budget is a deterministic event: it triggers escalation, not a
+silent extension. Budgets are never auto-increased mid-task, and forbidden
+exchanges cannot be re-sent under another type to evade accounting.
+
 No arbitrary unbounded agent-to-agent conversation exists anywhere in the
 model: free-form debate survives ONLY inside protocol-bounded stages (§9–§11),
-and Room micro-communication survives only inside D.7 budgets.
+and Room micro-communication survives only inside policy budgets —
+**agent collaboration is bounded and typed, not free-form autonomous
+chatter** (D.1).
 
 ## D.8 No hidden authority transfer
 
@@ -2680,28 +2717,36 @@ the following possible without re-defining protocol semantics here:
 * inspect decisions/artifacts/evidence generated from agent exchanges
   (`relay why <decision>`, `relay inspect <task>` already promise this).
 
-Addressing/tickling syntax belongs to later product phases (P7+); the Room
+Addressing/intervention syntax belongs to later product phases (P7+); the Room
 architecture defined above must not make this interaction impossible.
+
+Human intervention never bypasses evidence, approval, or permission contracts.
+A message typed into Room chat is ordinary Message traffic; asking an agent in
+chat does not mint evidence, and requesting a gated action still traverses
+PermissionGate with its existing outcomes. Approvals enter canonical state
+only through the existing approval mechanics with `human:*` producers
+(A.1/A.3) — participating in a Room grants human or agent alike no parallel
+pipeline around these contracts.
 
 ## D.10 Context Engine consequence
 
 Participants receive RECONSTRUCTED, task-relevant context — selected from the
 canonical store, not unlimited chat replay:
 
-ROLE · TASK · CURRENT PLAN (latest accepted) · superseded-plan relationships ·
-ACCEPTED DECISIONS · UNRESOLVED BLOCKING QUESTIONS · RELEVANT INTER-AGENT
+ROLE · TASK · CURRENT PLAN (latest accepted) · plan supersession chain ·
+ACCEPTED DECISIONS · UNRESOLVED BLOCKING COMMUNICATION · RELEVANT INTER-AGENT
 NOTES · CURRENT REVIEWER FINDINGS · RELEVANT ARTIFACTS/DIFFS · EVIDENCE ·
 relevant Room history excerpts.
 
-Context selection must include, where applicable, the latest accepted plan and
-its supersession chain, accepted decisions, open blocking questions, current
-findings, and relevant artifacts/evidence/history excerpts.
+The full Room transcript is NEVER the default participant input; agents MUST
+NOT depend on receiving it (§12 states the same contract).
 
-Agents MUST NOT depend on receiving the entire Room transcript by default.
 External harness session resume remains an optimization built on the C.2 seam
-and C.4 allowlisted `external_session_ref`: if resume is unavailable or out of
-sync, Relay reconstructs context from canonical records and proceeds fresh —
-the honest-discontinuity rule of C.7 P7 stands.
+and C.4-allowlisted `external_session_ref`. If resume is unavailable,
+unsupported, expired, or unsafe, Relay reconstructs context from canonical
+records and starts a FRESH backend run — the honest-discontinuity rule of
+C.7 P7 stands. External session state — including any successfully resumed
+session — is never canonical; the canonical store remains the source of truth.
 
 ## D.11 Roadmap consequences (extends App. C.7; annotates §27 P4–P7)
 
@@ -2731,7 +2776,8 @@ requirements:
 * blocking-clarification budgets (round-trips per stage);
 * loop/message budgets per task/stage; loop detection;
 * escalation behavior when communication cannot converge;
-* policy-controlled micro-communication only inside protocol stages.
+* policy-controlled micro-communication only inside protocol-governed stages
+  (discussion protocols and execution-loop stages alike).
 
 P5 exists precisely to prevent free autonomous group chat: an unconstrained
 sender→recipient edge, purpose set, or budget is a conformance defect.
