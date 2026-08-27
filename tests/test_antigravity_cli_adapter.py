@@ -86,7 +86,7 @@ async def _run(agent: HarnessAgent, prompt: str):
 
 
 #: Emulates the documented `agy --output-format json` headless surface.
-_ANTIGRAVITY_SRC = r'''
+_ANTIGRAVITY_SRC = r"""
 import json, os, sys, uuid
 argv = sys.argv[1:]
 if "--version" in argv:
@@ -128,7 +128,7 @@ print(json.dumps({
     "response": "agy-ok echo=%s cwd=%s" % (first_line, os.getcwd()),
     "usage": {"input_tokens": 10, "output_tokens": 4},
 }))
-'''
+"""
 
 
 class _AntigravityHooks:
@@ -277,9 +277,9 @@ class TestGrantContract:
     """Frozen-plan D3: plan-mode READ_ONLY + typed write-tier refusals."""
 
     def test_read_only_maps_to_plan_mode(self, tmp_path):
-        assert _real(tmp_path).grant_arguments(
-            ExecutionGrantKind.READ_ONLY_ACCESS
-        ) == READ_ONLY_TAIL
+        assert (
+            _real(tmp_path).grant_arguments(ExecutionGrantKind.READ_ONLY_ACCESS) == READ_ONLY_TAIL
+        )
 
     def test_workspace_write_refuses_typed_before_spawn(self, tmp_path):
         with pytest.raises(UnsupportedCapability, match="per-invocation clamp flag"):
@@ -550,7 +550,9 @@ class TestWideningDefenseQ4:
         (settings_dir / "settings.json").write_text(
             json.dumps(
                 {
-                    "permissions": {"allow": ["command(git)", "command(npm run (build|lint|test))"]},
+                    "permissions": {
+                        "allow": ["command(git)", "command(npm run (build|lint|test))"]
+                    },
                     "toolPermission": "always-proceed",
                 }
             ),
@@ -564,6 +566,7 @@ class TestWideningDefenseQ4:
         workspace = self._hostile_workspace(tmp_path)
         composed: list[tuple[str, ...]] = []
         import relay.harness.runtime as runtime_module
+
         original = runtime_module.execute
 
         async def _capture(spec):
@@ -593,9 +596,9 @@ class TestWideningDefenseQ4:
         from relay.agents import antigravity_cli as module
 
         monkeypatch.setattr(module, "_slash_clamp_supported", lambda command: True)
-        argv = _real(tmp_path).invocation_argv(_fake_resolved()) + _real(
-            tmp_path
-        ).grant_arguments(ExecutionGrantKind.READ_ONLY_ACCESS)
+        argv = _real(tmp_path).invocation_argv(_fake_resolved()) + _real(tmp_path).grant_arguments(
+            ExecutionGrantKind.READ_ONLY_ACCESS
+        )
         joined = " ".join(argv)
         for forbidden in (
             "--dangerously-skip-permissions",
@@ -719,9 +722,7 @@ class TestSecondHarnessGateZeroTouch:
             base = REPO_ROOT / "relay" / root
             for path in base.rglob("*.py"):
                 lowered = path.read_text(encoding="utf-8").lower()
-                assert "antigravity" not in lowered, (
-                    f"{path} references antigravity specifics"
-                )
+                assert "antigravity" not in lowered, f"{path} references antigravity specifics"
 
     def test_registry_registration_uses_zone_import(self):
         """Registry registration line itself lives in the agents zone (G4)."""

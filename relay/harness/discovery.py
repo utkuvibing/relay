@@ -87,10 +87,12 @@ async def probe_version(
     except OSError:
         return None, None
 
-    combined = "\n".join(part.strip() for part in (outcome.stdout.text, outcome.stderr.text) if part.strip())
+    combined = "\n".join(
+        part.strip() for part in (outcome.stdout.text, outcome.stderr.text) if part.strip()
+    )
     if not combined:
         return None, None
-    raw = combined.splitlines()[0][: _VERSION_RAW_CAP_CHARS]
+    raw = combined.splitlines()[0][:_VERSION_RAW_CAP_CHARS]
     return redact(raw)[:200], redact(combined)
 
 

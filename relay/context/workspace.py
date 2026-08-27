@@ -97,7 +97,18 @@ _PACKAGE_MANAGER_MARKERS: dict[str, tuple[str, ...]] = {
 _INSTRUCTION_FILES = ("AGENTS.md", "CONTRIBUTING.md", "CLAUDE.md")
 
 _EXCLUDED_DIRS = frozenset(
-    {".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__", ".relay", ".idea", ".vscode"}
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "dist",
+        "build",
+        "__pycache__",
+        ".relay",
+        ".idea",
+        ".vscode",
+    }
 )
 
 
@@ -271,9 +282,7 @@ def save_profile(root: str | Path, profile: ProjectProfile) -> Path:
     layout = workspace_layout(root)
     layout.data_dir.mkdir(parents=True, exist_ok=True)
     payload = {"project": profile.model_dump()}
-    layout.profile_path.write_text(
-        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
-    )
+    layout.profile_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return layout.profile_path
 
 

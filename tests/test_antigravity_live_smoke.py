@@ -80,8 +80,7 @@ class TestLiveAntigravitySmoke:
         executable = shutil.which("agy")
         assert executable is not None
         assert _slash_clamp_supported(executable), (
-            "installed agy does not advertise --disable-slash-commands — "
-            "upgrade via 'agy update'"
+            "installed agy does not advertise --disable-slash-commands — upgrade via 'agy update'"
         )
 
     def test_read_only_ask_returns_text_and_envelope_metadata(self, tmp_path):

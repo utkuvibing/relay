@@ -133,7 +133,7 @@ def default_factory_for(cls: type[HarnessAgent], *, timeout_s: float = 25.0):
 # FAKE A — structured/event-oriented
 # ---------------------------------------------------------------------------
 
-_STRUCT_SRC = r'''
+_STRUCT_SRC = r"""
 import json, os, sys
 data = sys.stdin.read()
 if "--version" in sys.argv:
@@ -155,13 +155,13 @@ first_line = data.strip().splitlines()[0] if data.strip() else "empty"
 print(json.dumps({"event": "started"}))
 print(json.dumps({"event": "result",
                   "output": "structured-ok echo=%s cwd=%s" % (first_line, os.getcwd())}))
-'''
+"""
 
 # ---------------------------------------------------------------------------
 # FAKE B — plain prose/noisy; different exit numerics; long-running tree mode
 # ---------------------------------------------------------------------------
 
-_PROSE_SRC = r'''
+_PROSE_SRC = r"""
 import os, subprocess, sys, time
 data = sys.stdin.read()
 if "--version" in sys.argv:
@@ -207,7 +207,7 @@ if mode == "weird":
 
 first_line = (data.strip().splitlines() or ["empty"])[0]
 print("prose result echo=%s cwd=%s" % (first_line, os.getcwd()))
-'''
+"""
 
 
 class StructuredFakeHarness(HarnessAgent):
@@ -223,8 +223,8 @@ class StructuredFakeHarness(HarnessAgent):
 
     #: Structured fake's failure vocabulary for conformance B05.
     failure_modes = (
-        ("usage", "rejected"),        # exit 3 → USAGE semantics
-        ("auth", "authentication"),   # exit 4 → AUTH semantics
+        ("usage", "rejected"),  # exit 3 → USAGE semantics
+        ("auth", "authentication"),  # exit 4 → AUTH semantics
     )
 
     def classify_exit(self, exit_code):
@@ -267,7 +267,7 @@ class ProseFakeHarness(HarnessAgent):
 
     #: Prose fake deliberately speaks a DIFFERENT failure vocabulary (R3).
     failure_modes = (
-        ("usage", "rejected"),         # exit 7 → USAGE semantics
+        ("usage", "rejected"),  # exit 7 → USAGE semantics
         ("transport", "transport problem"),  # exit 9 → TRANSPORT semantics
     )
 
@@ -344,7 +344,10 @@ def _case_b02_discovery_redacted(report, factory, root):
             return str(ghost)
 
     error = _run_async(
-        _capture_error(Missing(origin._settings, profile=origin._profile, workspace_root=root).discover(), HarnessDiscoveryError)
+        _capture_error(
+            Missing(origin._settings, profile=origin._profile, workspace_root=root).discover(),
+            HarnessDiscoveryError,
+        )
     )
     ok = error is not None and str(ghost) not in str(error) and "vanished.exe" in str(error)
     _record(report, "B02 discovery failure stays redacted", "C.2/C.4", ok, repr(error))
@@ -367,7 +370,10 @@ def _case_b04_cwd(report, factory, root):
     expected = str(agent._workspace_root.resolve())
     try:
         response = _run_async(agent.run(_prompt("cwd-probe")))
-        ok = expected.replace("\\", "/") in response.output.replace("\\", "/") or expected in response.output
+        ok = (
+            expected.replace("\\", "/") in response.output.replace("\\", "/")
+            or expected in response.output
+        )
         detail = "" if ok else f"want cwd {expected!r} got {response.output[:160]!r}"
     except Exception as exc:  # noqa: BLE001
         ok, detail = False, repr(exc)
@@ -384,8 +390,13 @@ def _case_b05_exit_semantics(report, factory, root):
     agent = factory(root)
     modes: tuple[tuple[str, str], ...] = tuple(getattr(agent, "failure_modes", ()))
     if not modes:
-        _record(report, "B05 nonzero exits map to typed failures", "C.2",
-                True, "adapter advertises no failure modes — nothing to probe")
+        _record(
+            report,
+            "B05 nonzero exits map to typed failures",
+            "C.2",
+            True,
+            "adapter advertises no failure modes — nothing to probe",
+        )
         return
 
     failures = []
@@ -393,9 +404,7 @@ def _case_b05_exit_semantics(report, factory, root):
         probe_agent = factory(root)
         probe_agent._profile.extra_args = ["--mode", mode]
         try:
-            error = _run_async(
-                _capture_error(probe_agent.run(_prompt("bad-exit")), AgentError)
-            )
+            error = _run_async(_capture_error(probe_agent.run(_prompt("bad-exit")), AgentError))
         except Exception as exc:  # noqa: BLE001 - raw escape IS a failure
             error = exc
         if error is None:
@@ -407,8 +416,11 @@ def _case_b05_exit_semantics(report, factory, root):
         if needle not in str(error):
             failures.append(f"{mode}: hint '{needle}' missing in {str(error)[:80]!r}")
     _record(
-        report, "B05 nonzero exits map to typed failures", "C.2",
-        not failures, "; ".join(failures),
+        report,
+        "B05 nonzero exits map to typed failures",
+        "C.2",
+        not failures,
+        "; ".join(failures),
     )
 
 
@@ -426,9 +438,12 @@ def _case_b06_tree_termination(report, factory, root):
         executable_path=str(PY),
         timeout_seconds=0.8,
         extra_args=[
-            "--mode", "spawntree",
-            "--tombstone", str(tombstone),
-            "--hbscript", str(hb_path),
+            "--mode",
+            "spawntree",
+            "--tombstone",
+            str(tombstone),
+            "--hbscript",
+            str(hb_path),
         ],
     )
     agent_tight = ProseFakeHarness(
@@ -437,14 +452,26 @@ def _case_b06_tree_termination(report, factory, root):
         workspace_root=root,
     )
 
-    error = _run_async(_capture_error(agent_tight.run(_prompt("grow-a-tree")), HarnessTimeoutError, AgentError))
+    error = _run_async(
+        _capture_error(agent_tight.run(_prompt("grow-a-tree")), HarnessTimeoutError, AgentError)
+    )
     if not isinstance(error, HarnessTimeoutError):
-        _record(report, "B15 tree termination leaves zero live descendants", "R2/G2",
-                False, f"expected HarnessTimeoutError, got {error!r}")
+        _record(
+            report,
+            "B15 tree termination leaves zero live descendants",
+            "R2/G2",
+            False,
+            f"expected HarnessTimeoutError, got {error!r}",
+        )
         return
     if not tombstone.exists():
-        _record(report, "B15 tree termination leaves zero live descendants", "R2/G2",
-                False, "tombstone never written — child did not reach spawn")
+        _record(
+            report,
+            "B15 tree termination leaves zero live descendants",
+            "R2/G2",
+            False,
+            "tombstone never written — child did not reach spawn",
+        )
         return
     early = tombstone.read_text(encoding="utf-8")
     stable_required = {"direct-child-start", "grand-child-start"}
@@ -456,7 +483,10 @@ def _case_b06_tree_termination(report, factory, root):
     stable = late == early
     ok = spawned and stable
     _record(
-        report, "B15 tree termination leaves zero live descendants", "R2/G2", ok,
+        report,
+        "B15 tree termination leaves zero live descendants",
+        "R2/G2",
+        ok,
         "" if ok else f"spawned={spawned} stable={stable} (early {len(early)}B late {len(late)}B)",
     )
 
@@ -487,14 +517,8 @@ def _case_b07_conflict_strip(report, factory, root):
         environ_guard.pollute(sentinels)
         agent = factory(root)
         response = _run_async(agent.run(_prompt(_envcheck_prompt(sorted(sentinels)))))
-        leaked = [
-            name
-            for name, sentinel in sentinels.items()
-            if sentinel in response.output
-        ]
-        stripped = all(
-            f"{name}=__MISSING__" in response.output for name in sentinels
-        )
+        leaked = [name for name, sentinel in sentinels.items() if sentinel in response.output]
+        stripped = all(f"{name}=__MISSING__" in response.output for name in sentinels)
         ok = not leaked and stripped
         detail = "" if ok else f"leaked={leaked} stripped_all={stripped}"
     except Exception as exc:  # noqa: BLE001
@@ -517,16 +541,16 @@ def _case_b08_self_allowlist(report, factory, root):
             self_allowed_env = frozenset({target})
 
         agent = SelfAllowing(origin._settings, profile=origin._profile, workspace_root=root)
-        response = _run_async(
-            agent.run(_prompt(_envcheck_prompt([target, *others])))
-        )
+        response = _run_async(agent.run(_prompt(_envcheck_prompt([target, *others]))))
         kept = sentinels[target] in response.output
-        others_blocked = all(
-            f"{name}=__MISSING__" in response.output for name in others
-        )
+        others_blocked = all(f"{name}=__MISSING__" in response.output for name in others)
         unrelated_still_blocked = "solo-prose_fake_local_token" not in response.output
         ok = kept and others_blocked and unrelated_still_blocked
-        detail = "" if ok else f"kept={kept} others_blocked={others_blocked} unrelated_blocked={unrelated_still_blocked}"
+        detail = (
+            ""
+            if ok
+            else f"kept={kept} others_blocked={others_blocked} unrelated_blocked={unrelated_still_blocked}"
+        )
     except Exception as exc:  # noqa: BLE001
         ok, detail = False, repr(exc)
     finally:
@@ -549,9 +573,13 @@ def _case_b10_malformed(report, factory, root):
     """Structured-declaring adapters must fail typed on malformed streams."""
     agent = factory(root)
     if HarnessCapability.STRUCTURED_OUTPUT not in agent.capabilities_set():
-        _record(report, "B10 malformed structured streams fail typed",
-                "C.2/C.3", True,
-                "adapter runs the prose-transcript path — nothing to parse")
+        _record(
+            report,
+            "B10 malformed structured streams fail typed",
+            "C.2/C.3",
+            True,
+            "adapter runs the prose-transcript path — nothing to parse",
+        )
         return
     probe = factory(root)
     probe._profile.extra_args = ["--mode", "malfault"]
@@ -566,8 +594,13 @@ def _case_b11_unsupported(report, factory, root):
     all_caps = set(HarnessCapability)
     missing = all_caps - agent.capabilities_set()
     if not missing:
-        _record(report, "B11 unsupported capabilities raise explicitly", "C.3/G0",
-                True, "adapter declares every capability — nothing to refuse")
+        _record(
+            report,
+            "B11 unsupported capabilities raise explicitly",
+            "C.3/G0",
+            True,
+            "adapter declares every capability — nothing to refuse",
+        )
         return
     required = min(missing, key=lambda cap: cap.value)
 
@@ -598,8 +631,13 @@ def _case_b11_unsupported(report, factory, root):
         grant_ok = True  # fully-capable adapters gate everything they declare
 
     ok = direct_ok and grant_ok
-    _record(report, "B11 unsupported capabilities raise explicitly", "C.3/G0", ok,
-            f"direct_ok={direct_ok} grant_ok={grant_ok} probed={required.value}")
+    _record(
+        report,
+        "B11 unsupported capabilities raise explicitly",
+        "C.3/G0",
+        ok,
+        f"direct_ok={direct_ok} grant_ok={grant_ok} probed={required.value}",
+    )
 
 
 def _case_b12_argv_order(report, factory, root):
@@ -617,8 +655,13 @@ def _case_b12_argv_order(report, factory, root):
         "-c" in argv,
         not any("prompt-with-secrets" in part for part in argv),  # stdin-only prompt
     ]
-    _record(report, "B12 canonical argv order; prompt never rides argv", "C.5",
-            all(checks), f"checks={checks}")
+    _record(
+        report,
+        "B12 canonical argv order; prompt never rides argv",
+        "C.5",
+        all(checks),
+        f"checks={checks}",
+    )
 
 
 def _case_b13_missing_grant(report, factory, root):
@@ -633,8 +676,13 @@ def _case_b13_missing_grant(report, factory, root):
         _capture_error(agent.run(_prompt("needs-grant")), MissingExecutionGrantError, AgentError)
     )
     ok = grant_error is not None and isinstance(run_error, AgentError)
-    _record(report, "B13 unresolvable grant blocks execution pre-spawn", "R1/G0", ok,
-            f"resolve={grant_error!r} run={run_error!r}")
+    _record(
+        report,
+        "B13 unresolvable grant blocks execution pre-spawn",
+        "R1/G0",
+        ok,
+        f"resolve={grant_error!r} run={run_error!r}",
+    )
 
 
 def _capture_type(callable_, exception_type):

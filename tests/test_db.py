@@ -140,8 +140,16 @@ class TestCodecRoundtrips:
         loaded = store.load_model(type(saved), _pk(saved))
         if isinstance(sample_record, EventLogEntry):
             # sequence is DB-assigned; compare every semantic field instead.
-            semantic = ("room_id", "task_id", "sender", "recipient", "type",
-                        "content", "references", "created_at")
+            semantic = (
+                "room_id",
+                "task_id",
+                "sender",
+                "recipient",
+                "type",
+                "content",
+                "references",
+                "created_at",
+            )
             for field in semantic:
                 assert getattr(loaded, field) == getattr(saved, field)
             assert loaded.sequence > 0

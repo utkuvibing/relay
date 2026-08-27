@@ -164,9 +164,7 @@ class TestOfflineE2E:
 
 
 class TestCrashPath:
-    def test_provider_failure_persists_failed_run_with_recoverable_prompt(
-        self, workspace, db
-    ):
+    def test_provider_failure_persists_failed_run_with_recoverable_prompt(self, workspace, db):
         runner.invoke(app, ["init"])
 
         def boom(request: httpx.Request) -> httpx.Response:
@@ -247,8 +245,7 @@ class TestHarnessRefusal:
     def test_backend_family_mismatch_is_a_config_error(self, workspace):
         """R1#1: api-declared agent + harness-routed adapter cannot wire."""
         (workspace / "relay.yaml").write_text(
-            "agents:\n"
-            "  impostor: {backend: api, adapter: c7_echo}\n",
+            "agents:\n  impostor: {backend: api, adapter: c7_echo}\n",
             encoding="utf-8",
         )
         runner.invoke(app, ["init"])
@@ -301,9 +298,7 @@ class TestHarnessRefusal:
                 )
 
         with transient_adapters({"c7_echo": _C7Echo}):
-            result = runner.invoke(
-                app, ["ask", "echoh", "ping-marker"]
-            )
+            result = runner.invoke(app, ["ask", "echoh", "ping-marker"])
         assert result.exit_code == 0, result.output
         assert "c7echo:ping-marker" in result.output
 

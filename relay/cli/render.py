@@ -72,9 +72,7 @@ def ask_result(
     if error is not None:
         _out().print(f"[red]ERROR {provider} failed:[/red] {error}")
         return
-    _out().print(
-        Panel(output or "(empty response)", title=f"{provider} | {model or 'default'}")
-    )
+    _out().print(Panel(output or "(empty response)", title=f"{provider} | {model or 'default'}"))
     usage = (
         f"in {run.input_size} | out {run.output_size}"
         if run.input_size is not None or run.output_size is not None
@@ -141,7 +139,11 @@ def build_result(*, task, outcome) -> None:
         )
     )
     observations = len(outcome.tool_run_ids)
-    diff_note = f"diff artifact {outcome.diff_artifact_id[:8]}..." if outcome.diff_artifact_id else "no workspace changes"
+    diff_note = (
+        f"diff artifact {outcome.diff_artifact_id[:8]}..."
+        if outcome.diff_artifact_id
+        else "no workspace changes"
+    )
     _out().print(
         f"[dim]task {task.id[:8]}... | run {ask.run.id[:8]}... | {ask.run.status.value} | "
         f"{observations} observed harness events | {diff_note} | evidence recorded[/dim]"

@@ -35,6 +35,7 @@ from relay.harness.sanitization import redact
 from relay.harness.types import ExecutionGrantKind
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
+    Approval,
     Artifact,
     ArtifactKind,
     EventType,
@@ -54,8 +55,12 @@ runner = CliRunner()
 _BUILD_SRC = r"""
 import json, os, sys
 data = sys.stdin.read()
-if "--version" in sys.argv:
+argv = sys.argv
+if "--version" in argv:
     print("build-fake 1.0.0"); sys.exit(0)
+verdict = "PASS"
+if "--review-verdict" in argv:
+    verdict = argv[argv.index("--review-verdict") + 1].upper()
 if "You are the planner" in data:
     # P3.1: the planning leg — produce a plan, touch nothing.
     print(json.dumps({"type": "thread.started", "thread_id": "t-plan"}))
@@ -66,6 +71,18 @@ if "You are the planner" in data:
                                        "Files: implemented.txt\n"
                                        "Verification: file exists"}}))
     print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 3}}))
+    sys.exit(0)
+if "You are the reviewer" in data:
+    # P3.3: the review leg - assess, then emit the fail-closed verdict line.
+    if "--review-crash" in argv:
+        sys.exit(9)
+    review_text = "## Review\n\nThe changes match the plan; correctness and risks assessed."
+    if verdict != "NONE":
+        review_text += "\nVERDICT: %s" % verdict
+    print(json.dumps({"type": "thread.started", "thread_id": "t-review"}))
+    print(json.dumps({"type": "item.completed",
+                      "item": {"id": "m", "type": "agent_message", "text": review_text}}))
+    print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 6, "output_tokens": 2}}))
     sys.exit(0)
 first_line = data.strip().splitlines()[0] if data.strip() else "empty"
 # Simulate an implementation: write one tracked file.
@@ -533,7 +550,7 @@ def _with_verification(build_workspace, program: str, args: str) -> None:
 class TestVerification:
     """P3.2: Relay grades the exam — frozen plan Q-c/Q-f contract."""
 
-    def test_pass_reaches_reviewing_with_provenance(self, build_workspace):
+    def test_pass_reaches_approval_required_with_provenance(self, build_workspace):
         _with_verification(
             build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
         )
@@ -547,7 +564,9 @@ class TestVerification:
         store = SqliteRelayStore(conn)
         evidence = SqliteEvidenceStore(store)
         task = next(iter(store.all_models(Task)))
-        assert task.state is TaskState.REVIEWING
+        # P3.3: the review leg chains after verification and lands the task
+        # on the human's desk (gated default).
+        assert task.state is TaskState.APPROVAL_REQUIRED
 
         records = evidence.records_for_task(task.id)
         passed = next(r for r in records if r.kind is EvidenceKind.TESTS_PASSED)
@@ -565,6 +584,11 @@ class TestVerification:
         contents = [e.content for e in writer.all() if e.type is EventType.STATE_TRANSITIONED]
         assert "task state: implemented -> verifying" in contents
         assert "task state: verifying -> reviewing" in contents
+        # P3.3: review passed on top — provenance + the open human gate.
+        review_record = next(r for r in records if r.kind is EvidenceKind.REVIEW_PASSED)
+        assert review_record.produced_by.startswith("agent:")
+        approvals = [a for a in store.all_models(Approval) if a.task_id == task.id]
+        assert len(approvals) == 1 and approvals[0].status.value == "pending"
         conn.close()
 
     def test_failure_loops_back_to_implementing(self, build_workspace):
@@ -664,6 +688,242 @@ class TestVerification:
         artifact = store.load_model(Artifact, passed.artifact_id)
         assert "absent" in (artifact.content or "")
         assert "sk-decoy" not in (artifact.content or "")
+        conn.close()
+
+
+class TestReviewApproval:
+    """P3.3: review run + approval closure — frozen plan Q-d/Q-e contract."""
+
+    def test_gated_flagship_reaches_approval_required_then_done(self, build_workspace):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.APPROVAL_REQUIRED
+
+        approvals = [a for a in store.all_models(Approval) if a.task_id == task.id]
+        assert len(approvals) == 1
+        assert approvals[0].status.value == "pending"
+        assert approvals[0].action.value == "edit_files"
+
+        review_run = next(r for r in store.all_models(Run) if r.role == "reviewer")
+        review_record = next(
+            r for r in evidence.records_for_task(task.id) if r.kind is EvidenceKind.REVIEW_PASSED
+        )
+        assert review_record.run_id == review_run.id
+        assert review_record.produced_by.startswith("agent:")
+
+        # The human closes it — the only producer the store allows.
+        approved = runner.invoke(app, ["approve", task.id, "--by", "kaya"])
+        assert approved.exit_code == 0, approved.output
+        assert "DONE" in approved.output
+
+        task = store.load_model(Task, task.id)
+        assert task.state is TaskState.DONE
+        decided = store.load_model(Approval, approvals[0].id)
+        assert decided.status.value == "approved" and decided.decided_by == "kaya"
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.APPROVAL_GRANTED in kinds
+        granted = next(
+            r for r in evidence.records_for_task(task.id) if r.kind is EvidenceKind.APPROVAL_GRANTED
+        )
+        assert granted.produced_by == "human:kaya"
+
+        writer = EventLogWriter(conn)
+        contents = [e.content for e in writer.all() if e.type is EventType.STATE_TRANSITIONED]
+        assert "task state: approval_required -> done" in contents
+        conn.close()
+
+    def test_findings_rework_leaves_no_review_evidence(self, build_workspace):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+
+        class FindingsImplementer(_FakeImplementer):
+            def invocation_argv(self, resolved):
+                return (resolved.command, "-c", _BUILD_SRC, "--review-verdict", "findings")
+
+        with transient_adapters({"fake_implementer_build": FindingsImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING  # honest rework loop
+
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        assert EvidenceKind.APPROVAL_GRANTED not in kinds
+        review_artifacts = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        ]
+        assert len(review_artifacts) == 1
+        conn.close()
+
+    def test_missing_verdict_fails_closed(self, build_workspace):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+
+        class NoVerdictImplementer(_FakeImplementer):
+            def invocation_argv(self, resolved):
+                return (resolved.command, "-c", _BUILD_SRC, "--review-verdict", "none")
+
+        with transient_adapters({"fake_implementer_build": NoVerdictImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING  # never a guessed pass
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        conn.close()
+
+    def test_direct_mode_reaches_done_without_human(self, build_workspace):
+        relay_yaml = build_workspace / "relay.yaml"
+        relay_yaml.write_text(
+            relay_yaml.read_text(encoding="utf-8") + "approval:\n  mode: direct\n",
+            encoding="utf-8",
+        )
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.DONE  # A.3 direct path
+
+        records = evidence.records_for_task(task.id)
+        kinds = {r.kind for r in records}
+        assert {
+            EvidenceKind.TESTS_PASSED,
+            EvidenceKind.REVIEW_PASSED,
+            EvidenceKind.NO_PENDING_APPROVALS,
+            EvidenceKind.IMPLEMENTATION_PRODUCED,
+        } <= kinds
+        no_pending = next(r for r in records if r.kind is EvidenceKind.NO_PENDING_APPROVALS)
+        assert no_pending.produced_by == "relay:review"
+        assert [a for a in store.all_models(Approval) if a.task_id == task.id] == []
+        conn.close()
+
+    def test_dedicated_reviewer_config_is_used(self, build_workspace):
+        relay_yaml = build_workspace / "relay.yaml"
+        exe = json.dumps(sys.executable)
+        text = relay_yaml.read_text(encoding="utf-8")
+        # Inject the reviewer as a SIBLING of impl inside the agents mapping
+        # (a second top-level 'agents:' key would REPLACE the mapping), then
+        # reference it from the top-level reviewer key.
+        text = text.replace(
+            "      timeout_seconds: 60\n",
+            "      timeout_seconds: 60\n"
+            "  fake_reviewer:\n"
+            "    backend: harness\n"
+            "    adapter: fake_implementer_build\n"
+            f"    harness: {{executable_path: {exe}, grant: read_only}}\n",
+        )
+        relay_yaml.write_text(text + "reviewer: fake_reviewer\n", encoding="utf-8")
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt", "--agent", "impl"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.APPROVAL_REQUIRED
+        review_run = next(r for r in store.all_models(Run) if r.role == "reviewer")
+        assert review_run.agent == "fake_reviewer"  # Q-d: dedicated reviewer used
+        review_record = next(
+            r for r in evidence.records_for_task(task.id) if r.kind is EvidenceKind.REVIEW_PASSED
+        )
+        assert review_record.produced_by == "agent:fake_reviewer"
+        conn.close()
+
+    def test_review_run_failure_blocks_at_reviewing(self, build_workspace):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+
+        class CrashingReviewer(_FakeImplementer):
+            def invocation_argv(self, resolved):
+                return (resolved.command, "-c", _BUILD_SRC, "--review-crash")
+
+        with transient_adapters({"fake_implementer_build": CrashingReviewer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING  # blocked: no verdict invented (D8)
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        conn.close()
+
+    def test_approve_refuses_wrong_state_and_missing_identity(self, build_workspace):
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        task = next(iter(_all_tasks(build_workspace)))
+
+        # --by is required (explicit provenance).
+        missing_by = runner.invoke(app, ["approve", task.id])
+        assert missing_by.exit_code != 0
+
+        # A task not at APPROVAL_REQUIRED cannot be approved.
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        fresh = store.save_model(Task(title="fresh", state=TaskState.CREATED))
+        conn.close()
+        wrong_state = runner.invoke(app, ["approve", fresh.id, "--by", "kaya"])
+        assert wrong_state.exit_code == 1
+        # rich wraps long lines: assert on wrap-resistant fragments.
+        assert "'created'" in wrong_state.output
+        assert "can be approved" in wrong_state.output
+
+
+def _all_tasks(root):
+    conn = __import__("relay.storage", fromlist=["connect"]).connect(
+        root / ".relay" / "relay.sqlite3"
+    )
+    try:
+        return list(SqliteRelayStore(conn).all_models(Task))
+    finally:
         conn.close()
 
 

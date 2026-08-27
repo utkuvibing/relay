@@ -66,15 +66,11 @@ TRANSITIONS: dict[TaskState, tuple[Transition, ...]] = {
     TaskState.CONTEXT_READY: (
         Transition(TaskState.PLAN_READY, frozenset({EvidenceKind.PLAN_PRODUCED})),
     ),
-    TaskState.PLAN_READY: (
-        Transition(TaskState.IMPLEMENTING),
-    ),
+    TaskState.PLAN_READY: (Transition(TaskState.IMPLEMENTING),),
     TaskState.IMPLEMENTING: (
         Transition(TaskState.IMPLEMENTED, frozenset({EvidenceKind.IMPLEMENTATION_PRODUCED})),
     ),
-    TaskState.IMPLEMENTED: (
-        Transition(TaskState.VERIFYING),
-    ),
+    TaskState.IMPLEMENTED: (Transition(TaskState.VERIFYING),),
     # FAIL → back to implementation (SPEC §6 diagram).
     TaskState.VERIFYING: (
         # Entering review demands recorded test proof.

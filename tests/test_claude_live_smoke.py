@@ -61,8 +61,7 @@ class TestLiveClaudeCodeSmoke:
         floor = (2, 1, 169)
         actual = tuple(int(p) for p in parts[:3]) if all(p.isdigit() for p in parts[:3]) else floor
         assert actual >= floor, (
-            f"installed claude {info.version} predates --safe-mode/--tools "
-            f"(need >= 2.1.169)"
+            f"installed claude {info.version} predates --safe-mode/--tools (need >= 2.1.169)"
         )
 
     async def test_read_only_ask_returns_text_and_envelope_metadata(self, tmp_path, live_agent):
@@ -86,9 +85,11 @@ class TestLiveClaudeCodeSmoke:
             f"Create a file named exactly '{target_rel}' in the current working "
             "directory containing exactly one line: relay-live-smoke-ok"
         )
-        grant_args = agent.grant_arguments(__import__(
-            "relay.harness.types", fromlist=["ExecutionGrantKind"]
-        ).ExecutionGrantKind.WORKSPACE_WRITE)
+        grant_args = agent.grant_arguments(
+            __import__(
+                "relay.harness.types", fromlist=["ExecutionGrantKind"]
+            ).ExecutionGrantKind.WORKSPACE_WRITE
+        )
         assert "--tools" in grant_args
         response = await _ask_wide(agent, prompt)
         assert response.status == "ok", response.output[:200]

@@ -45,16 +45,28 @@ PY = sys.executable
 FIXTURE_SESSION_ID = "3f2a1c9e-7b64-4d0e-9f21-a5c8b7d6e123"
 
 READ_ONLY_TAIL = (
-    "--safe-mode", "--permission-mode", "default",
-    "--tools", "Read,Grep,Glob",
-    "--disallowedTools", "mcp__*",
-    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    "--safe-mode",
+    "--permission-mode",
+    "default",
+    "--tools",
+    "Read,Grep,Glob",
+    "--disallowedTools",
+    "mcp__*",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
 )
 WORKSPACE_WRITE_TAIL = (
-    "--safe-mode", "--permission-mode", "acceptEdits",
-    "--tools", "Read,Grep,Glob,Edit,Write,NotebookEdit",
-    "--disallowedTools", "mcp__*",
-    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    "--safe-mode",
+    "--permission-mode",
+    "acceptEdits",
+    "--tools",
+    "Read,Grep,Glob,Edit,Write,NotebookEdit",
+    "--disallowedTools",
+    "mcp__*",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
 )
 
 
@@ -86,7 +98,7 @@ def asyncio_run(coro):
 
 
 #: Emulates the documented `claude -p --output-format json` surface.
-_CLAUDE_SRC = r'''
+_CLAUDE_SRC = r"""
 import json, os, sys, uuid
 argv = sys.argv[1:]
 if "--version" in argv:
@@ -124,7 +136,7 @@ print(json.dumps({
     "result": "claude-ok echo=%s cwd=%s" % (first_line, os.getcwd()),
     "usage": {"input_tokens": 10, "output_tokens": 4},
 }))
-'''
+"""
 
 
 class _ClaudeHooks:
@@ -256,19 +268,31 @@ class TestGrantAllowlistContract:
 
     def test_read_only_layering(self, tmp_path):
         expected = (
-            "--safe-mode", "--permission-mode", "default",
-            "--tools", "Read,Grep,Glob",
-            "--disallowedTools", "mcp__*",
-            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--safe-mode",
+            "--permission-mode",
+            "default",
+            "--tools",
+            "Read,Grep,Glob",
+            "--disallowedTools",
+            "mcp__*",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
         )
         assert _real(tmp_path).grant_arguments(ExecutionGrantKind.READ_ONLY_ACCESS) == expected
 
     def test_workspace_write_layering(self, tmp_path):
         expected = (
-            "--safe-mode", "--permission-mode", "acceptEdits",
-            "--tools", "Read,Grep,Glob,Edit,Write,NotebookEdit",
-            "--disallowedTools", "mcp__*",
-            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--safe-mode",
+            "--permission-mode",
+            "acceptEdits",
+            "--tools",
+            "Read,Grep,Glob,Edit,Write,NotebookEdit",
+            "--disallowedTools",
+            "mcp__*",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
         )
         assert _real(tmp_path).grant_arguments(ExecutionGrantKind.WORKSPACE_WRITE) == expected
 
@@ -457,7 +481,9 @@ class TestWideningDefenseFix4:
             ),
             encoding="utf-8",
         )
-        (ws / ".mcp.json").write_text('{"mcpServers":{"evil":{"command":"evil.exe"}}}', encoding="utf-8")
+        (ws / ".mcp.json").write_text(
+            '{"mcpServers":{"evil":{"command":"evil.exe"}}}', encoding="utf-8"
+        )
         return ws
 
     async def test_composed_run_keeps_allowlist_layers_under_hostile_settings(
@@ -466,6 +492,7 @@ class TestWideningDefenseFix4:
         workspace = self._hostile_workspace(tmp_path)
         composed: list[tuple[str, ...]] = []
         import relay.harness.runtime as runtime_module
+
         original = runtime_module.execute
 
         async def _capture(spec):
@@ -478,8 +505,12 @@ class TestWideningDefenseFix4:
         assert len(composed) == 1
         argv = composed[0]
         for required in (
-            "--safe-mode", "--tools", "--disallowedTools",
-            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--safe-mode",
+            "--tools",
+            "--disallowedTools",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
         ):
             assert required in argv, f"missing {required} in composed argv"
         tools_idx = argv.index("--tools")
@@ -487,7 +518,9 @@ class TestWideningDefenseFix4:
 
     def test_invocation_never_composes_allowedtools_or_bare_flags(self, tmp_path):
         for grant_kind in (ExecutionGrantKind.READ_ONLY_ACCESS, ExecutionGrantKind.WORKSPACE_WRITE):
-            argv = _agent(tmp_path).compose_argv(_fake_resolved(), _agent(tmp_path).resolve_grant(grant_kind))
+            argv = _agent(tmp_path).compose_argv(
+                _fake_resolved(), _agent(tmp_path).resolve_grant(grant_kind)
+            )
             joined = " ".join(argv)
             assert "--allowedTools" not in joined
             assert "--bare" not in joined
@@ -553,9 +586,7 @@ class TestSecondHarnessGateZeroTouch:
         found: list[tuple[int, str]] = []
         tree = ast.parse(text)
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith(
-                ".claude_code"
-            ):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith(".claude_code"):
                 found.append((node.lineno, node.module))
             elif isinstance(node, ast.Import):
                 for alias in node.names:
@@ -630,9 +661,8 @@ class TestSecondHarnessGateZeroTouch:
             stripped = line.strip()
             # Template-body samples sit inside string literals starting '#'.
             in_template_sample = (
-                (stripped.startswith(('"', "'")) and stripped.lstrip('"\'').startswith("#"))
-                or stripped.startswith("#")
-            )
+                stripped.startswith(('"', "'")) and stripped.lstrip("\"'").startswith("#")
+            ) or stripped.startswith("#")
             assert in_template_sample, (
                 f"{main_path}:{lineno}: unexpected claude reference outside the "
                 f"config-sample carveout: {stripped[:60]}"
@@ -643,7 +673,7 @@ class TestSecondHarnessGateZeroTouch:
         registry_path = REPO_ROOT / "relay" / "agents" / "registry.py"
         text = registry_path.read_text(encoding="utf-8")
         assert 'AGENTS["claude_code"] = ClaudeCodeAgent' in text
-        assert 'from relay.agents.claude_code import ClaudeCodeAgent' in text
+        assert "from relay.agents.claude_code import ClaudeCodeAgent" in text
         # and nowhere else may the adapter be wired
         for root in ("cli", "context", "core", "storage"):
             base = REPO_ROOT / "relay" / root

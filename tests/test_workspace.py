@@ -12,7 +12,6 @@ Phase 1 contract under test:
   same id across re-inits, profile refreshed.
 """
 
-
 import pytest
 import yaml
 
@@ -101,7 +100,7 @@ class TestRelayYamlConfig:
         free-form shell string."""
         (tmp_path / "relay.yaml").write_text(
             "agents:\n  gpt: {backend: api, adapter: openai}\n"
-            "verification:\n  program: pytest\n  args: [\"-q\"]\n  timeout_seconds: 120\n",
+            'verification:\n  program: pytest\n  args: ["-q"]\n  timeout_seconds: 120\n',
             encoding="utf-8",
         )
         config = load_config(tmp_path)
@@ -113,8 +112,7 @@ class TestRelayYamlConfig:
     def test_verification_defaults_and_absence(self, tmp_path):
         assert load_config(tmp_path).verification is None
         (tmp_path / "relay.yaml").write_text(
-            "agents:\n  gpt: {backend: api, adapter: openai}\n"
-            "verification:\n  program: pytest\n",
+            "agents:\n  gpt: {backend: api, adapter: openai}\nverification:\n  program: pytest\n",
             encoding="utf-8",
         )
         verification = load_config(tmp_path).verification
@@ -126,8 +124,8 @@ class TestRelayYamlConfig:
         "block",
         [
             "verification:\n  args: []\n",  # missing required program
-            "verification:\n  program: pytest\n  args: [\"-q\"]\n  timeout_seconds: 0\n",
-            "verification:\n  program: pytest\n  shell: \"pytest -q\"\n",
+            'verification:\n  program: pytest\n  args: ["-q"]\n  timeout_seconds: 0\n',
+            'verification:\n  program: pytest\n  shell: "pytest -q"\n',
         ],
     )
     def test_invalid_verification_block_is_a_config_error(self, tmp_path, block):
@@ -154,8 +152,7 @@ class TestRelayYamlConfig:
     def test_api_backend_cannot_carry_harness_block(self, tmp_path):
         """Family/field coherence: 'harness:' demands backend: harness."""
         (tmp_path / "relay.yaml").write_text(
-            "agents:\n"
-            "  wrong: {backend: api, adapter: openai, harness: {timeout_seconds: 5}}\n",
+            "agents:\n  wrong: {backend: api, adapter: openai, harness: {timeout_seconds: 5}}\n",
             encoding="utf-8",
         )
         with pytest.raises(ConfigError, match="'harness:' block requires"):
@@ -241,9 +238,10 @@ class TestIdempotentInit:
         folder = tmp_path / "Demo"
         folder.mkdir()
         key = identity_key(folder)
-        assert key == identity_key(tmp_path / "demo") or key.lower() == identity_key(
-            tmp_path / "demo"
-        ).lower()  # normcase handles Windows case-folding
+        assert (
+            key == identity_key(tmp_path / "demo")
+            or key.lower() == identity_key(tmp_path / "demo").lower()
+        )  # normcase handles Windows case-folding
         assert key == identity_key(folder / ".." / "Demo")  # realpath collapses ".."
 
     def test_layout_paths(self, tmp_path):

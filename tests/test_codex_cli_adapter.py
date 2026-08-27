@@ -207,7 +207,12 @@ class TestParseOutput:
                 json.dumps({"type": "thread.started", "thread_id": "t"}),
                 json.dumps({"type": "future.event", "payload": 1}),
                 json.dumps({"type": "item.completed", "item": {"id": "i", "type": "web_search"}}),
-                json.dumps({"type": "item.completed", "item": {"id": "f", "type": "agent_message", "text": "ok"}}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"id": "f", "type": "agent_message", "text": "ok"},
+                    }
+                ),
                 json.dumps({"type": "turn.completed"}),
             ]
         )
@@ -231,7 +236,10 @@ class TestParseOutput:
             [
                 json.dumps({"type": "thread.started"}),
                 json.dumps(
-                    {"type": "item.completed", "item": {"id": "f", "type": "agent_message", "text": "partial"}}
+                    {
+                        "type": "item.completed",
+                        "item": {"id": "f", "type": "agent_message", "text": "partial"},
+                    }
                 ),
                 json.dumps({"type": "turn.failed", "error": {"message": "model overloaded"}}),
             ]
@@ -246,7 +254,10 @@ class TestParseOutput:
             [
                 json.dumps({"type": "thread.started"}),
                 json.dumps(
-                    {"type": "item.completed", "item": {"id": "f", "type": "agent_message", "text": "looks done"}}
+                    {
+                        "type": "item.completed",
+                        "item": {"id": "f", "type": "agent_message", "text": "looks done"},
+                    }
                 ),
             ]
         )
@@ -259,9 +270,14 @@ class TestParseOutput:
             [
                 json.dumps({"type": "thread.started", "thread_id": "t9"}),
                 json.dumps(
-                    {"type": "item.completed", "item": {"id": "f", "type": "agent_message", "text": "done properly"}}
+                    {
+                        "type": "item.completed",
+                        "item": {"id": "f", "type": "agent_message", "text": "done properly"},
+                    }
                 ),
-                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 2}}),
+                json.dumps(
+                    {"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 2}}
+                ),
             ]
         )
         assert agent.parse_output(stream, "") == "done properly"
@@ -284,7 +300,10 @@ class TestParseOutput:
                     }
                 ),
                 json.dumps(
-                    {"type": "item.completed", "item": {"id": "f", "type": "agent_message", "text": "ok"}}
+                    {
+                        "type": "item.completed",
+                        "item": {"id": "f", "type": "agent_message", "text": "ok"},
+                    }
                 ),
                 json.dumps({"type": "turn.completed"}),
             ]
@@ -344,7 +363,7 @@ class TestParseOutput:
 # ---------------------------------------------------------------------------
 
 
-_CODEX_SRC = r'''
+_CODEX_SRC = r"""
 import json, os, sys
 data = sys.stdin.read()
 if "--version" in sys.argv:
@@ -374,7 +393,7 @@ print(json.dumps({"type": "item.completed",
                            "text": "codex-ok echo=%s cwd=%s" % (first_line, os.getcwd())}}))
 print(json.dumps({"type": "turn.completed",
                   "usage": {"input_tokens": 10, "output_tokens": 5}}))
-'''
+"""
 
 
 class _CodexHooks:
@@ -410,9 +429,7 @@ class CodexShapedFixture(HarnessAgent):
     )
 
     def __init__(self, settings=None, *, profile=None, workspace_root=None):
-        super().__init__(
-            settings=settings, profile=profile, workspace_root=workspace_root
-        )
+        super().__init__(settings=settings, profile=profile, workspace_root=workspace_root)
         self.__hooks = _CodexHooks(self.name, self._settings)
 
     def invocation_argv(self, resolved):
@@ -619,7 +636,9 @@ def test_live_codex_build_smoke(tmp_path, monkeypatch):
     assert len(diffs) == 1, "expected a Relay-owned diff artifact from a real edit"
     assert "COUNT = 1" in (diffs[0].content or "")
 
-    evidence_store = __import__("relay.storage", fromlist=["SqliteEvidenceStore"]).SqliteEvidenceStore(store)
+    evidence_store = __import__(
+        "relay.storage", fromlist=["SqliteEvidenceStore"]
+    ).SqliteEvidenceStore(store)
     kinds = {r.kind for r in evidence_store.records_for_task(task.id)}
     assert _EvidenceKind.IMPLEMENTATION_PRODUCED in kinds
 

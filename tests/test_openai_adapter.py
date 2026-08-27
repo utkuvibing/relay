@@ -135,9 +135,7 @@ class TestActionableErrors:
 
     def test_missing_key_fails_before_any_io(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        agent = OpenAICompatibleAgent(
-            AgentSettings(adapter="openai"), client=httpx.AsyncClient()
-        )
+        agent = OpenAICompatibleAgent(AgentSettings(adapter="openai"), client=httpx.AsyncClient())
         with pytest.raises(AgentNotConfigured, match="OPENAI_API_KEY"):
             asyncio_run(agent, AgentRequest(prompt="p", role=AgentRole.RESEARCHER))
 
@@ -179,9 +177,7 @@ class TestSettingsPrecedence:
 
     def test_yaml_beats_default(self):
         yaml_agent = AgentConfig(backend=BackendType.API, adapter="openai", model="from-yaml")
-        settings = resolve_settings(
-            env={"OPENAI_API_KEY": API_KEY}, yaml_agent=yaml_agent
-        )
+        settings = resolve_settings(env={"OPENAI_API_KEY": API_KEY}, yaml_agent=yaml_agent)
         assert settings.model == "from-yaml"
 
     def test_default_when_nothing_configured(self):

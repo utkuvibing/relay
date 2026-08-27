@@ -177,9 +177,7 @@ class ClaudeCodeAgent(HarnessAgent):
         try:
             envelope = json.loads(stdout_text.strip() or "{}")
         except json.JSONDecodeError as exc:
-            raise HarnessOutputError(
-                f"{self.name}: result envelope could not be decoded"
-            ) from exc
+            raise HarnessOutputError(f"{self.name}: result envelope could not be decoded") from exc
         if not isinstance(envelope, dict):
             raise HarnessOutputError(f"{self.name}: result envelope could not be decoded")
 
@@ -252,8 +250,7 @@ class ClaudeCodeAgent(HarnessAgent):
         ref = _uuid_or_none(session_ref)
         if ref is None:
             raise UnsupportedCapability(
-                f"{self.name}: invalid session reference {session_ref!r} — "
-                "expected a UUID"
+                f"{self.name}: invalid session reference {session_ref!r} — expected a UUID"
             )
         return ("--resume", ref)
 
