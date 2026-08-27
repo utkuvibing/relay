@@ -15,12 +15,18 @@ Family-blind by App. B.2: API- and harness-backed adapters flow through this
 exact code. No ``Message`` rows and no ``Task`` — a one-shot ask is not
 conversation-bus traffic (App. A.2/B.1).
 
-``run_build`` (P2.2b) reuses this crash-safe spine for a task-scoped
-implementation run, then closes gate G2: adapter-normalized tool
+``run_build`` (P2.2b, lifecycle-wired in P3.1) reuses this crash-safe spine
+for a task-scoped flow and closes gate G2: the deterministic task state
+machine (``relay.core.state_machine``) owns the task from ``CREATED`` —
+Relay collects context (``relay:core``), a READ_ONLY planning run mints the
+canonical ``ArtifactKind.PLAN`` (``PLAN_PRODUCED`` with that run's
+``run_id``), the standalone build's explicit human initiation is the D.3
+implicit freeze onto ``IMPLEMENTING``, and the implementation run's Relay-
+extracted diff backs ``IMPLEMENTATION_PRODUCED``. Every edge is validated
+against the ``EvidenceStore`` — a model claiming "done" moves nothing
+(SPEC §27 Phase 3 exit gate; App. A.1). Adapter-normalized tool
 observations land as ToolRun rows; Relay extracts the diff itself from a
-pre-run baseline (non-mutating) as a DIFF artifact;
-IMPLEMENTATION_PRODUCED evidence is recorded with run provenance only when
-a workspace change was actually produced.
+pre-run baseline (non-mutating) as a DIFF artifact.
 
 Core never sees provider event vocabulary: adapters expose normalized
 :class:`~relay.agents.base.ToolObservation` values on ``AgentResponse``
@@ -29,6 +35,7 @@ Core never sees provider event vocabulary: adapters expose normalized
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass
 
@@ -36,12 +43,14 @@ from relay.agents.base import (
     Agent,
     AgentRequest,
     AgentResponse,
+    AgentRole,
     BackendType,
     RunObservation,
 )
 from relay.agents.errors import AgentError
 from relay.core.evidence import EvidenceKind, EvidenceStore
 from relay.core.permissions import Action, PermissionGate, ToolRequest
+from relay.core.state_machine import TaskState, TaskStateMachine
 from relay.harness.sanitization import redact
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
@@ -318,10 +327,8 @@ def _diff_against_baseline(gate: PermissionGate, root, task_id: str) -> str:
         def _text(blob: bytes | None) -> str:
             return blob.decode("utf-8", errors="replace") if blob is not None else ""
 
-        is_binary_before = (
-            before is not None and b"\x00" in before[: _BINARY_SNIFF_BYTES]
-        )
-        is_binary_after = after is not None and b"\x00" in after[: _BINARY_SNIFF_BYTES]
+        is_binary_before = before is not None and b"\x00" in before[:_BINARY_SNIFF_BYTES]
+        is_binary_after = after is not None and b"\x00" in after[:_BINARY_SNIFF_BYTES]
         if is_binary_before or is_binary_after:
             lines.append(f"Binary files {name} differ")
             continue
@@ -351,6 +358,174 @@ _BASELINE_FILE_CAP_BYTES = 4 * 1024 * 1024
 _BINARY_SNIFF_BYTES = 8000
 
 
+# ---------------------------------------------------------------------------
+# P3.1 — deterministic task lifecycle (SPEC §6, §27 Phase 3, App. A.1, D.3)
+# ---------------------------------------------------------------------------
+
+_PLAN_DIRECTIVE = (
+    "You are the planner. Produce a concise, executable implementation plan "
+    "for the task below. Output only the plan as markdown with the sections: "
+    "Goal, Steps, Files, Verification.\n\nTASK:\n{prompt}"
+)
+
+_IMPLEMENT_DIRECTIVE = (
+    "Implement the following accepted plan exactly.\n\n"
+    "ACCEPTED PLAN:\n{plan}\n\nORIGINAL REQUEST:\n{prompt}"
+)
+
+
+def _advance(
+    machine: TaskStateMachine,
+    store: SqliteRelayStore,
+    writer: EventLogWriter,
+    task: Task,
+    target: TaskState,
+) -> Task:
+    """One persisted lifecycle transition: validate → persist state → event.
+
+    The machine validates the edge against the ``EvidenceStore`` first; only
+    a granted transition updates ``Task.state`` and appends the
+    ``STATE_TRANSITIONED`` event (same transaction). No caller-supplied enum
+    ever carries transition authority (App. A.1).
+    """
+    previous = machine.state
+    machine.transition(target)
+    updated = task.model_copy(update={"state": target})
+    with store.transaction():
+        store.update_model(updated)
+        writer.record(
+            EventLogEntry(
+                type=EventType.STATE_TRANSITIONED,
+                content=f"task state: {previous.value} -> {target.value}",
+                references=[f"task:{task.id}"],
+            )
+        )
+    return updated
+
+
+def _collect_context(
+    store: SqliteRelayStore,
+    writer: EventLogWriter,
+    evidence: EvidenceStore,
+    task: Task,
+    workspace_root,
+) -> Task:
+    """Relay-collected workspace context backing ``CREATED→CONTEXT_READY``.
+
+    The brief is real discovered repository fact (SPEC §13 profile: languages,
+    frameworks, instruction files, test suites) persisted as a RESEARCH
+    artifact the evidence record points at — never a caller-supplied claim.
+    """
+    from relay.context.workspace import discover_profile
+
+    profile = discover_profile(workspace_root)
+    brief = (
+        "# Workspace context (relay:core)\n\n"
+        f"- languages: {', '.join(profile.languages) or '(none detected)'}\n"
+        f"- frameworks: {', '.join(profile.frameworks) or '(none detected)'}\n"
+        f"- package managers: {', '.join(profile.package_managers) or '(none detected)'}\n"
+        f"- instruction files: {', '.join(profile.instructions) or '(none)'}\n"
+        f"- test suites: {json.dumps(profile.tests, sort_keys=True) if profile.tests else '(none detected)'}\n"
+        f"- default branch: {profile.default_branch}\n"
+    )
+    with store.transaction():
+        artifact = store.save_model(
+            Artifact(kind=ArtifactKind.REPORT, task_id=task.id, content=brief)
+        )
+        evidence.record(
+            EvidenceRecord(
+                kind=EvidenceKind.CONTEXT_COLLECTED,
+                task_id=task.id,
+                produced_by="relay:core",
+                artifact_id=artifact.id,
+            )
+        )
+        writer.record(
+            EventLogEntry(
+                type=EventType.EVIDENCE_RECORDED,
+                content=f"{EvidenceKind.CONTEXT_COLLECTED.value} recorded for task",
+                references=[f"task:{task.id}", f"artifact:{artifact.id}"],
+            )
+        )
+    return task
+
+
+def _freeze_plan(
+    store: SqliteRelayStore,
+    writer: EventLogWriter,
+    evidence: EvidenceStore,
+    task: Task,
+    plan_outcome: AskOutcome,
+) -> Task:
+    """Mint the canonical ``ArtifactKind.PLAN`` + ``PLAN_PRODUCED`` evidence.
+
+    Provenance is honest by construction: the plan artifact and the evidence
+    record both point at the planning run that produced them (App. A.1).
+    """
+    plan_text = plan_outcome.response.output if plan_outcome.response else ""
+    with store.transaction():
+        artifact = store.save_model(
+            Artifact(
+                kind=ArtifactKind.PLAN,
+                run_id=plan_outcome.run.id,
+                task_id=task.id,
+                content=plan_text,
+            )
+        )
+        evidence.record(
+            EvidenceRecord(
+                kind=EvidenceKind.PLAN_PRODUCED,
+                task_id=task.id,
+                run_id=plan_outcome.run.id,
+                artifact_id=artifact.id,
+                produced_by=f"agent:{plan_outcome.run.agent}",
+            )
+        )
+        writer.record(
+            EventLogEntry(
+                type=EventType.ARTIFACT_CREATED,
+                content="canonical plan artifact minted",
+                references=[
+                    f"run:{plan_outcome.run.id}",
+                    f"artifact:{artifact.id}",
+                    f"task:{task.id}",
+                ],
+            )
+        )
+        writer.record(
+            EventLogEntry(
+                type=EventType.EVIDENCE_RECORDED,
+                content=f"{EvidenceKind.PLAN_PRODUCED.value} recorded for task",
+                references=[f"task:{task.id}", f"run:{plan_outcome.run.id}"],
+            )
+        )
+    return task
+
+
+def _planner_for(agent: Agent) -> Agent:
+    """Same adapter bound to a READ_ONLY grant for the planning run (D3).
+
+    Mirrors the existing ``agent._profile`` access precedent: the planner is
+    the configured implementer's own adapter downgraded to READ_ONLY — plans
+    are authored without any write capability. API-backed agents (which
+    cannot reach this code path — build refuses them earlier) fall through
+    unchanged.
+    """
+    from relay.harness.runtime import HarnessAgent
+    from relay.harness.types import ExecutionGrantKind
+
+    if not isinstance(agent, HarnessAgent):
+        return agent
+    profile = None
+    if agent._profile is not None:
+        profile = agent._profile.model_copy(update={"grant": ExecutionGrantKind.READ_ONLY_ACCESS})
+    return type(agent)(
+        settings=agent._settings,
+        profile=profile,
+        workspace_root=agent._workspace_root,
+    )
+
+
 async def run_build(
     store: SqliteRelayStore,
     writer: EventLogWriter,
@@ -363,7 +538,16 @@ async def run_build(
     model: str | None = None,
     agent_name: str | None = None,
 ) -> BuildOutcome:
-    """One implementation run under a task; closes acceptance gate G2."""
+    """Drive one task through the deterministic lifecycle to IMPLEMENTED.
+
+    P3.1 wiring (SPEC §27 Phase 3): the task state machine owns the task
+    from ``CREATED`` — context collection, a READ_ONLY planning run minting
+    the canonical plan artifact, the D.3 implicit freeze (standalone build =
+    explicit human initiation), then the implementation run. Every edge is
+    validated against the ``EvidenceStore``; a run that produces no workspace
+    change leaves the task honestly blocked at ``IMPLEMENTING`` (claims never
+    close tasks). Closes acceptance gate G2 along the way.
+    """
     gate = gate or PermissionGate()
     if request.task_id is None:
         raise BuildRefusal("build runs are task-scoped: provide request.task_id")
@@ -389,11 +573,61 @@ async def run_build(
             f"configured grant '{effective.value}' cannot implement changes"
         )
 
-    # Blocker 2 provenance baseline: snapshot BEFORE any harness I/O so
-    # pre-existing files are never attributed to the run.
+    # P3.1: the deterministic machine owns the task from here on. A task
+    # whose lifecycle already started is refused (resumability is a later
+    # seam; guessing at mid-flight state would transfer authority back to
+    # callers).
+    if task.state is not TaskState.CREATED:
+        raise BuildRefusal(
+            f"task '{task.id}' is at state '{task.state.value}' — "
+            "lifecycle already started; a fresh build creates a fresh task"
+        )
+    machine = TaskStateMachine(task_id=task.id, store=evidence)
+
+    # 1. Context collection (relay:core) → CONTEXT_READY.
+    task = _collect_context(store, writer, evidence, task, workspace_root)
+    task = _advance(machine, store, writer, task, TaskState.CONTEXT_READY)
+
+    # 2. Planning run (same adapter, READ_ONLY) → canonical plan → PLAN_READY.
+    plan_request = request.model_copy(
+        update={
+            "role": AgentRole.PLANNER,
+            "prompt": _PLAN_DIRECTIVE.format(prompt=request.prompt),
+        }
+    )
+    plan_outcome = await run_ask(
+        store, writer, _planner_for(agent), plan_request, model=model, agent_name=agent_name
+    )
+    if plan_outcome.response is None or not plan_outcome.response.output.strip():
+        # Planning failed or produced nothing usable: the task stays honestly
+        # blocked at CONTEXT_READY (no plan evidence, no implementation).
+        return BuildOutcome(task=task, ask=plan_outcome)
+    task = _freeze_plan(store, writer, evidence, task, plan_outcome)
+    task = _advance(machine, store, writer, task, TaskState.PLAN_READY)
+
+    # 3. Implicit freeze (App. D.3): a standalone `relay build` IS the
+    # human's explicit initiation — the PLAN_READY→IMPLEMENTING edge.
+    task = _advance(machine, store, writer, task, TaskState.IMPLEMENTING)
+
+    # 4. Implementation run — the prompt is the frozen plan artifact content,
+    # not the raw prompt (App. D.3: downstream agents operate against the
+    # canonical plan).
+    implement_request = request.model_copy(
+        update={
+            "prompt": _IMPLEMENT_DIRECTIVE.format(
+                plan=plan_outcome.response.output, prompt=request.prompt
+            )
+        }
+    )
+
+    # Blocker 2 provenance baseline: snapshot BEFORE implement-run I/O so
+    # pre-existing files are never attributed to the run. (The plan run is
+    # READ_ONLY; anything it left behind is pre-existing by definition.)
     _workdir_state["baseline"] = _capture_baseline(workspace_root)
 
-    outcome = await run_ask(store, writer, agent, request, model=model, agent_name=agent_name)
+    outcome = await run_ask(
+        store, writer, agent, implement_request, model=model, agent_name=agent_name
+    )
     if outcome.response is None:
         return BuildOutcome(task=task, ask=outcome)
 
@@ -408,19 +642,29 @@ async def run_build(
     if diff_text.strip():
         with store.transaction():
             artifact = store.save_model(
-                Artifact(kind=ArtifactKind.DIFF, run_id=outcome.run.id, task_id=task.id, content=diff_text)
+                Artifact(
+                    kind=ArtifactKind.DIFF,
+                    run_id=outcome.run.id,
+                    task_id=task.id,
+                    content=diff_text,
+                )
             )
             writer.record(
                 EventLogEntry(
                     type=EventType.ARTIFACT_CREATED,
                     content="diff extracted from workspace after build",
-                    references=[f"run:{outcome.run.id}", f"artifact:{artifact.id}", f"task:{task.id}"],
+                    references=[
+                        f"run:{outcome.run.id}",
+                        f"artifact:{artifact.id}",
+                        f"task:{task.id}",
+                    ],
                 )
             )
         diff_artifact_id = artifact.id
 
     # IMPLEMENTATION_PRODUCED only when the run actually produced changes
-    # (Blocker 4): a no-op build mints nothing.
+    # (Blocker 4): a no-op build mints nothing — and the machine therefore
+    # keeps the task at IMPLEMENTING (§27 Phase 3 exit gate).
     if diff_text.strip():
         evidence.record(
             EvidenceRecord(
@@ -437,5 +681,8 @@ async def run_build(
                 references=[f"task:{task.id}", f"run:{outcome.run.id}"],
             )
         )
+        task = _advance(machine, store, writer, task, TaskState.IMPLEMENTED)
 
-    return BuildOutcome(task=task, ask=outcome, diff_artifact_id=diff_artifact_id, tool_run_ids=tool_run_ids)
+    return BuildOutcome(
+        task=task, ask=outcome, diff_artifact_id=diff_artifact_id, tool_run_ids=tool_run_ids
+    )
