@@ -603,3 +603,52 @@ Highlights:
 
 Suite at merge time: 330 passed / 6 skipped; ruff clean.
 
+---
+
+## 17. P2.4 execution record (Antigravity CLI adapter)
+
+Implemented per frozen plan rev 2 (`p2.4-antigravity-cli-adapter-plan.md`,
+grilled decisions Q1-Q5 in-band). The roadmap's "expected Antigravity CLI"
+materialized before implementation: `agy` v1.1.22 replaced Gemini CLI for
+individual accounts on 2026-06-18; the Google subscription path targets it.
+
+Highlights:
+
+* READ_ONLY-only ship (grilled decision Q4): the CLI has NO per-invocation
+  clamp flag, so once vendor bug #548 is fixed, settings-side widening
+  (`permissions.allow` / `agentMode` / `mcpServers` / hooks in
+  `~/.gemini/antigravity-cli/settings.json`) would govern headless runs
+  beyond Relay's control. WORKSPACE_WRITE and WORKSPACE_WRITE_NETWORK
+  refuse typed pre-spawn. **Reopen condition:** the vendor ships a
+  per-invocation allowlist flag (`--tools`-style) or equivalent settings
+  isolation.
+* READ_ONLY maps to `--mode plan` (Q1): structural no-mutation, CLI flag
+  overrides `agentMode` settings. Documented behavioral note: plan mode
+  prepends the `/plan` prefix, so read-only responses skew toward
+  outline/analysis; the live smoke's no-write lock makes the guarantee
+  empirical (asked to create a file, the agent must not).
+* Mandatory slash clamp (Q3): Relay requires `agy >= 1.1.9` AND verifiable
+  `--disable-slash-commands` presence in the binary's help output; the flag
+  rides every invocation and a binary lacking either fails typed pre-spawn.
+  Prompts are never sanitized or rewritten.
+* Fail-closed envelope contract (D5): only `SUCCESS` yields text; every
+  documented failure status and any unknown future status produce typed,
+  sanitized failures. `conversation_id` is UUID-validated in memory only
+  (D8 dormancy, `--conversation` translation dormant until P7).
+* Conflict-variable audit (D7): `GEMINI_API_KEY`/`GOOGLE_API_KEY`/
+  `GOOGLE_APPLICATION_CREDENTIALS` already universal; the profile adds
+  `GOOGLE_GEMINI_BASE_URL`, `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_CLOUD_PROJECT`.
+* Windows note: `agy` is a native Go binary - no shim wrapping (codex
+  precedent); the resolved command is exec'd directly.
+* K3 refusal parity: `relay build` configured with the adapter persists a
+  failed run naming adapter and grant - no DIFF artifact, no
+  IMPLEMENTATION_PRODUCED evidence; G2 machinery stays family-blind.
+* G4 zero-touch proven: PR diff review plus the standing tier scans
+  (AST identifiers outside agents/tests prohibited; tokens outside the
+  zone only in '#' comment lines or prose).
+* Precondition executed: main realigned at 2f3934d; hermetic-first path
+  (Q-c) - `agy` absent locally, step-0 degrades to the doubly-gated live
+  smoke (`RELAY_LIVE_ANTIGRAVITY_SMOKE=1`).
+
+Suite at merge time: 374 passed / 9 skipped; ruff clean.
+
