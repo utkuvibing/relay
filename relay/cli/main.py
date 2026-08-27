@@ -75,9 +75,7 @@ def _open_db(root: Path):
     """Open (and migrate) the workspace database; raises ConfigError if uninitialized."""
     layout = workspace_layout(root)
     if not layout.db_path.exists():
-        raise ConfigError(
-            f"workspace not initialized - run 'relay init' in {root} first"
-        )
+        raise ConfigError(f"workspace not initialized - run 'relay init' in {root} first")
     conn = connect(layout.db_path)
     migrate(conn)
     return conn
@@ -134,9 +132,7 @@ def init() -> None:
 def ask(
     provider: str = typer.Argument(..., help="Agent name from relay.yaml, e.g. 'gpt'."),
     prompt: str = typer.Argument(..., help="What to ask, in quotes."),
-    role: AgentRole = typer.Option(
-        AgentRole.RESEARCHER, "--role", help="Agent role for this run."
-    ),
+    role: AgentRole = typer.Option(AgentRole.RESEARCHER, "--role", help="Agent role for this run."),
     model: str | None = typer.Option(None, "--model", help="Model override (CLI wins)."),
 ) -> None:
     """Run one agent on one prompt; persist the run crash-safely."""
@@ -231,6 +227,7 @@ def build(
                     workspace_root=root,
                     model=settings.model,
                     agent_name=chosen_name,
+                    verification=config.verification,
                 )
             )
         finally:
@@ -325,11 +322,7 @@ def history(
                     raise typer.Exit(code=1)
                 artifacts = store.artifacts_for_run(run.id)
                 writer = EventLogWriter(conn)
-                events = [
-                    entry
-                    for entry in writer.all()
-                    if f"run:{run.id}" in entry.references
-                ]
+                events = [entry for entry in writer.all() if f"run:{run.id}" in entry.references]
                 run_detail(run, artifacts, events)
                 return
             runs = list(store.all_models(Run, order_by="started_at DESC, rowid DESC", limit=limit))
@@ -346,4 +339,3 @@ def history(
 
 if __name__ == "__main__":
     app()
-

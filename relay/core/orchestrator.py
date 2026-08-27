@@ -36,6 +36,8 @@ Core never sees provider event vocabulary: adapters expose normalized
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 
@@ -48,6 +50,7 @@ from relay.agents.base import (
     RunObservation,
 )
 from relay.agents.errors import AgentError
+from relay.context.config import VerificationConfig
 from relay.core.evidence import EvidenceKind, EvidenceStore
 from relay.core.permissions import Action, PermissionGate, ToolRequest
 from relay.core.state_machine import TaskState, TaskStateMachine
@@ -526,6 +529,180 @@ def _planner_for(agent: Agent) -> Agent:
     )
 
 
+# ---------------------------------------------------------------------------
+# P3.2 — Relay-scoped verification (SPEC §27 Phase 3 exit gate, App. A.1)
+# ---------------------------------------------------------------------------
+
+_VERIFICATION_OUTPUT_CAP_CHARS = 20_000
+
+
+async def _run_verification(
+    store: SqliteRelayStore,
+    writer: EventLogWriter,
+    evidence: EvidenceStore,
+    gate: PermissionGate,
+    machine: TaskStateMachine,
+    task: Task,
+    verification: VerificationConfig | None,
+    workspace_root,
+) -> Task:
+    """Relay grades the exam — the implementer never does (frozen plan Q-c).
+
+    The configured command executes as a Relay-owned ToolRun (no agent
+    parent) through the permission gate with a stripped, baseline child
+    environment and a bounded timeout. Dispositions (frozen-plan D3):
+
+    * absent config → stay blocked in ``VERIFYING`` (the gap is queryable);
+    * exit 0 → ``TESTS_PASSED`` (``tool_run_id`` + artifact provenance)
+      → ``REVIEWING``;
+    * non-zero exit → ``TEST_RESULT`` artifact → rework to ``IMPLEMENTING``;
+    * could-not-execute / timeout / gate refusal → blocked in ``VERIFYING``
+      with the reason on the ToolRun row — "Relay could not run the exam"
+      is never recorded as "the tests failed".
+
+    Exit code is the only verdict; output is persisted (capped, redacted)
+    for humans, never parsed.
+    """
+    if verification is None:
+        return task
+
+    from relay.harness.env_policy import DEFAULT_CONFLICT_VARIABLES, build_child_env
+    from relay.harness.process import LaunchSpec
+    from relay.harness.process import execute as execute_process
+
+    # Policy first (D4): the same single gate path as every Relay execution.
+    decision = gate.check(
+        ToolRequest(
+            action=Action.RUN_TESTS,
+            agent="relay",
+            task_id=task.id,
+            reason="relay-scoped verification of the implemented plan (P3.2)",
+        )
+    )
+    resolved = shutil.which(verification.program)
+    blocked_reason: str | None = None
+    if decision.outcome != "allow":
+        blocked_reason = (
+            f"verification refused by policy: {decision.action.value} -> {decision.outcome}"
+        )
+    elif resolved is None:
+        blocked_reason = f"verification program {verification.program!r} was not found on PATH"
+
+    tool_run = ToolRun(
+        parent_run_id=None,  # Relay-owned: no agent run triggered this (D5)
+        tool="verification",
+        arguments={"program": verification.program, "args": list(verification.args)},
+        status=RunStatus.RUNNING,
+    )
+    with store.transaction():
+        store.save_model(tool_run)
+        writer.record(
+            EventLogEntry(
+                type=EventType.TOOL_REQUESTED,
+                content=f"verification requested: {verification.program}",
+                references=[f"task:{task.id}", f"tool_run:{tool_run.id}"],
+            )
+        )
+
+    def _finalize(row_status: RunStatus, error: str | None, result_ref: str | None) -> None:
+        finished = tool_run.model_copy(
+            update={
+                "status": row_status,
+                "ended_at": utcnow(),
+                "error": error,
+                "result_ref": result_ref,
+            }
+        )
+        store.update_model(finished)
+        writer.record(
+            EventLogEntry(
+                type=EventType.TOOL_COMPLETED,
+                content=(
+                    f"verification {row_status.value}"
+                    + (f": {redact(error[:160])}" if error else "")
+                ),
+                references=[f"task:{task.id}", f"tool_run:{tool_run.id}"],
+            )
+        )
+
+    if blocked_reason is not None:
+        with store.transaction():
+            _finalize(RunStatus.FAILED, blocked_reason, None)
+        return task  # blocked in VERIFYING — never a minted verdict
+
+    try:
+        outcome = await execute_process(
+            LaunchSpec(
+                argv=(resolved, *verification.args),
+                cwd=workspace_root,
+                env=build_child_env(
+                    dict(os.environ),
+                    conflict_variables=DEFAULT_CONFLICT_VARIABLES,
+                ),
+                timeout_s=verification.timeout_seconds,
+            )
+        )
+    except OSError as exc:
+        with store.transaction():
+            _finalize(
+                RunStatus.FAILED,
+                f"verification could not execute: {type(exc).__name__}",
+                None,
+            )
+        return task
+
+    output = redact(
+        f"exit={outcome.exit_code} duration={outcome.duration_s:.2f}s\n"
+        f"--- stdout ---\n{outcome.stdout.text}\n--- stderr ---\n{outcome.stderr.text}"
+    )[:_VERIFICATION_OUTPUT_CAP_CHARS]
+
+    if outcome.timed_out or outcome.exit_code is None:
+        with store.transaction():
+            _finalize(
+                RunStatus.FAILED,
+                "verification exceeded its bounded deadline — tree terminated",
+                None,
+            )
+        return task
+
+    with store.transaction():
+        artifact = store.save_model(
+            Artifact(kind=ArtifactKind.TEST_RESULT, task_id=task.id, content=output)
+        )
+        writer.record(
+            EventLogEntry(
+                type=EventType.ARTIFACT_CREATED,
+                content="verification output persisted as TEST_RESULT",
+                references=[f"task:{task.id}", f"artifact:{artifact.id}"],
+            )
+        )
+
+    if outcome.exit_code == 0:
+        with store.transaction():
+            _finalize(RunStatus.SUCCEEDED, None, artifact.id)
+            evidence.record(
+                EvidenceRecord(
+                    kind=EvidenceKind.TESTS_PASSED,
+                    task_id=task.id,
+                    tool_run_id=tool_run.id,
+                    artifact_id=artifact.id,
+                    produced_by="relay:verification",
+                )
+            )
+            writer.record(
+                EventLogEntry(
+                    type=EventType.EVIDENCE_RECORDED,
+                    content=f"{EvidenceKind.TESTS_PASSED.value} recorded for task",
+                    references=[f"task:{task.id}", f"tool_run:{tool_run.id}"],
+                )
+            )
+        return _advance(machine, store, writer, task, TaskState.REVIEWING)
+
+    with store.transaction():
+        _finalize(RunStatus.FAILED, None, artifact.id)
+    return _advance(machine, store, writer, task, TaskState.IMPLEMENTING)
+
+
 async def run_build(
     store: SqliteRelayStore,
     writer: EventLogWriter,
@@ -537,6 +714,7 @@ async def run_build(
     gate: PermissionGate | None = None,
     model: str | None = None,
     agent_name: str | None = None,
+    verification: VerificationConfig | None = None,
 ) -> BuildOutcome:
     """Drive one task through the deterministic lifecycle to IMPLEMENTED.
 
@@ -682,6 +860,14 @@ async def run_build(
             )
         )
         task = _advance(machine, store, writer, task, TaskState.IMPLEMENTED)
+
+        # P3.2: auto-chained Relay-scoped verification (frozen plan Q-f) —
+        # endings: REVIEWING (pass), IMPLEMENTING (test-failure rework), or
+        # blocked in VERIFYING (no config / could-not-execute / timeout).
+        task = _advance(machine, store, writer, task, TaskState.VERIFYING)
+        task = await _run_verification(
+            store, writer, evidence, gate, machine, task, verification, workspace_root
+        )
 
     return BuildOutcome(
         task=task, ask=outcome, diff_artifact_id=diff_artifact_id, tool_run_ids=tool_run_ids

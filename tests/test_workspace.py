@@ -96,6 +96,48 @@ class TestRelayYamlConfig:
         assert agent.adapter == "openai"
         assert agent.model == "gpt-4o-mini"
 
+    def test_verification_block_parses_typed_argv(self, tmp_path):
+        """P3.2 (frozen plan Q-c): typed argv, bounded timeout — never a
+        free-form shell string."""
+        (tmp_path / "relay.yaml").write_text(
+            "agents:\n  gpt: {backend: api, adapter: openai}\n"
+            "verification:\n  program: pytest\n  args: [\"-q\"]\n  timeout_seconds: 120\n",
+            encoding="utf-8",
+        )
+        config = load_config(tmp_path)
+        assert config.verification is not None
+        assert config.verification.program == "pytest"
+        assert config.verification.args == ["-q"]
+        assert config.verification.timeout_seconds == 120
+
+    def test_verification_defaults_and_absence(self, tmp_path):
+        assert load_config(tmp_path).verification is None
+        (tmp_path / "relay.yaml").write_text(
+            "agents:\n  gpt: {backend: api, adapter: openai}\n"
+            "verification:\n  program: pytest\n",
+            encoding="utf-8",
+        )
+        verification = load_config(tmp_path).verification
+        assert verification is not None
+        assert verification.args == []
+        assert verification.timeout_seconds == 300
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            "verification:\n  args: []\n",  # missing required program
+            "verification:\n  program: pytest\n  args: [\"-q\"]\n  timeout_seconds: 0\n",
+            "verification:\n  program: pytest\n  shell: \"pytest -q\"\n",
+        ],
+    )
+    def test_invalid_verification_block_is_a_config_error(self, tmp_path, block):
+        (tmp_path / "relay.yaml").write_text(
+            "agents:\n  gpt: {backend: api, adapter: openai}\n" + block,
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError):
+            load_config(tmp_path)
+
     def test_parses_api_and_harness_entries(self, tmp_path):
         (tmp_path / "relay.yaml").write_text(
             "agents:\n"
