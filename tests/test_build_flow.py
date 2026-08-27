@@ -254,6 +254,13 @@ class TestBuildRefusals:
 
     def test_no_harness_agent_configured_refuses(self, tmp_path, monkeypatch):
         subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        for args in (
+            ["config", "user.email", "relay-test@local"],
+            ["config", "user.name", "Relay Tests"],
+        ):
+            subprocess.run(
+                ["git", "-C", str(tmp_path), *args], capture_output=True, check=True
+            )
         monkeypatch.chdir(tmp_path)
         (tmp_path / "README.md").write_text("# r\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(tmp_path), "add", "."], capture_output=True, check=True)
