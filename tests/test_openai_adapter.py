@@ -155,7 +155,7 @@ class TestRegistry:
 
     def test_unknown_name_lists_knowns(self):
         with pytest.raises(UnknownAgentError, match="known adapters"):
-            get_agent_class("claude_code")  # unregistered until its P2.3 adapter ships
+            get_agent_class("antigravity_cli")  # unregistered until P2.4 ships
 
 
 class TestSettingsPrecedence:

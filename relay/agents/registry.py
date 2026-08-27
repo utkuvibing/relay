@@ -41,11 +41,14 @@ AGENTS: dict[str, type[Agent]] = {
 
 #: Harness-family adapters (P2.2). Product names live ONLY here, in the
 #: adapter modules themselves, and in config values — never in core (C.1).
+from relay.agents.claude_code import ClaudeCodeAgent
 from relay.agents.codex_cli import CodexCLIAdapter
 
 AGENTS["codex_cli"] = CodexCLIAdapter
 #: Familiar alias for the Codex CLI adapter.
 AGENTS["codex"] = CodexCLIAdapter
+
+AGENTS["claude_code"] = ClaudeCodeAgent
 
 
 class UnknownAgentError(ValueError):

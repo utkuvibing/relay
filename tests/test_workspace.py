@@ -17,7 +17,7 @@ import pytest
 import yaml
 
 from relay.agents.base import AgentRole, BackendType
-from relay.agents.codex_cli import CodexCLIAdapter
+from relay.agents.claude_code import ClaudeCodeAgent
 from relay.agents.registry import UnknownAgentError, get_agent_class
 from relay.context import (
     ConfigError,
@@ -122,18 +122,18 @@ class TestRelayYamlConfig:
     def test_unregistered_harness_adapter_names_the_adapter(self, tmp_path):
         """G0/R1: registry absence fails explicitly naming the adapter.
 
-        P2.2: ``codex_cli`` IS registered now, so the G0 refusal is pinned
+        P2.3: ``claude_code`` IS registered now, so the G0 refusal is pinned
         with a still-unregistered harness name instead.
         """
         (tmp_path / "relay.yaml").write_text(
-            "agents:\n  cc: {backend: harness, adapter: claude_code}\n",
+            "agents:\n  agy: {backend: harness, adapter: antigravity_cli}\n",
             encoding="utf-8",
         )
-        agent_cfg = agent_config(load_config(tmp_path), "cc")
+        agent_cfg = agent_config(load_config(tmp_path), "agy")
         assert agent_cfg.backend is BackendType.HARNESS
-        assert get_agent_class("codex_cli") is CodexCLIAdapter  # P2.2: registered
-        with pytest.raises(UnknownAgentError, match="claude_code"):
-            get_agent_class("claude_code")
+        assert get_agent_class("claude_code") is ClaudeCodeAgent  # P2.3: registered
+        with pytest.raises(UnknownAgentError, match="antigravity_cli"):
+            get_agent_class("antigravity_cli")
 
     def test_unknown_agent_lists_knowns(self, tmp_path):
         (tmp_path / "relay.yaml").write_text(
