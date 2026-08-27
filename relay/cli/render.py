@@ -28,7 +28,9 @@ def _out() -> Console:
 
 def _auth_state(agent: AgentConfig, key_present: bool) -> str:
     if agent.backend is BackendType.HARNESS:
-        return "harness (Phase 2)"
+        # Harness adapters own their authentication (App. B.3): Relay can
+        # only report whether the adapter is registered, never login state.
+        return "harness-owned auth"
     return "configured" if key_present else "not configured"
 
 
@@ -40,11 +42,15 @@ def _agent_table(config: RelayConfig, key_states: dict[str, bool]) -> Table:
     table.add_column("Model")
     table.add_column("Auth")
     for name, agent in sorted(config.agents.items()):
+        model_display = agent.model or "-"
+        if agent.backend is BackendType.HARNESS and agent.harness is not None:
+            grant = agent.harness.grant.value if agent.harness.grant else "default"
+            model_display = f"{model_display} · grant:{grant}"
         table.add_row(
             name,
             agent.backend.value,
             agent.adapter,
-            agent.model or "-",
+            model_display,
             _auth_state(agent, key_states.get(name, False)),
         )
     return table
@@ -120,3 +126,23 @@ def run_detail(run: Run, artifacts: list[Any], events: list[Any]) -> None:
         _out().print(Panel(artifact.content or "", title=f"{artifact.kind.value} artifact"))
     for event in events:
         _out().print(f"[dim]event #{event.sequence}: {event.type.value} - {event.content}[/dim]")
+
+
+def build_result(*, task, outcome) -> None:
+    """Render one `relay build` outcome (P2.2b)."""
+    ask = outcome.ask
+    if ask.error is not None:
+        _out().print(f"[red]ERROR {ask.run.agent} failed:[/red] {ask.error}")
+        return
+    _out().print(
+        Panel(
+            (ask.response.output if ask.response else "") or "(empty response)",
+            title=f"{task.title[:60]}",
+        )
+    )
+    observations = len(outcome.tool_run_ids)
+    diff_note = f"diff artifact {outcome.diff_artifact_id[:8]}..." if outcome.diff_artifact_id else "no workspace changes"
+    _out().print(
+        f"[dim]task {task.id[:8]}... | run {ask.run.id[:8]}... | {ask.run.status.value} | "
+        f"{observations} observed harness events | {diff_note} | evidence recorded[/dim]"
+    )

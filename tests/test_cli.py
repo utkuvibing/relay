@@ -227,17 +227,21 @@ class TestInitIdempotenceCLI:
 
 class TestHarnessRefusal:
     def test_harness_agent_errors_naming_the_missing_adapter(self, workspace):
-        """G0/R1: unregistered harness adapters fail explicitly, by name."""
+        """G0/R1: unregistered harness adapters fail explicitly, by name.
+
+        P2.2 note: ``codex_cli`` is registered now — the refusal premise is
+        pinned with the still-unregistered ``claude_code`` name.
+        """
         (workspace / "relay.yaml").write_text(
-            "agents:\n  codex: {backend: harness, adapter: codex_cli}\n",
+            "agents:\n  claude: {backend: harness, adapter: claude_code}\n",
             encoding="utf-8",
         )
         runner.invoke(app, ["init"])
-        result = runner.invoke(app, ["ask", "codex", "make a change"])
+        result = runner.invoke(app, ["ask", "claude", "make a change"])
         assert result.exit_code == 1
         # rich wraps long lines, so assert on wording fragments, not strings.
         assert "unknown agent adapter" in result.output
-        assert "codex_cli" in result.output
+        assert "claude_code" in result.output
 
     def test_backend_family_mismatch_is_a_config_error(self, workspace):
         """R1#1: api-declared agent + harness-routed adapter cannot wire."""

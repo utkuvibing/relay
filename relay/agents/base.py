@@ -67,6 +67,39 @@ class AgentRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class RunObservation(BaseModel):
+    """Provider-neutral facts a backend reported about its own execution.
+
+    App. C.6 seam: additive, nullable, allowlist-shaped. Field names are
+    deliberately restricted to the C.4/C.6 vocabulary; nothing secret-shaped
+    may ride here (enforced by the persisted-vocabulary hygiene tests).
+    """
+
+    resolved_model: str | None = None
+    adapter_version: str | None = None
+    backend: BackendType | str | None = None
+    external_session_ref: str | None = Field(
+        default=None,
+        description="NON-SECRET continuation handle only when config opts in.",
+    )
+
+
+class ToolObservation(BaseModel):
+    """One provider-neutral tool/tool-like event a backend reported.
+
+    Adapters translate their native event streams into this shape; core
+    persists it without knowing any provider vocabulary (App. C.1). Fields
+    are allowlist-shaped and bounded upstream by the adapter.
+    """
+
+    kind: str = Field(description="Neutral kind, e.g. 'shell', 'file_edit', 'message'.")
+    summary: str = Field(default="", description="Bounded human-readable description.")
+    command: str | None = Field(
+        default=None,
+        description="Sanitized command line when the observation is a shell-type event.",
+    )
+
+
 class AgentResponse(BaseModel):
     """Structured result of one agent run."""
 
@@ -78,6 +111,10 @@ class AgentResponse(BaseModel):
     #: References to artifacts produced during the run (plans, diffs, findings).
     artifact_refs: list[str] = Field(default_factory=list)
     usage: TokenUsage | None = None
+    #: Optional execution observation (harness runs report what actually ran).
+    observation: RunObservation | None = None
+    #: Adapter-normalized tool events (observability tier; App. C.5/C.7).
+    tool_observations: list[ToolObservation] = Field(default_factory=list)
 
 
 class Agent(abc.ABC):

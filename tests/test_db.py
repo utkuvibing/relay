@@ -20,6 +20,7 @@ from relay.core.state_machine import (
     TaskStateMachine,
 )
 from relay.storage import connect, migrate
+from relay.storage.db import _MIGRATIONS, SCHEMA_VERSION
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     Approval,
@@ -69,8 +70,8 @@ def store(db):
 class TestSchemaAndConnect:
     def test_migrate_is_idempotent(self, tmp_path):
         conn = connect(tmp_path / "r.sqlite3")
-        assert migrate(conn) == 1
-        assert migrate(conn) == 1
+        assert migrate(conn) == 2
+        assert migrate(conn) == 2
         conn.close()
 
     def test_wal_and_foreign_keys_enabled(self, db):
@@ -441,6 +442,59 @@ class TestDurabilityAndIdentity:
         fresh_store = SqliteRelayStore(reopened)
         found = fresh_store.workspace_for_identity(identity_key)
         assert found is not None and found.id == ws.id and found.path == "C:/projects/demo"
+        reopened.close()
+
+    def test_v1_database_upgrades_in_place_preserving_rows(self, tmp_path):
+        db_path = tmp_path / "v1.sqlite3"
+        v1_conn = connect(db_path)
+        for statement in _MIGRATIONS[1]:
+            v1_conn.execute(statement)
+        v1_conn.execute("PRAGMA user_version = 1")
+        v1_conn.execute(
+            "INSERT INTO runs (id, agent, role, model, status, started_at) "
+            "VALUES ('run-hist', 'gpt', 'researcher', 'gpt-4o-mini', 'succeeded', '2026-01-01T00:00:00Z')"
+        )
+        v1_conn.commit()
+        assert int(v1_conn.execute("PRAGMA user_version").fetchone()[0]) == 1
+        v1_conn.close()
+
+        upgraded = connect(db_path)
+        assert migrate(upgraded) == SCHEMA_VERSION
+        row = upgraded.execute("SELECT * FROM runs WHERE id='run-hist'").fetchone()
+        assert row["model"] == "gpt-4o-mini"
+        assert row["resolved_model"] is None
+        assert row["adapter_version"] is None
+        assert row["backend"] is None
+        assert row["external_session_ref"] is None
+        columns = {c[1] for c in upgraded.execute("PRAGMA table_info(runs)")}
+        assert {"resolved_model", "adapter_version", "backend", "external_session_ref"} <= columns
+        upgraded.close()
+
+    def test_c6_seam_columns_roundtrip_and_survive_reopen(self, tmp_path):
+        conn = connect(tmp_path / "relay.sqlite3")
+        migrate(conn)
+        store = SqliteRelayStore(conn)
+        saved = store.save_model(
+            Run(
+                agent="codex_cli",
+                role="implementer",
+                model="gpt-5.6-codex",
+                resolved_model="gpt-5.6-codex",
+                adapter_version="codex-cli 0.55.0",
+                backend="harness",
+                external_session_ref="0199a213-81c0-7800-8aa1-bbab2a035a53",
+            )
+        )
+        loaded = SqliteRelayStore(conn).load_model(Run, saved.id)
+        assert loaded.resolved_model == "gpt-5.6-codex"
+        assert loaded.adapter_version == "codex-cli 0.55.0"
+        assert loaded.backend == "harness"
+        assert loaded.external_session_ref == "0199a213-81c0-7800-8aa1-bbab2a035a53"
+
+        reopened = connect(tmp_path / "relay.sqlite3")
+        migrate(reopened)
+        again = SqliteRelayStore(reopened).load_model(Run, saved.id)
+        assert again == loaded
         reopened.close()
 
     def test_counts_cover_every_table(self, store):

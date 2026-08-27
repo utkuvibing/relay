@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _APPEND_ONLY_TABLES = ("event_log", "evidence_records")
 
@@ -176,6 +176,17 @@ _V1_STATEMENTS: tuple[str, ...] = (
 )
 
 _MIGRATIONS: dict[int, tuple[str, ...]] = {1: _V1_STATEMENTS}
+
+#: App. C.6 seam — additive, nullable, provider-neutral harness-fact columns.
+#: Historical rows are untouched; ``model`` remains the requested model.
+_V2_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE runs ADD COLUMN resolved_model TEXT",
+    "ALTER TABLE runs ADD COLUMN adapter_version TEXT",
+    "ALTER TABLE runs ADD COLUMN backend TEXT",
+    "ALTER TABLE runs ADD COLUMN external_session_ref TEXT",
+)
+
+_MIGRATIONS[2] = _V2_STATEMENTS
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
