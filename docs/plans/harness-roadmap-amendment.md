@@ -576,3 +576,30 @@ absent from DB/WAL bytes on a polluted parent environment.
 Known deferred: worktree-containment mode (clean-tree refusal suffices for
 the reference slice), session-resume consumption (P7 seam), proxy-variable
 whitelisting for network grants (needs explicit C.4 note first).
+
+---
+
+## 16. P2.3 execution record (Claude Code adapter)
+
+Implemented per frozen plan rev 2 (`p2.3-claude-code-adapter-plan.md`).
+Highlights:
+
+* Allowlist grant contract enforced on every invocation: `--safe-mode`
+  (suppresses CLAUDE.md/skills/plugins/hooks/MCP/custom agents/workflows),
+  exact `--tools` surface per ExecutionGrant, `--disallowedTools mcp__*`,
+  and an empty strict MCP config. Repo/user settings widening is structurally
+  inert because unlisted tools never load; the regression test composes runs
+  over a hostile workspace (permissive settings.json + .mcp.json) and asserts
+  the layered argv byte-for-byte.
+* WORKSPACE_WRITE_NETWORK refuses pre-spawn with vendor-guidance context.
+* External session references stay in memory: observation reports
+  `external_session_ref=None`; persistence waits for the P7 config seam.
+* Live smoke is doubly gated (env opt-in AND discoverable binary), CI-inert.
+* G4 zero-touch proven twice: PR diff review plus a standing test scanning
+  tokens across tiers (AST identifiers outside agents/tests prohibited;
+  cli/main.py's relay.yaml template comment is the sole documented carveout).
+* Precondition executed: local superseded Room-amendment commit was verified
+  against merged PR #5 and discarded via archive branch; main realigned.
+
+Suite at merge time: 330 passed / 6 skipped; ruff clean.
+
