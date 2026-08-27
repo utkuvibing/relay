@@ -256,9 +256,7 @@ class SqliteRelayStore:
 
     def load_model(self, model_cls: type, record_id: str | int) -> Any | None:
         return next(
-            self._iter_rows(
-                model_cls, f"WHERE {_pk_column(model_cls)} = ?", [record_id]
-            ),
+            self._iter_rows(model_cls, f"WHERE {_pk_column(model_cls)} = ?", [record_id]),
             None,
         )
 

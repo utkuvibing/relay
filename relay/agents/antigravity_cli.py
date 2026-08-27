@@ -221,9 +221,7 @@ class AntigravityCLIAdapter(HarnessAgent):
         try:
             envelope = json.loads(stdout_text.strip() or "{}")
         except json.JSONDecodeError as exc:
-            raise HarnessOutputError(
-                f"{self.name}: result envelope could not be decoded"
-            ) from exc
+            raise HarnessOutputError(f"{self.name}: result envelope could not be decoded") from exc
         if not isinstance(envelope, dict):
             raise HarnessOutputError(f"{self.name}: result envelope could not be decoded")
 
@@ -233,8 +231,7 @@ class AntigravityCLIAdapter(HarnessAgent):
         if status != "SUCCESS":
             detail = redact(str(envelope.get("error", ""))[:200])
             raise HarnessOutputError(
-                f"{self.name}: harness reported failure (status={status}): "
-                f"{detail or 'no detail'}"
+                f"{self.name}: harness reported failure (status={status}): {detail or 'no detail'}"
             )
 
         response = envelope.get("response")
@@ -297,8 +294,7 @@ class AntigravityCLIAdapter(HarnessAgent):
         ref = _uuid_or_none(session_ref)
         if ref is None:
             raise UnsupportedCapability(
-                f"{self.name}: invalid session reference {session_ref!r} — "
-                "expected a UUID"
+                f"{self.name}: invalid session reference {session_ref!r} — expected a UUID"
             )
         return ("--conversation", ref)
 

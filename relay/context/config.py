@@ -7,7 +7,7 @@ model, base URL. Credentials are environment-only and never appear here.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -78,6 +78,20 @@ class VerificationConfig(BaseModel):
     timeout_seconds: float = Field(default=300, gt=0, le=_MAX_HARNESS_TIMEOUT_S)
 
 
+class ApprovalPolicyConfig(BaseModel):
+    """Completion policy (P3.3; SPEC App. A.3 — policy-driven approval).
+
+    ``gated`` (default): REVIEWING → APPROVAL_REQUIRED → human → DONE.
+    ``direct``: the A.3 opt-out — Relay attests NO_PENDING_APPROVALS over an
+    empty-by-construction queue and the machine's direct REVIEWING → DONE
+    edge (which still demands tests + review evidence) completes the task.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["gated", "direct"] = "gated"
+
+
 class RelayConfig(BaseModel):
     """The full parsed ``relay.yaml``; unknown top-level fields are rejected."""
 
@@ -87,6 +101,21 @@ class RelayConfig(BaseModel):
     #: P3.2 — Relay-scoped verification (frozen plan Q-c): typed argv, never
     #: a free-form shell string. Absent → builds block honestly in VERIFYING.
     verification: VerificationConfig | None = None
+    #: P3.3 (frozen plan Q-d): name reference into ``agents:`` — the dedicated
+    #: review role; absent → the implementer's adapter falls back under
+    #: READ_ONLY + REVIEWER role in a fresh process. Any execution family.
+    reviewer: str | None = None
+    #: P3.3 (frozen plan Q-e): completion policy. Gated is the default.
+    approval: ApprovalPolicyConfig | None = None
+
+    @model_validator(mode="after")
+    def _reviewer_must_be_configured(self) -> RelayConfig:
+        if self.reviewer is not None and self.reviewer not in self.agents:
+            raise ValueError(
+                f"reviewer '{self.reviewer}' is not a configured agent — "
+                "add it under 'agents:' first"
+            )
+        return self
 
 
 class ConfigError(ValueError):

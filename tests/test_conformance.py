@@ -61,8 +61,7 @@ class TestR3HeterogeneityProof:
                 code
                 for code in range(-10, 130)
                 if code != 0
-                and agent.classify_exit(code)
-                not in (ExitSemantics.OK, ExitSemantics.UNKNOWN)
+                and agent.classify_exit(code) not in (ExitSemantics.OK, ExitSemantics.UNKNOWN)
             }
 
         assert mapped_codes(s_agent) == {3, 4}

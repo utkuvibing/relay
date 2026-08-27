@@ -83,9 +83,7 @@ class MissingProvenanceError(EvidenceError):
         self.kind = kind
         self.missing_fields = missing_fields
         names = ", ".join(sorted(missing_fields))
-        super().__init__(
-            f"Evidence kind '{kind.value}' requires provenance fields: {names}"
-        )
+        super().__init__(f"Evidence kind '{kind.value}' requires provenance fields: {names}")
 
 
 class InvalidProducerError(EvidenceError):
@@ -162,7 +160,5 @@ class InMemoryEvidenceStore:
         kind: EvidenceKind | None = None,
     ) -> Sequence[EvidenceRecord]:
         return tuple(
-            r
-            for r in self._records
-            if r.task_id == task_id and (kind is None or r.kind is kind)
+            r for r in self._records if r.task_id == task_id and (kind is None or r.kind is kind)
         )

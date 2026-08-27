@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -50,13 +51,15 @@ from relay.agents.base import (
     RunObservation,
 )
 from relay.agents.errors import AgentError
-from relay.context.config import VerificationConfig
+from relay.context.config import ApprovalPolicyConfig, VerificationConfig
 from relay.core.evidence import EvidenceKind, EvidenceStore
 from relay.core.permissions import Action, PermissionGate, ToolRequest
 from relay.core.state_machine import TaskState, TaskStateMachine
 from relay.harness.sanitization import redact
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
+    Approval,
+    ApprovalStatus,
     Artifact,
     ArtifactKind,
     EventLogEntry,
@@ -703,6 +706,143 @@ async def _run_verification(
     return _advance(machine, store, writer, task, TaskState.IMPLEMENTING)
 
 
+# ---------------------------------------------------------------------------
+# P3.3 — review + approval closure (SPEC §27 Phase 3, App. A.1/A.3, Q-d/Q-e)
+# ---------------------------------------------------------------------------
+
+_REVIEW_DIRECTIVE = (
+    "You are the reviewer. Review the implemented changes against the "
+    "accepted plan below. Assess correctness, completeness, and risks.\n"
+    "End your output with EXACTLY one final line:\n"
+    "VERDICT: PASS\n"
+    "or\n"
+    "VERDICT: FINDINGS\n"
+    "(a garbled or missing verdict is treated as FINDINGS).\n\n"
+    "ACCEPTED PLAN:\n{plan}\n\nIMPLEMENTED DIFF:\n{diff}\n\n"
+    "ORIGINAL REQUEST:\n{prompt}"
+)
+
+_VERDICT_PATTERN = re.compile(r"verdict:\s*(pass|findings)", re.IGNORECASE)
+
+
+def _parse_verdict(text: str) -> str:
+    """Fail-closed verdict extraction (frozen-plan D2): the last verdict
+    marker wins; missing or garbled markers are FINDINGS — the machine never
+    guesses a pass from an agent's prose."""
+    matches = _VERDICT_PATTERN.findall(text)
+    return matches[-1].lower() if matches else "findings"
+
+
+async def _run_review(
+    store: SqliteRelayStore,
+    writer: EventLogWriter,
+    evidence: EvidenceStore,
+    machine: TaskStateMachine,
+    task: Task,
+    reviewer: Agent,
+    request: AgentRequest,
+    plan_outcome: AskOutcome,
+    diff_text: str,
+    *,
+    model: str | None = None,
+    agent_name: str | None = None,
+) -> Task:
+    """One review run against the frozen plan + the Relay-extracted diff.
+
+    Returns the task at ``REVIEWING`` with ``REVIEW_PASSED`` recorded (the
+    caller decides gated vs direct closure), or advanced to ``IMPLEMENTING``
+    on findings. A failed reviewer run leaves the task honestly blocked at
+    ``REVIEWING`` (D8) — no verdict is ever invented.
+    """
+    review_request = request.model_copy(
+        update={
+            "role": AgentRole.REVIEWER,
+            "prompt": _REVIEW_DIRECTIVE.format(
+                plan=plan_outcome.response.output,
+                diff=diff_text,
+                prompt=request.prompt,
+            ),
+        }
+    )
+    review_outcome = await run_ask(
+        store, writer, reviewer, review_request, model=model, agent_name=agent_name
+    )
+    if review_outcome.response is None:
+        return task
+
+    review_text = review_outcome.response.output
+    verdict = _parse_verdict(review_text)
+    with store.transaction():
+        artifact = store.save_model(
+            Artifact(
+                kind=ArtifactKind.REVIEW_FINDING,
+                run_id=review_outcome.run.id,
+                task_id=task.id,
+                content=review_text,
+            )
+        )
+        writer.record(
+            EventLogEntry(
+                type=EventType.ARTIFACT_CREATED,
+                content="review output persisted as REVIEW_FINDING",
+                references=[
+                    f"run:{review_outcome.run.id}",
+                    f"artifact:{artifact.id}",
+                    f"task:{task.id}",
+                ],
+            )
+        )
+
+    if verdict != "pass":
+        return _advance(machine, store, writer, task, TaskState.IMPLEMENTING)
+
+    with store.transaction():
+        evidence.record(
+            EvidenceRecord(
+                kind=EvidenceKind.REVIEW_PASSED,
+                task_id=task.id,
+                run_id=review_outcome.run.id,
+                artifact_id=artifact.id,
+                produced_by=f"agent:{review_outcome.run.agent}",
+            )
+        )
+        writer.record(
+            EventLogEntry(
+                type=EventType.EVIDENCE_RECORDED,
+                content=f"{EvidenceKind.REVIEW_PASSED.value} recorded for task",
+                references=[f"task:{task.id}", f"run:{review_outcome.run.id}"],
+            )
+        )
+    return task
+
+
+def _request_approval(store: SqliteRelayStore, writer: EventLogWriter, task: Task) -> None:
+    """Open the human gate: one PENDING approval + APPROVAL_REQUESTED event.
+
+    ``action=EDIT_FILES`` carries the vocabulary wrinkle surfaced at freeze:
+    the Action enum has no task-completion member, so the approval targets
+    the changes with the reason carrying the specifics (frozen-plan veto
+    item 1).
+    """
+    with store.transaction():
+        approval = store.save_model(
+            Approval(
+                action=Action.EDIT_FILES,
+                task_id=task.id,
+                requested_by="relay:review",
+                reason=f"task completion approval — {task.title[:120]}",
+                status=ApprovalStatus.PENDING,
+            )
+        )
+        writer.record(
+            EventLogEntry(
+                type=EventType.APPROVAL_REQUESTED,
+                content="task completion approval requested",
+                references=[f"task:{task.id}", f"approval:{approval.id}"],
+            )
+        )
+
+
 async def run_build(
     store: SqliteRelayStore,
     writer: EventLogWriter,
@@ -715,8 +855,11 @@ async def run_build(
     model: str | None = None,
     agent_name: str | None = None,
     verification: VerificationConfig | None = None,
+    reviewer: Agent | None = None,
+    reviewer_name: str | None = None,
+    approval: ApprovalPolicyConfig | None = None,
 ) -> BuildOutcome:
-    """Drive one task through the deterministic lifecycle to IMPLEMENTED.
+    """Drive one task through the deterministic lifecycle to closure.
 
     P3.1 wiring (SPEC §27 Phase 3): the task state machine owns the task
     from ``CREATED`` — context collection, a READ_ONLY planning run minting
@@ -725,6 +868,10 @@ async def run_build(
     validated against the ``EvidenceStore``; a run that produces no workspace
     change leaves the task honestly blocked at ``IMPLEMENTING`` (claims never
     close tasks). Closes acceptance gate G2 along the way.
+
+    P3.2 chains Relay-scoped verification after ``IMPLEMENTED``; P3.3 chains
+    the review run and lands the task at ``APPROVAL_REQUIRED`` (gated
+    default) or ``DONE`` (``approval: {mode: direct}`` policy opt-out).
     """
     gate = gate or PermissionGate()
     if request.task_id is None:
@@ -868,6 +1015,54 @@ async def run_build(
         task = await _run_verification(
             store, writer, evidence, gate, machine, task, verification, workspace_root
         )
+
+        # P3.3: review + closure (frozen plan Q-d/Q-e) — only reachable when
+        # verification passed (task at REVIEWING with TESTS_PASSED on record).
+        if task.state is TaskState.REVIEWING:
+            task = await _run_review(
+                store,
+                writer,
+                evidence,
+                machine,
+                task,
+                reviewer or _planner_for(agent),
+                request,
+                plan_outcome,
+                diff_text,
+                model=model,
+                agent_name=reviewer_name or agent_name,
+            )
+            # D8: a failed reviewer run leaves the task at REVIEWING with no
+            # verdict evidence — store truth decides, never the state alone.
+            review_passed = any(
+                record.kind is EvidenceKind.REVIEW_PASSED
+                for record in evidence.records_for_task(task.id, kind=EvidenceKind.REVIEW_PASSED)
+            )
+            if review_passed:
+                if approval is not None and approval.mode == "direct":
+                    # A.3 opt-out: Relay attests the empty-by-construction
+                    # queue (no approval row is ever created in direct mode).
+                    with store.transaction():
+                        evidence.record(
+                            EvidenceRecord(
+                                kind=EvidenceKind.NO_PENDING_APPROVALS,
+                                task_id=task.id,
+                                produced_by="relay:review",
+                            )
+                        )
+                        writer.record(
+                            EventLogEntry(
+                                type=EventType.EVIDENCE_RECORDED,
+                                content=(
+                                    f"{EvidenceKind.NO_PENDING_APPROVALS.value} recorded for task"
+                                ),
+                                references=[f"task:{task.id}"],
+                            )
+                        )
+                    task = _advance(machine, store, writer, task, TaskState.DONE)
+                else:
+                    _request_approval(store, writer, task)
+                    task = _advance(machine, store, writer, task, TaskState.APPROVAL_REQUIRED)
 
     return BuildOutcome(
         task=task, ask=outcome, diff_artifact_id=diff_artifact_id, tool_run_ids=tool_run_ids

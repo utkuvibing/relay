@@ -120,14 +120,17 @@ if _IS_WINDOWS:
     _PROCESS_TERMINATE = 0x0001
 
     class _IO_COUNTERS(ctypes.Structure):
-        _fields_ = [(name, ctypes.c_uint64) for name in (
-            "ReadOperationCount",
-            "WriteOperationCount",
-            "OtherOperationCount",
-            "ReadTransferCount",
-            "WriteTransferCount",
-            "OtherTransferCount",
-        )]
+        _fields_ = [
+            (name, ctypes.c_uint64)
+            for name in (
+                "ReadOperationCount",
+                "WriteOperationCount",
+                "OtherOperationCount",
+                "ReadTransferCount",
+                "WriteTransferCount",
+                "OtherTransferCount",
+            )
+        ]
 
     class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
         _fields_ = [

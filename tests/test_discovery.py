@@ -28,9 +28,7 @@ def _mk_exec(dir_path: Path, name: str) -> Path:
 class TestResolveExecutable:
     def test_explicit_path_wins_when_it_exists(self, tmp_path):
         exe = _mk_exec(tmp_path, "fakeharness.exe")
-        resolved = resolve_executable(
-            executable_path=str(exe), command_name="fakeharness"
-        )
+        resolved = resolve_executable(executable_path=str(exe), command_name="fakeharness")
         assert resolved.command == str(exe)
         assert resolved.source == "explicit_path"
 
@@ -75,7 +73,9 @@ class TestProbeVersion:
 
     async def test_stderr_fallback_still_yields_a_line(self, tmp_path):
         script = tmp_path / "_ver.py"
-        script.write_text("import sys; print('only-stderr 9.9', file=sys.stderr)\n", encoding="utf-8")
+        script.write_text(
+            "import sys; print('only-stderr 9.9', file=sys.stderr)\n", encoding="utf-8"
+        )
         clean, raw = await probe_version((PY, str(script)))
         assert clean == "only-stderr 9.9"
         assert raw and "only-stderr" in raw

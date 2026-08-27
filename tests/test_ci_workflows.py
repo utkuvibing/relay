@@ -62,9 +62,7 @@ def _iter_steps(workflow: dict):
 
 
 def _steps_using(workflow: dict, prefix: str) -> list[dict]:
-    return [
-        step for step in _iter_steps(workflow) if str(step.get("uses", "")).startswith(prefix)
-    ]
+    return [step for step in _iter_steps(workflow) if str(step.get("uses", "")).startswith(prefix)]
 
 
 class TestImmutablePinning:
@@ -80,9 +78,9 @@ class TestImmutablePinning:
     def test_setup_uv_pinned_to_the_reviewed_release(self, ci, release):
         for doc in (ci, release):
             for step in _steps_using(doc, "astral-sh/setup-uv"):
-                assert step["uses"].endswith(
-                    "20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
-                ), step["uses"]
+                assert step["uses"].endswith("20cfd1bf945f4377ade1205e4dbc17946fc9a30d"), step[
+                    "uses"
+                ]
 
 
 class TestCredentialHygiene:
@@ -93,9 +91,9 @@ class TestCredentialHygiene:
         assert checkouts, f"{wf}.yml: no checkout steps found"
         for step in checkouts:
             with_block = step.get("with") or {}
-            assert (
-                with_block.get("persist-credentials") is False
-            ), f"{wf}.yml: checkout step '{step.get('name')}' persists credentials"
+            assert with_block.get("persist-credentials") is False, (
+                f"{wf}.yml: checkout step '{step.get('name')}' persists credentials"
+            )
 
 
 class TestLeastPrivilegeRelease:

@@ -33,11 +33,19 @@ from relay.context import (
     load_config,
     workspace_layout,
 )
+from relay.core.evidence import EvidenceKind
 from relay.core.orchestrator import run_ask
+from relay.core.state_machine import TaskState, TaskStateMachine
 from relay.storage import connect, migrate
 from relay.storage.events import EventLogWriter
-from relay.storage.models import Run
-from relay.storage.store import SqliteRelayStore
+from relay.storage.models import (
+    ApprovalStatus,
+    EvidenceRecord,
+    Run,
+    Task,
+    utcnow,
+)
+from relay.storage.store import SqliteEvidenceStore, SqliteRelayStore
 
 app = typer.Typer(
     name="relay",
@@ -217,6 +225,15 @@ def build(
             )
 
             request = AgentRequest(prompt=prompt, role=AgentRole.IMPLEMENTER, task_id=task.id)
+            reviewer = None
+            if config.reviewer is not None:
+                reviewer_cfg = agent_config(config, config.reviewer)
+                reviewer = build_agent(
+                    config.reviewer,
+                    resolve_settings(cli=CliOverrides(), yaml_agent=reviewer_cfg),
+                    reviewer_cfg,
+                    workspace_root=root,
+                )
             outcome = asyncio.run(
                 run_build(
                     store,
@@ -228,6 +245,9 @@ def build(
                     model=settings.model,
                     agent_name=chosen_name,
                     verification=config.verification,
+                    reviewer=reviewer,
+                    reviewer_name=config.reviewer,
+                    approval=config.approval,
                 )
             )
         finally:
@@ -243,6 +263,99 @@ def build(
         raise typer.Exit(code=1) from exc
 
     build_result(task=outcome.task, outcome=outcome)
+
+
+@app.command()
+def approve(
+    task_id: str = typer.Argument(..., help="The task awaiting completion approval."),
+    by: str = typer.Option(
+        ...,
+        "--by",
+        help="Human identity recorded as provenance (human:<name>) - explicit, never inferred.",
+    ),
+) -> None:
+    """Record the human approval that closes a task (P3.3; SPEC App. A.3).
+
+    ``APPROVAL_GRANTED`` is the one evidence kind no agent can author - the
+    store refuses it from any non-``human:`` producer. The machine's
+    ``APPROVAL_REQUIRED -> DONE`` edge demands it.
+    """
+    from relay.core.state_machine import StateMachineError
+    from relay.storage.models import Approval, EventLogEntry, EventType
+
+    conn = None
+    task = None
+    try:
+        root = Path.cwd()
+        conn = _open_db(root)
+        store = SqliteRelayStore(conn)
+        writer = EventLogWriter(conn)
+        evidence = SqliteEvidenceStore(store)
+
+        task = store.load_model(Task, task_id)
+        if task is None:
+            raise ConfigError(f"task '{task_id}' does not exist")
+        if task.state is not TaskState.APPROVAL_REQUIRED:
+            raise ConfigError(
+                f"task '{task_id}' is at state '{task.state.value}' - "
+                "only a task at 'approval_required' can be approved"
+            )
+
+        pending = [
+            a
+            for a in store.all_models(Approval)
+            if a.task_id == task_id and a.status is ApprovalStatus.PENDING
+        ]
+        if not pending:
+            raise ConfigError(f"task '{task_id}' has no pending approval to decide")
+
+        approval = pending[0].model_copy(
+            update={
+                "status": ApprovalStatus.APPROVED,
+                "decided_by": by,
+                "decided_at": utcnow(),
+            }
+        )
+        machine = TaskStateMachine(task_id=task.id, store=evidence, state=task.state)
+        with store.transaction():
+            store.update_model(approval)
+            evidence.record(
+                EvidenceRecord(
+                    kind=EvidenceKind.APPROVAL_GRANTED,
+                    task_id=task.id,
+                    produced_by=f"human:{by}",
+                )
+            )
+            writer.record(
+                EventLogEntry(
+                    type=EventType.APPROVAL_GRANTED,
+                    content=f"task completion approved by human:{by}",
+                    references=[
+                        f"task:{task.id}",
+                        f"approval:{approval.id}",
+                    ],
+                )
+            )
+
+        previous = machine.state
+        machine.transition(TaskState.DONE)
+        with store.transaction():
+            store.update_model(task.model_copy(update={"state": TaskState.DONE}))
+            writer.record(
+                EventLogEntry(
+                    type=EventType.STATE_TRANSITIONED,
+                    content=f"task state: {previous.value} -> done",
+                    references=[f"task:{task.id}"],
+                )
+            )
+    except (ConfigError, StateMachineError) as exc:
+        _out().print(f"[red]ERROR[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+    _out().print(f"[green]task {task_id} approved by human:{by} - DONE[/green]")
 
 
 def _worktree_is_clean(root: Path) -> bool:

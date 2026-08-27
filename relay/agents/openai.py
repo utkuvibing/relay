@@ -109,9 +109,7 @@ class OpenAICompatibleAgent(Agent):
                 "and that the key is valid for the configured base URL"
             )
         if response.status_code == 429:
-            raise AgentError(
-                f"{self.name}: rate limited (429) — retry later or lower concurrency"
-            )
+            raise AgentError(f"{self.name}: rate limited (429) — retry later or lower concurrency")
         if response.status_code >= 400:
             raise AgentError(f"{self.name}: provider returned HTTP {response.status_code}")
 

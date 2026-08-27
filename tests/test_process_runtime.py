@@ -19,7 +19,7 @@ from relay.harness.process import LaunchSpec, execute
 PY = sys.executable
 
 #: Heartbeat writer: appends one tagged line every 50 ms for up to 30 s.
-_HEARTBEAT_SRC = '''\
+_HEARTBEAT_SRC = """\
 import sys, time
 path, tag = sys.argv[1], sys.argv[2]
 end = time.time() + 30
@@ -30,7 +30,7 @@ while time.time() < end:
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(f"{tag}:{time.time():.6f}\\n")
     time.sleep(0.05)
-'''
+"""
 
 
 def _spec(
@@ -78,8 +78,11 @@ async def test_nonzero_exit_is_reported_not_raised(tmp_path):
 
 
 async def test_stdin_delivery_reaches_child_and_pipe_closes(tmp_path):
-    spec = _spec(_script("import sys; data=sys.stdin.read(); print('got:'+data)"),
-                 tmp_path, stdin_data=b"prompt-body")
+    spec = _spec(
+        _script("import sys; data=sys.stdin.read(); print('got:'+data)"),
+        tmp_path,
+        stdin_data=b"prompt-body",
+    )
     outcome = await execute(spec)
     assert outcome.exit_code == 0
     assert "got:prompt-body" in outcome.stdout.text

@@ -141,13 +141,9 @@ class HarnessAgent(Agent):
 
     # -- grants ----------------------------------------------------------------
 
-    def resolve_grant(
-        self, requested: ExecutionGrantKind | None = None
-    ) -> ExecutionGrant:
+    def resolve_grant(self, requested: ExecutionGrantKind | None = None) -> ExecutionGrant:
         """Profile → explicit request → adapter default; else typed error."""
-        from_config = (
-            self._profile.grant if (self._profile is not None) else None
-        )
+        from_config = self._profile.grant if (self._profile is not None) else None
         kind = requested or from_config or self.default_grant
         if kind is None:
             raise MissingExecutionGrantError(
@@ -273,9 +269,7 @@ class HarnessAgent(Agent):
             self._workspace_root.mkdir(parents=True, exist_ok=True)
             return self._workspace_root
         except OSError as exc:
-            raise HarnessLaunchError(
-                f"{self.name}: cannot prepare working directory"
-            ) from exc
+            raise HarnessLaunchError(f"{self.name}: cannot prepare working directory") from exc
 
     def _child_env(self) -> dict[str, str]:
         """C.4 allowlist policy plus Relay-forced neutral stdio settings.
@@ -294,9 +288,7 @@ class HarnessAgent(Agent):
         env["PYTHONUTF8"] = "1"
         return env
 
-    def compose_argv(
-        self, resolved: ResolvedExecutable, grant: ExecutionGrant
-    ) -> tuple[str, ...]:
+    def compose_argv(self, resolved: ResolvedExecutable, grant: ExecutionGrant) -> tuple[str, ...]:
         """Canonical ordering: invocation · profile.extra_args · grant flags.
 
         Grant flags come last so adapters can rely on positional override;
@@ -308,9 +300,7 @@ class HarnessAgent(Agent):
             *grant.additional_args,
         )
 
-    def _failure_message(
-        self, prefix: str, outcome_stderr: str, *, semantics_hint: str
-    ) -> str:
+    def _failure_message(self, prefix: str, outcome_stderr: str, *, semantics_hint: str) -> str:
         tail = redact(outcome_stderr.strip())[-_STDERR_TAIL_CHARS:]
         detail = f"; stderr tail: {tail}" if tail else ""
         return f"{self.name}: {prefix} ({semantics_hint}){detail}"
@@ -359,10 +349,7 @@ class HarnessAgent(Agent):
 
         output = self.parse_output(outcome.stdout.text, outcome.stderr.text)
         if len(output) > DEFAULT_OUTPUT_TEXT_CAP_CHARS:
-            output = (
-                output[:DEFAULT_OUTPUT_TEXT_CAP_CHARS]
-                + "\n…[output truncated by Relay]"
-            )
+            output = output[:DEFAULT_OUTPUT_TEXT_CAP_CHARS] + "\n…[output truncated by Relay]"
         return AgentResponse(
             agent=self.name,
             role=request.role,
@@ -380,9 +367,7 @@ class HarnessAgent(Agent):
         if isinstance(exc, TimeoutError):
             return HarnessTimeoutError(f"{agent_name}: harness run exceeded its deadline")
         if isinstance(exc, OSError):
-            return HarnessLaunchError(
-                f"{agent_name}: could not launch the harness process"
-            )
+            return HarnessLaunchError(f"{agent_name}: could not launch the harness process")
         return AgentError(f"{agent_name}: harness run failed unexpectedly")
 
     async def run(self, request: AgentRequest) -> AgentResponse:

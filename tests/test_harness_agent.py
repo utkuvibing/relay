@@ -35,9 +35,7 @@ PY = sys.executable
 
 _ECHO_SCRIPT = "import sys; sys.stdout.write(sys.stdin.read())"
 _SLEEP_SCRIPT = "import time; time.sleep(5)"
-_AUTH_FAIL_SCRIPT = (
-    "import sys; print('FAKE_TOKEN=supersecret123', file=sys.stderr); sys.exit(9)"
-)
+_AUTH_FAIL_SCRIPT = "import sys; print('FAKE_TOKEN=supersecret123', file=sys.stderr); sys.exit(9)"
 
 
 class EchoHarness(HarnessAgent):
@@ -84,9 +82,7 @@ class TestGrants:
             name = "no_default"
             default_grant = None
 
-        agent = _agent(
-            tmp_path, NoDefault, profile=HarnessAgentConfig(executable_path=str(PY))
-        )
+        agent = _agent(tmp_path, NoDefault, profile=HarnessAgentConfig(executable_path=str(PY)))
         with pytest.raises(MissingExecutionGrantError) as excinfo:
             agent.resolve_grant()
         assert excinfo.value.args[0].startswith("no_default:")
@@ -109,11 +105,11 @@ class TestGrants:
             name = "no_default2"
             default_grant = None
 
-        agent = _agent(
-            tmp_path, NoDefault, profile=HarnessAgentConfig(executable_path=str(PY))
-        )
+        agent = _agent(tmp_path, NoDefault, profile=HarnessAgentConfig(executable_path=str(PY)))
         with pytest.raises(MissingExecutionGrantError):
-            __import__("asyncio").run(agent.run(AgentRequest(prompt="x", role=AgentRole.RESEARCHER)))
+            __import__("asyncio").run(
+                agent.run(AgentRequest(prompt="x", role=AgentRole.RESEARCHER))
+            )
         assert spawned == []
 
 
@@ -206,9 +202,7 @@ class TestRunIntegration:
                 return (resolved.command, "-c", _AUTH_FAIL_SCRIPT)
 
             def classify_exit(self, exit_code):
-                return {9: ExitSemantics.AUTH}.get(
-                    exit_code, super().classify_exit(exit_code)
-                )
+                return {9: ExitSemantics.AUTH}.get(exit_code, super().classify_exit(exit_code))
 
         agent = _agent(tmp_path, AuthExiter)
         with pytest.raises(HarnessOutputError) as excinfo:

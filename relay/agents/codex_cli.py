@@ -148,9 +148,7 @@ class CodexCLIAdapter(HarnessAgent):
                     f"{self.name}: harness output could not be decoded"
                 ) from exc
             if not isinstance(event, dict):
-                raise HarnessOutputError(
-                    f"{self.name}: harness output could not be decoded"
-                )
+                raise HarnessOutputError(f"{self.name}: harness output could not be decoded")
             event_type = event.get("type")
 
             if event_type == _JSONL_EVENT_THREAD_STARTED:
@@ -164,11 +162,7 @@ class CodexCLIAdapter(HarnessAgent):
                     output_tokens = _positive_int(usage.get("output_tokens"))
             elif event_type == _JSONL_EVENT_TURN_FAILED:
                 error_payload = event.get("error")
-                detail = (
-                    error_payload.get("message", "")
-                    if isinstance(error_payload, dict)
-                    else ""
-                )
+                detail = error_payload.get("message", "") if isinstance(error_payload, dict) else ""
                 detail = str(detail)[:200] if detail else "turn failed"
                 raise HarnessOutputError(f"{self.name}: harness turn failed: {detail}")
             elif event_type == _JSONL_EVENT_ERROR:
@@ -177,9 +171,7 @@ class CodexCLIAdapter(HarnessAgent):
                 raise HarnessOutputError(
                     f"{self.name}: harness reported {('error: ' + detail) if detail else 'an error event'}"
                 )
-            elif event_type == _JSONL_EVENT_ITEM_COMPLETED and isinstance(
-                event.get("item"), dict
-            ):
+            elif event_type == _JSONL_EVENT_ITEM_COMPLETED and isinstance(event.get("item"), dict):
                 item = event["item"]
                 item_type = item.get("type")
                 if item_type == _FINAL_ITEM_TYPE:
@@ -205,13 +197,9 @@ class CodexCLIAdapter(HarnessAgent):
                     )
 
         if not turn_completed:
-            raise HarnessOutputError(
-                f"{self.name}: harness stream ended without a completed turn"
-            )
+            raise HarnessOutputError(f"{self.name}: harness stream ended without a completed turn")
         if not finals:
-            raise HarnessOutputError(
-                f"{self.name}: harness produced no final agent message"
-            )
+            raise HarnessOutputError(f"{self.name}: harness produced no final agent message")
         self._last_thread_id = thread_id
         self._last_input_tokens = input_tokens
         self._last_output_tokens = output_tokens

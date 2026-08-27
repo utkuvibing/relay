@@ -168,7 +168,9 @@ class TestEvidenceRecord:
         assert record.run_id is None and record.artifact_id is None
 
     def test_records_are_frozen(self):
-        record = EvidenceRecord(kind=EvidenceKind.CONTEXT_COLLECTED, task_id="t1", produced_by="relay")
+        record = EvidenceRecord(
+            kind=EvidenceKind.CONTEXT_COLLECTED, task_id="t1", produced_by="relay"
+        )
         with pytest.raises(ValidationError):
             record.task_id = "t2"  # type: ignore[misc]
 

@@ -207,7 +207,9 @@ class TestEvidenceIntegrity:
         with pytest.raises(MissingProvenanceError):
             store.record(make_record(EvidenceKind.REVIEW_PASSED, run_id=None))
 
-    @pytest.mark.parametrize("kind", [EvidenceKind.PLAN_PRODUCED, EvidenceKind.IMPLEMENTATION_PRODUCED])
+    @pytest.mark.parametrize(
+        "kind", [EvidenceKind.PLAN_PRODUCED, EvidenceKind.IMPLEMENTATION_PRODUCED]
+    )
     def test_agent_output_kinds_demand_run_linkage(self, kind):
         store = InMemoryEvidenceStore()
         with pytest.raises(MissingProvenanceError):
@@ -216,9 +218,7 @@ class TestEvidenceIntegrity:
     def test_approval_evidence_may_only_come_from_a_human(self):
         store = InMemoryEvidenceStore()
         with pytest.raises(InvalidProducerError):
-            store.record(
-                make_record(EvidenceKind.APPROVAL_GRANTED, produced_by="agent:claude")
-            )
+            store.record(make_record(EvidenceKind.APPROVAL_GRANTED, produced_by="agent:claude"))
         # The forged record never entered the store:
         assert store.records_for_task(TASK, EvidenceKind.APPROVAL_GRANTED) == ()
         store.record(make_record(EvidenceKind.APPROVAL_GRANTED, produced_by="human:utku"))
@@ -227,16 +227,16 @@ class TestEvidenceIntegrity:
     def test_policy_evidence_may_only_come_from_relay(self):
         store = InMemoryEvidenceStore()
         with pytest.raises(InvalidProducerError):
-            store.record(
-                make_record(EvidenceKind.NO_PENDING_APPROVALS, produced_by="agent:gpt")
-            )
+            store.record(make_record(EvidenceKind.NO_PENDING_APPROVALS, produced_by="agent:gpt"))
         assert store.records_for_task(TASK, EvidenceKind.NO_PENDING_APPROVALS) == ()
 
 
 class TestConditionalCompletion:
     """REVIEWING -> DONE is legal only under a cleared completion policy."""
 
-    def _reviewed_machine(self, policy: CompletionPolicy) -> tuple[TaskStateMachine, InMemoryEvidenceStore]:
+    def _reviewed_machine(
+        self, policy: CompletionPolicy
+    ) -> tuple[TaskStateMachine, InMemoryEvidenceStore]:
         store = InMemoryEvidenceStore()
         store.record(make_record(EvidenceKind.TESTS_PASSED))
         store.record(make_record(EvidenceKind.REVIEW_PASSED))
