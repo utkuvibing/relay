@@ -941,6 +941,126 @@ class _NoopImplementer(_FakeImplementer):
         return (resolved.command, "-c", noop_script)
 
 
+class TestTaskObservability:
+    """P3.4: status/inspect/build endings make machine position visible.
+
+    Everything shown is derived from stored records — the same contract the
+    taskview unit tests pin, exercised here through the real build flow.
+    """
+
+    def _flagship(self, build_workspace):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        return result
+
+    def test_build_ending_names_state_and_approve_hint(self, build_workspace):
+        result = self._flagship(build_workspace)
+        task = next(iter(_all_tasks(build_workspace)))
+
+        # D6: the gated ending is explicit — state + the unblocking command.
+        assert "state: approval_required" in result.output
+        assert f"relay approve {task.id}" in result.output
+        assert "blocked:" not in result.output
+
+    def test_status_shows_position_gap_and_hint(self, build_workspace):
+        self._flagship(build_workspace)
+        task = next(iter(_all_tasks(build_workspace)))
+
+        status_result = runner.invoke(app, ["status"])
+        assert status_result.exit_code == 0, status_result.output
+        assert "approval_required" in status_result.output  # table + panel
+        assert "missing approval_granted" in status_result.output
+        assert f"relay approve {task.id}" in status_result.output
+        assert "reviewing -> approval_required" in status_result.output
+
+    def test_status_after_approval_shows_terminal_no_active_panel(self, build_workspace):
+        self._flagship(build_workspace)
+        task = next(iter(_all_tasks(build_workspace)))
+        approved = runner.invoke(app, ["approve", task.id, "--by", "kaya"])
+        assert approved.exit_code == 0, approved.output
+
+        status_result = runner.invoke(app, ["status"])
+        assert status_result.exit_code == 0, status_result.output
+        assert "done" in status_result.output  # table state column
+        assert "Active task" not in status_result.output  # nothing non-terminal
+
+    def test_status_shows_verifying_gap_when_config_missing(self, build_workspace):
+        """No verification block: the §27 gap is visible, never papered over."""
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+
+        status_result = runner.invoke(app, ["status"])
+        assert status_result.exit_code == 0, status_result.output
+        assert "verifying" in status_result.output
+        assert "missing tests_passed" in status_result.output
+
+    def test_noop_build_ending_names_the_implementation_gap(self, build_workspace):
+        with transient_adapters({"fake_implementer_build": _NoopImplementer}):
+            result = runner.invoke(app, ["build", "do nothing"])
+        assert result.exit_code == 0, result.output
+        assert "state: implementing" in result.output
+        assert "blocked: missing implementation_produced" in result.output
+
+    def test_inspect_ledger_renders_records_with_provenance(self, build_workspace):
+        self._flagship(build_workspace)
+        task = next(iter(_all_tasks(build_workspace)))
+
+        detail = runner.invoke(app, ["inspect", task.id])
+        assert detail.exit_code == 0, detail.output
+        assert "Transitions" in detail.output
+        assert "created -> context_ready" in detail.output
+        assert "reviewing -> approval_required" in detail.output
+        assert "context_collected by relay:core" in detail.output
+        assert "tests_passed by relay:verification" in detail.output
+        assert "review_passed by agent:impl" in detail.output
+        assert "pending edit_files" in detail.output
+
+    def test_inspect_json_is_a_complete_machine_ledger(self, build_workspace):
+        self._flagship(build_workspace)
+        task = next(iter(_all_tasks(build_workspace)))
+
+        result = runner.invoke(app, ["inspect", task.id, "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["task"]["state"] == "approval_required"
+        assert payload["edges"] == [{"to": "done", "missing": ["approval_granted"]}]
+        assert payload["transitions"][-1]["to"] == "approval_required"
+        kinds = {record["kind"] for record in payload["evidence"]}
+        assert {"context_collected", "plan_produced", "tests_passed", "review_passed"} <= kinds
+        tests = next(r for r in payload["evidence"] if r["kind"] == "tests_passed")
+        assert tests["produced_by"] == "relay:verification"
+        assert tests["tool_run_id"] is not None
+        assert payload["approvals"][0]["status"] == "pending"
+
+    def test_inspect_resolves_unique_prefix_and_refuses_the_rest(self, build_workspace):
+        self._flagship(build_workspace)
+        task = next(iter(_all_tasks(build_workspace)))
+
+        # Unique prefix resolves (status shows 8 chars).
+        short = runner.invoke(app, ["inspect", task.id[:8]])
+        assert short.exit_code == 0, short.output
+
+        # A crafted twin shares the first 4 chars -> ambiguous prefix.
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        store.save_model(Task(id=task.id[:4] + "ffff" + task.id[8:], title="twin"))
+        conn.close()
+        ambiguous = runner.invoke(app, ["inspect", task.id[:4]])
+        assert ambiguous.exit_code == 1
+        assert "ambiguous" in ambiguous.output
+
+        unknown = runner.invoke(app, ["inspect", "nope"])
+        assert unknown.exit_code == 1
+        assert "does not exist" in unknown.output
+
+
 class TestG2HygieneAudit:
     def test_decoy_credentials_never_reach_any_persisted_byte(self, build_workspace, monkeypatch):
         """Decoy key shapes pollute parent env; none survive into the DB."""
