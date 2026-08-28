@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import enum
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -158,3 +159,64 @@ class TestAgentLayerTransportNeutrality:
         assert run.cost_usd is None and run.input_size is None and run.output_size is None
         assert InTestHarnessAgent.backend is BackendType.HARNESS
         assert artifact.kind is ArtifactKind.RUN_OUTPUT
+
+
+class TestConversationBusAuthorityBoundary:
+    """P4.1 App. D.8 — conversation is coordination input, never state authority.
+
+    Structural half of the D.8 proof: the bus and the Room feed read-model
+    must not import the canonical-authority modules (state machine, evidence,
+    permissions), absolutely or relatively. Persistence plumbing arrives
+    transitively via ``relay.storage`` — that is the generic store every
+    aggregate shares; the behavioral half
+    (``tests/test_bus.py::TestConversationIsNotState``) proves no canonical
+    mutation through the public API.
+    """
+
+    _AUTHORITY_MODULES: ClassVar[set[str]] = {"state_machine", "evidence", "permissions"}
+
+    @staticmethod
+    def _absolute_is_authority(dotted: str) -> bool:
+        parts = dotted.split(".")
+        return parts[:2] == ["relay", "core"] and (
+            dotted
+            in {f"relay.core.{m}" for m in TestConversationBusAuthorityBoundary._AUTHORITY_MODULES}
+            or (
+                len(parts) >= 3
+                and parts[2] in TestConversationBusAuthorityBoundary._AUTHORITY_MODULES
+            )
+        )
+
+    def test_bus_and_feed_import_no_canonical_authority_modules(self):
+        modules = [RELAY_ROOT / "core" / "bus.py", RELAY_ROOT / "core" / "room_feed.py"]
+        assert all(path.exists() for path in modules), "guard against silent renames"
+        for module_path in modules:
+            tree = ast.parse(module_path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    offenders = [
+                        alias.name
+                        for alias in node.names
+                        if self._absolute_is_authority(alias.name)
+                    ]
+                elif isinstance(node, ast.ImportFrom):
+                    base = node.module or ""
+                    offenders = []
+                    if node.level == 0:
+                        offenders = [base] if self._absolute_is_authority(base) else []
+                        if base == "relay.core":
+                            offenders += [
+                                alias.name
+                                for alias in node.names
+                                if alias.name in self._AUTHORITY_MODULES
+                            ]
+                    else:
+                        # relative import resolves inside relay/core
+                        head = base.split(".")[0] if base else ""
+                        candidates = {head} | {alias.name for alias in node.names}
+                        offenders = sorted(candidates & self._AUTHORITY_MODULES)
+                else:
+                    continue
+                assert not offenders, (
+                    f"{module_path.name} imports canonical-authority module(s) {offenders}"
+                )
