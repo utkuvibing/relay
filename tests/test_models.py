@@ -98,6 +98,50 @@ class TestMessageAndEventLog:
         message = Message(sender="claude", recipient=None, type=MessageType.OPINION, content="...")
         assert message.recipient is None
 
+    def test_d5_vocabulary_extension_is_additive(self):
+        """P4.1 (App. D.5): lowercase concept-form additions beside the frozen set."""
+        frozen = {
+            "opinion",
+            "challenge",
+            "rebuttal",
+            "final_position",
+            "synthesis",
+            "review_finding",
+            "system",
+        }
+        values = {m.value for m in MessageType}
+        assert frozen <= values
+        assert {
+            "clarification_request",
+            "clarification_response",
+            "proposal",
+            "note",
+        } <= values
+        event_values = {event.value for event in EventType}
+        assert event_values.isdisjoint(values)
+
+    def test_message_blocking_and_role_addressing_defaults(self):
+        """P4.1 additive fields: blocking metadata off; direct addressing."""
+        message = Message(sender="claude", recipient="codex", type=MessageType.OPINION, content="x")
+        assert message.blocking is False
+        assert message.recipient_role is None
+
+    def test_message_role_addressing_shape(self):
+        """P4.1 (plan D3): role addressing resolves recipient, keeps role provenance."""
+        message = Message(
+            sender="gpt",
+            recipient="claude",
+            recipient_role="reviewer",
+            type=MessageType.CHALLENGE,
+            content="justified?",
+            blocking=True,
+            references=["plan:abc"],
+        )
+        restored = Message.model_validate_json(message.model_dump_json())
+        assert restored == message
+        assert restored.recipient == "claude" and restored.recipient_role == "reviewer"
+        assert restored.blocking is True
+
     def test_event_log_entry_shape_matches_spec_15(self):
         entry = EventLogEntry(
             room_id="touchline-m5",

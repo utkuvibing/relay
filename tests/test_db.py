@@ -70,8 +70,8 @@ def store(db):
 class TestSchemaAndConnect:
     def test_migrate_is_idempotent(self, tmp_path):
         conn = connect(tmp_path / "r.sqlite3")
-        assert migrate(conn) == 2
-        assert migrate(conn) == 2
+        assert migrate(conn) == SCHEMA_VERSION
+        assert migrate(conn) == SCHEMA_VERSION
         conn.close()
 
     def test_wal_and_foreign_keys_enabled(self, db):
@@ -103,7 +103,14 @@ class TestSchemaAndConnect:
         Room(name="room-1", members=[RoomMember(agent="gpt", role="researcher")]),
         Task(title="do a thing"),
         Run(agent="gpt", role="researcher", model="gpt-4o-mini"),
-        Message(sender="user", recipient="gpt", type=MessageType.OPINION, content="hi there"),
+        Message(
+            sender="user",
+            recipient="gpt",
+            recipient_role="reviewer",
+            type=MessageType.OPINION,
+            content="hi there",
+            blocking=True,
+        ),
         Artifact(kind=ArtifactKind.RUN_INPUT, run_id=None, content="payload"),
         Decision(statement="Use SQLite", supported_by=["gpt"], challenged_by=["claude"]),
         Approval(action=Action.EDIT_FILES),
@@ -194,13 +201,19 @@ class TestAppendOnlyHistory:
             "VALUES ('ev-seed', 'context_collected', 't1', 'relay:core', "
             "'2024-01-01T00:00:00+00:00')"
         )
+        db.execute(
+            "INSERT INTO messages "
+            "(id, sender, recipient, type, content, blocking, created_at) "
+            "VALUES ('msg-seed', 'claude', 'codex', 'opinion', 'seed', 0, "
+            "'2024-01-01T00:00:00+00:00')"
+        )
 
-    @pytest.mark.parametrize("table", ["event_log", "evidence_records"])
+    @pytest.mark.parametrize("table", ["event_log", "evidence_records", "messages"])
     def test_raw_sql_update_aborts(self, db, seeded, table):
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             db.execute(f"UPDATE {table} SET created_at = '1999-01-01'")
 
-    @pytest.mark.parametrize("table", ["event_log", "evidence_records"])
+    @pytest.mark.parametrize("table", ["event_log", "evidence_records", "messages"])
     def test_raw_sql_delete_aborts(self, db, seeded, table):
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             db.execute(f"DELETE FROM {table}")
@@ -217,6 +230,41 @@ class TestAppendOnlyHistory:
         entry = writer.record(EventLogEntry(type=EventType.TASK_CREATED, content="t"))
         with pytest.raises(ImmutableHistoryError):
             store.delete_model(entry)
+
+    def test_python_api_refuses_message_updates(self, store):
+        message = store.save_model(
+            Message(sender="claude", recipient="codex", type=MessageType.OPINION, content="hi")
+        )
+        tampered = message.model_copy(update={"content": "rewritten"})
+        with pytest.raises(ImmutableHistoryError):
+            store.update_model(tampered)
+
+    def test_delete_model_on_message_refused(self, store):
+        message = store.save_model(
+            Message(sender="claude", recipient=None, type=MessageType.NOTE, content="note")
+        )
+        with pytest.raises(ImmutableHistoryError):
+            store.delete_model(message)
+
+    def test_message_trigger_abort_mid_transaction_rolls_back_cleanly(self, store, db):
+        """G1(c): a trigger abort inside an open transaction leaves the tx
+        consistent; the caller's ROLLBACK discards all partial work."""
+        message = Message(sender="claude", recipient="codex", type=MessageType.OPINION, content="x")
+
+        def failing_txn() -> None:
+            with store.transaction():
+                store.save_model(message)
+                with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                    db.execute(
+                        f"UPDATE messages SET content = 'tampered' WHERE id = '{message.id}'"
+                    )
+                raise RuntimeError("caller aborts after the trigger abort")
+
+        with pytest.raises(RuntimeError):
+            failing_txn()
+
+        assert store.load_model(Message, message.id) is None
+        assert int(db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]) == 0
 
     def test_transaction_rollback_preserves_append_only_tables(self, store, db):
         writer = EventLogWriter(db)
@@ -476,6 +524,36 @@ class TestDurabilityAndIdentity:
         assert row["external_session_ref"] is None
         columns = {c[1] for c in upgraded.execute("PRAGMA table_info(runs)")}
         assert {"resolved_model", "adapter_version", "backend", "external_session_ref"} <= columns
+        upgraded.close()
+
+    def test_v2_database_upgrades_to_v3_preserving_messages(self, tmp_path):
+        """G1: the P4.1 v3 migration is ADD COLUMN-only and keeps history rows."""
+        db_path = tmp_path / "v2.sqlite3"
+        v2_conn = connect(db_path)
+        for version in (1, 2):
+            for statement in _MIGRATIONS[version]:
+                v2_conn.execute(statement)
+        v2_conn.execute("PRAGMA user_version = 2")
+        v2_conn.execute(
+            "INSERT INTO messages (id, sender, recipient, type, content, created_at) "
+            "VALUES ('msg-hist', 'claude', 'codex', 'opinion', 'pre-v3', "
+            "'2026-01-01T00:00:00+00:00')"
+        )
+        v2_conn.commit()
+        v2_conn.close()
+
+        upgraded = connect(db_path)
+        assert migrate(upgraded) == SCHEMA_VERSION
+        row = upgraded.execute("SELECT * FROM messages WHERE id='msg-hist'").fetchone()
+        assert row["content"] == "pre-v3"
+        assert row["blocking"] == 0
+        assert row["recipient_role"] is None
+        columns = {c[1] for c in upgraded.execute("PRAGMA table_info(messages)")}
+        assert {"blocking", "recipient_role"} <= columns
+        triggers = {
+            r[0] for r in upgraded.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+        }
+        assert {"messages_no_update", "messages_no_delete"} <= triggers
         upgraded.close()
 
     def test_c6_seam_columns_roundtrip_and_survive_reopen(self, tmp_path):

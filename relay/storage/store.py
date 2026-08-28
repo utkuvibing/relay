@@ -7,11 +7,12 @@ the vocabulary there is the schema contract. Container-typed fields are
 stored as JSON columns (``<field>_json``); enums as their values;
 datetimes as ISO-8601 strings.
 
-Immutability policy: ``event_log`` and ``evidence_records`` reject
-UPDATE/DELETE twice — here in Python (defense-in-depth, mirroring
-``relay.core.state_machine``'s client-side filter) and at the database
-level via triggers installed by :mod:`relay.storage.db`. Rows elsewhere
-(state-bearing records such as Run, Task, Approval) mutate legitimately.
+Immutability policy: ``event_log``, ``evidence_records`` and (P4.1)
+``messages`` reject UPDATE/DELETE twice — here in Python (defense-in-depth,
+mirroring ``relay.core.state_machine``'s client-side filter) and at the
+database level via triggers installed by :mod:`relay.storage.db`. Rows
+elsewhere (state-bearing records such as Run, Task, Approval) mutate
+legitimately.
 """
 
 from __future__ import annotations
@@ -69,7 +70,7 @@ MODEL_TABLES: dict[type[pydantic.BaseModel], str] = {
     EventLogEntry: "event_log",
 }
 
-_APPEND_ONLY_TABLES = frozenset({"event_log", "evidence_records"})
+_APPEND_ONLY_TABLES = frozenset({"event_log", "evidence_records", "messages"})
 
 _PRIMITIVES = (str, int, float, bool)
 
