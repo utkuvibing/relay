@@ -31,7 +31,8 @@ relay why 18
 | P0 | Specification freeze — core abstractions in code | ✅ hardened |
 | P1 | Single-agent runtime (`relay init`, `relay ask`, SQLite) — first **API-backed** runtime (OpenAI-compatible HTTP) per SPEC App. B.4; harness-backed agents arrive in Phase 2 | ✅ |
 | P2 | **Generic harness runtime** (SPEC §27 Phase 2 + App. C): P2.1 ✅ process runtime + conformance suite (G0–G3); P2.2 ✅ Codex CLI reference adapter + `relay build` (G2); P2.3 ✅ Claude Code adapter (safe-mode tool allowlists); P2.4 ✅ Antigravity CLI adapter (read-only plan-mode grants; write tier pending a vendor clamp flag) | 🔶 |
-| P3+ | State machine → multi-agent messaging/communication policy (typed, bounded; SPEC App. D) → semantic execution loop with plan-freeze gate → persistent Rooms ("AI group chat" model) — see SPEC §27 roadmap + Appendix D | ⬜ |
+| P3 | **Deterministic task state machine** (SPEC §27 Phase 3 + App. A): P3.1 ✅ lifecycle wired into `relay build` (context → plan → implement, every edge evidence-gated); P3.2 ✅ Relay-scoped verification runner (exit code is the only verdict); P3.3 ✅ review + approval closure (`relay approve`, gated default + A.3 direct path); P3.4 ✅ task observability (`relay status` machine position + evidence gaps, `relay inspect <task>` ledger) | ✅ |
+| P4+ | Multi-agent messaging/communication policy (typed, bounded; SPEC App. D) → semantic execution loop with plan-freeze gate → persistent Rooms ("AI group chat" model) — see SPEC §27 roadmap + Appendix D | ⬜ |
 
 Runs are persisted crash-safely: the prompt lands as a `run_input` artifact
 before any provider call, so it survives failures by construction

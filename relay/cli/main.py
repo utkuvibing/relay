@@ -39,6 +39,7 @@ from relay.core.state_machine import TaskState, TaskStateMachine
 from relay.storage import connect, migrate
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
+    Approval,
     ApprovalStatus,
     EvidenceRecord,
     Run,
@@ -234,11 +235,12 @@ def build(
                     reviewer_cfg,
                     workspace_root=root,
                 )
+            evidence_store = SqliteEvidenceStore(store)
             outcome = asyncio.run(
                 run_build(
                     store,
                     writer,
-                    SqliteEvidenceStore(store),
+                    evidence_store,
                     implementer,
                     request,
                     workspace_root=root,
@@ -249,6 +251,18 @@ def build(
                     reviewer_name=config.reviewer,
                     approval=config.approval,
                 )
+            )
+
+            # P3.4 D6: the build's ending names the machine state and the
+            # unblocking action — composed from the same records run_build
+            # just persisted (read-only; never mints).
+            from relay.cli.taskview import build_task_view
+
+            view = build_task_view(
+                task=outcome.task,
+                evidence_store=evidence_store,
+                events=writer.all(),
+                approvals=list(store.all_models(Approval)),
             )
         finally:
             conn.close()
@@ -262,7 +276,7 @@ def build(
         _out().print(f"[red]ERROR[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    build_result(task=outcome.task, outcome=outcome)
+    build_result(task=outcome.task, outcome=outcome, view=view)
 
 
 @app.command()
@@ -358,6 +372,55 @@ def approve(
     _out().print(f"[green]task {task_id} approved by human:{by} - DONE[/green]")
 
 
+def _resolve_task(store: SqliteRelayStore, task_id: str) -> Task:
+    """Load a task by exact id or unique id prefix (status shows 8 chars)."""
+    task = store.load_model(Task, task_id)
+    if task is not None:
+        return task
+    matches = [t for t in store.all_models(Task) if t.id.startswith(task_id)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ConfigError(f"task prefix '{task_id}' is ambiguous - {len(matches)} tasks match")
+    raise ConfigError(f"task '{task_id}' does not exist")
+
+
+@app.command()
+def inspect(
+    task_id: str = typer.Argument(..., help="Task id (or unique prefix) as shown by status."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable task ledger."),
+) -> None:
+    """Show one task's full ledger: transitions, evidence, approvals, artifacts (P3.4).
+
+    Everything rendered is a stored record (SPEC §15: history is
+    rebuildable); nothing here mints evidence or moves the machine.
+    """
+    from relay.cli.render import inspect_task
+    from relay.cli.taskview import build_task_ledger
+
+    root = Path.cwd()
+    try:
+        conn = _open_db(root)
+        try:
+            store = SqliteRelayStore(conn)
+            evidence = SqliteEvidenceStore(store)
+            writer = EventLogWriter(conn)
+            task = _resolve_task(store, task_id)
+            ledger = build_task_ledger(
+                task=task,
+                store=store,
+                evidence_store=evidence,
+                events=writer.all(),
+            )
+        finally:
+            conn.close()
+    except ConfigError as exc:
+        _out().print(f"[red]ERROR[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    inspect_task(ledger, json_output=json_output)
+
+
 def _worktree_is_clean(root: Path) -> bool:
     """Refuse builds whose *tracked* content diverges from HEAD."""
     import subprocess
@@ -394,24 +457,47 @@ def _select_implementer(candidates: list[str]) -> str:
     return candidates[0]
 
 
+_STATUS_TASKS = 5  # recent-task rows shown by `relay status` (P3.4)
+
+
 @app.command()
 def status() -> None:
-    """Show workspace state and whether each agent is configured."""
+    """Show workspace state, agent configuration, and task positions (P3.4)."""
     from relay.cli.render import status as render_status
+    from relay.cli.taskview import build_task_view
 
     root = Path.cwd()
     config = load_config(root)
     workspace = None
+    tasks: list[Task] = []
+    active_view = None
     try:
         conn = _open_db(root)
         try:
             store = SqliteRelayStore(conn)
+            evidence = SqliteEvidenceStore(store)
+            writer = EventLogWriter(conn)
             workspace = store.workspace_for_identity(identity_key(root))
+            tasks = list(
+                store.all_models(Task, order_by="created_at DESC, rowid DESC", limit=_STATUS_TASKS)
+            )
+            if tasks:
+                events = writer.all()
+                approvals = list(store.all_models(Approval))
+                # Active = most recent task the machine has not closed.
+                active = next((t for t in tasks if t.state is not TaskState.DONE), None)
+                if active is not None:
+                    active_view = build_task_view(
+                        task=active,
+                        evidence_store=evidence,
+                        events=events,
+                        approvals=approvals,
+                    )
         finally:
             conn.close()
     except ConfigError:
         pass  # renderer prints the not-initialized hint
-    render_status(workspace, config, _key_states(config))
+    render_status(workspace, config, _key_states(config), tasks=tasks, active_view=active_view)
 
 
 @app.command()

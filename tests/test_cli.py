@@ -363,3 +363,24 @@ class TestHistory:
         runner.invoke(app, ["init"])
         result = runner.invoke(app, ["history", "--full", "nope"])
         assert result.exit_code == 1
+
+
+class TestTaskObservability:
+    """P3.4 CLI edges: empty workspaces degrade; unknown tasks fail typed."""
+
+    def test_status_without_tasks_omits_task_section(self, workspace):
+        runner.invoke(app, ["init"])
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0, result.output
+        assert "Relay tasks" not in result.output
+        assert "Active task" not in result.output
+
+    def test_inspect_before_init_and_unknown_task(self, workspace):
+        not_initialized = runner.invoke(app, ["inspect", "whatever"])
+        assert not_initialized.exit_code == 1
+        assert "not initialized" in not_initialized.output
+
+        runner.invoke(app, ["init"])
+        unknown = runner.invoke(app, ["inspect", "nope"])
+        assert unknown.exit_code == 1
+        assert "does not exist" in unknown.output
