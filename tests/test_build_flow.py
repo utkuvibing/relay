@@ -26,8 +26,8 @@ from relay.agents.registry import transient_adapters
 from relay.cli.main import app
 from relay.context.config import HarnessAgentConfig
 from relay.core.evidence import EvidenceKind
-from relay.core.orchestrator import BuildRefusal, run_build
-from relay.core.state_machine import TaskState
+from relay.core.orchestrator import BuildRefusal, _open_approval_gate, advance_task, run_build
+from relay.core.state_machine import TaskState, TaskStateMachine
 from relay.harness.capabilities import HarnessCapability
 from relay.harness.errors import HarnessOutputError
 from relay.harness.runtime import HarnessAgent
@@ -36,9 +36,11 @@ from relay.harness.types import ExecutionGrantKind
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     Approval,
+    ApprovalStatus,
     Artifact,
     ArtifactKind,
     EventType,
+    EvidenceRecord,
     Run,
     Task,
     ToolRun,
@@ -1089,4 +1091,224 @@ class TestG2HygieneAudit:
             assert decoy_key not in json.dumps(tr.arguments, default=str), (
                 f"live decoy key leaked into tool_run {tr.id}"
             )
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P3 hardening: atomic completion boundaries (fault-injection rollback tests)
+# ---------------------------------------------------------------------------
+
+
+class _FaultInjected(Exception):
+    """Simulated crash: raised at a chosen write inside an open transaction."""
+
+
+def _writer_failing_on(content_marker: str):
+    """EventLogWriter factory that raises when the marked event is recorded.
+
+    The fault fires mid-transaction — after every earlier write in the same
+    ``BEGIN IMMEDIATE`` block — so a clean post-mortem (nothing committed)
+    proves the boundary is all-or-nothing: any surviving write would show up
+    in the reopened database.
+    """
+
+    class _FaultyWriter(EventLogWriter):
+        def record(self, entry):
+            if entry.type is EventType.STATE_TRANSITIONED and content_marker in entry.content:
+                raise _FaultInjected(f"injected fault at: {entry.content}")
+            return super().record(entry)
+
+    return _FaultyWriter
+
+
+class TestAdvanceTaskAtomic:
+    """The shared persistence helper itself, at the store level.
+
+    ``advance_task`` is the single transition-persistence path; these tests
+    pin its contract directly — companion records commit atomically with the
+    transition, and a mid-transaction fault rolls the whole boundary back.
+    """
+
+    @staticmethod
+    def _reviewing_task(tmp_path, name: str):
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(tmp_path / name)
+        __import__("relay.storage", fromlist=["migrate"]).migrate(conn)
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        writer = EventLogWriter(conn)
+        task = store.save_model(Task(title="gate", state=TaskState.REVIEWING))
+        evidence.record(
+            EvidenceRecord(
+                kind=EvidenceKind.TESTS_PASSED,
+                task_id=task.id,
+                produced_by="relay:verification",
+                tool_run_id="tr-1",
+            )
+        )
+        evidence.record(
+            EvidenceRecord(
+                kind=EvidenceKind.REVIEW_PASSED,
+                task_id=task.id,
+                produced_by="agent:impl",
+                run_id="run-1",
+            )
+        )
+        return conn, store, evidence, writer, task
+
+    def test_gate_records_commit_atomically_with_the_transition(self, tmp_path):
+        conn, store, evidence, writer, task = self._reviewing_task(tmp_path, "atomic-ok.sqlite3")
+
+        approval, event = _open_approval_gate(task)
+        machine = TaskStateMachine(task_id=task.id, store=evidence, state=task.state)
+        updated = advance_task(
+            machine,
+            store,
+            writer,
+            task,
+            TaskState.APPROVAL_REQUIRED,
+            created_approval=approval,
+            events=(event,),
+        )
+        assert updated.state is TaskState.APPROVAL_REQUIRED
+        assert store.load_model(Task, task.id).state is TaskState.APPROVAL_REQUIRED
+        rows = [a for a in store.all_models(Approval) if a.task_id == task.id]
+        assert len(rows) == 1
+        assert rows[0].status is ApprovalStatus.PENDING
+        types = [e.type for e in writer.all() if f"task:{task.id}" in e.references]
+        assert EventType.APPROVAL_REQUESTED in types
+        conn.close()
+
+    def test_fault_rolls_back_the_whole_boundary(self, tmp_path):
+        conn, store, evidence, writer, task = self._reviewing_task(tmp_path, "atomic-fault.sqlite3")
+
+        approval, event = _open_approval_gate(task)
+        machine = TaskStateMachine(task_id=task.id, store=evidence, state=task.state)
+        with pytest.raises(_FaultInjected):
+            advance_task(
+                machine,
+                store,
+                _writer_failing_on("reviewing -> approval_required")(conn),
+                task,
+                TaskState.APPROVAL_REQUIRED,
+                created_approval=approval,
+                events=(event,),
+            )
+        # Post-mortem: the boundary never happened — nothing from it committed.
+        assert store.load_model(Task, task.id).state is TaskState.REVIEWING
+        assert [a for a in store.all_models(Approval) if a.task_id == task.id] == []
+        assert EventType.APPROVAL_REQUESTED not in [
+            e.type for e in writer.all() if f"task:{task.id}" in e.references
+        ]
+        # The transaction was released: the store accepts new work.
+        assert store._in_transaction is False
+        conn.close()
+
+
+class TestAtomicClosure:
+    """All three completion boundaries are all-or-nothing (P3 hardening).
+
+    The fault is injected at the LAST write of each boundary transaction —
+    the ``STATE_TRANSITIONED`` event — after every earlier write in that
+    transaction. Writes from EARLIER transactions legitimately survive; the
+    boundary's own writes must not.
+    """
+
+    def test_gate_transition_rolls_back_approval_request(self, build_workspace, monkeypatch):
+        """Crash in REVIEWING -> APPROVAL_REQUIRED: no gate, no approval row."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        monkeypatch.setattr(
+            "relay.cli.main.EventLogWriter",
+            _writer_failing_on("reviewing -> approval_required"),
+        )
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        writer = EventLogWriter(conn)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING  # old side of the edge
+        assert [a for a in store.all_models(Approval) if a.task_id == task.id] == []
+        types = [e.type for e in writer.all() if f"task:{task.id}" in e.references]
+        assert EventType.APPROVAL_REQUESTED not in types
+        # Earlier transactions legitimately committed:
+        assert EvidenceKind.REVIEW_PASSED in {r.kind for r in evidence.records_for_task(task.id)}
+        conn.close()
+
+    def test_approve_rolls_back_decision_evidence_and_transition(
+        self, build_workspace, monkeypatch
+    ):
+        """Crash in APPROVAL_REQUIRED -> DONE: the human decision, the
+        APPROVAL_GRANTED evidence, and their events roll back together."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            built = runner.invoke(app, ["build", "write implemented.txt"])
+        assert built.exit_code == 0, built.output
+        task = next(iter(_all_tasks(build_workspace)))
+        assert task.state is TaskState.APPROVAL_REQUIRED
+
+        monkeypatch.setattr(
+            "relay.cli.main.EventLogWriter",
+            _writer_failing_on("approval_required -> done"),
+        )
+        result = runner.invoke(app, ["approve", task.id, "--by", "kaya"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        writer = EventLogWriter(conn)
+        assert store.load_model(Task, task.id).state is TaskState.APPROVAL_REQUIRED
+        pending = [a for a in store.all_models(Approval) if a.task_id == task.id]
+        assert len(pending) == 1
+        assert pending[0].status is ApprovalStatus.PENDING
+        assert pending[0].decided_by is None  # the decision rolled back
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.APPROVAL_GRANTED not in kinds
+        types = [e.type for e in writer.all() if f"task:{task.id}" in e.references]
+        assert EventType.APPROVAL_GRANTED not in types
+        conn.close()
+
+    def test_direct_mode_rolls_back_attestation_and_transition(self, build_workspace, monkeypatch):
+        """Crash in REVIEWING -> DONE (A.3 direct path): the relay-attested
+        empty queue and its event roll back with the transition."""
+        relay_yaml = build_workspace / "relay.yaml"
+        relay_yaml.write_text(
+            relay_yaml.read_text(encoding="utf-8") + "approval:\n  mode: direct\n",
+            encoding="utf-8",
+        )
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        monkeypatch.setattr(
+            "relay.cli.main.EventLogWriter",
+            _writer_failing_on("reviewing -> done"),
+        )
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        evidence = SqliteEvidenceStore(store)
+        writer = EventLogWriter(conn)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.NO_PENDING_APPROVALS not in kinds  # rolled back
+        assert EvidenceKind.REVIEW_PASSED in kinds  # earlier Tx committed
+        contents = [e.content for e in writer.all() if f"task:{task.id}" in e.references]
+        assert "task state: reviewing -> done" not in contents
         conn.close()
