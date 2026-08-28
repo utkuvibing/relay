@@ -294,6 +294,7 @@ def approve(
     store refuses it from any non-``human:`` producer. The machine's
     ``APPROVAL_REQUIRED -> DONE`` edge demands it.
     """
+    from relay.core.orchestrator import advance_task
     from relay.core.state_machine import StateMachineError
     from relay.storage.models import Approval, EventLogEntry, EventType
 
@@ -331,16 +332,26 @@ def approve(
             }
         )
         machine = TaskStateMachine(task_id=task.id, store=evidence, state=task.state)
-        with store.transaction():
-            store.update_model(approval)
-            evidence.record(
+        # P3 hardening: the human decision, the APPROVAL_GRANTED evidence, its
+        # event, the DONE transition, and the STATE_TRANSITIONED event commit
+        # in ONE transaction — a crash can never strand recorded approval on a
+        # task still at approval_required.
+        advance_task(
+            machine,
+            store,
+            writer,
+            task,
+            TaskState.DONE,
+            evidence_store=evidence,
+            updated_approval=approval,
+            evidence_records=(
                 EvidenceRecord(
                     kind=EvidenceKind.APPROVAL_GRANTED,
                     task_id=task.id,
                     produced_by=f"human:{by}",
-                )
-            )
-            writer.record(
+                ),
+            ),
+            events=(
                 EventLogEntry(
                     type=EventType.APPROVAL_GRANTED,
                     content=f"task completion approved by human:{by}",
@@ -348,20 +359,9 @@ def approve(
                         f"task:{task.id}",
                         f"approval:{approval.id}",
                     ],
-                )
-            )
-
-        previous = machine.state
-        machine.transition(TaskState.DONE)
-        with store.transaction():
-            store.update_model(task.model_copy(update={"state": TaskState.DONE}))
-            writer.record(
-                EventLogEntry(
-                    type=EventType.STATE_TRANSITIONED,
-                    content=f"task state: {previous.value} -> done",
-                    references=[f"task:{task.id}"],
-                )
-            )
+                ),
+            ),
+        )
     except (ConfigError, StateMachineError) as exc:
         _out().print(f"[red]ERROR[/red] {exc}")
         raise typer.Exit(code=1) from exc

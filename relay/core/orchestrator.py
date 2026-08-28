@@ -380,25 +380,49 @@ _IMPLEMENT_DIRECTIVE = (
 )
 
 
-def _advance(
+def advance_task(
     machine: TaskStateMachine,
     store: SqliteRelayStore,
     writer: EventLogWriter,
     task: Task,
     target: TaskState,
+    *,
+    evidence_store: EvidenceStore | None = None,
+    created_approval: Approval | None = None,
+    updated_approval: Approval | None = None,
+    evidence_records: tuple[EvidenceRecord, ...] = (),
+    events: tuple[EventLogEntry, ...] = (),
 ) -> Task:
-    """One persisted lifecycle transition: validate → persist state → event.
+    """One persisted lifecycle transition — validate, then persist ATOMICALLY.
 
-    The machine validates the edge against the ``EvidenceStore`` first; only
-    a granted transition updates ``Task.state`` and appends the
-    ``STATE_TRANSITIONED`` event (same transaction). No caller-supplied enum
-    ever carries transition authority (App. A.1).
+    The machine validates the edge against the ``EvidenceStore``; only a
+    granted transition writes. Companion records a completion boundary
+    demands (a created/updated approval row, boundary evidence, their
+    events) commit in the SAME ``BEGIN IMMEDIATE`` transaction as the
+    ``Task.state`` update and the ``STATE_TRANSITIONED`` event: a crash or
+    exception can never leave committed approval/evidence on the old side
+    of a transition (P3 hardening). Companion evidence is written BEFORE
+    the machine validates, inside the transaction, so gates that demand
+    the very evidence the boundary is minting (e.g. ``APPROVAL_GRANTED``
+    on the ``APPROVAL_REQUIRED -> DONE`` edge) validate against it.
+    No caller-supplied enum ever carries transition authority (App. A.1).
     """
-    previous = machine.state
-    machine.transition(target)
-    updated = task.model_copy(update={"state": target})
+    if evidence_records and evidence_store is None:
+        raise ValueError("evidence_records require evidence_store")
     with store.transaction():
+        if created_approval is not None:
+            store.save_model(created_approval)
+        if updated_approval is not None:
+            store.update_model(updated_approval)
+        if evidence_store is not None and evidence_records:
+            for record in evidence_records:
+                evidence_store.record(record)
+        previous = machine.state
+        machine.transition(target)
+        updated = task.model_copy(update={"state": target})
         store.update_model(updated)
+        for entry in events:
+            writer.record(entry)
         writer.record(
             EventLogEntry(
                 type=EventType.STATE_TRANSITIONED,
@@ -699,11 +723,11 @@ async def _run_verification(
                     references=[f"task:{task.id}", f"tool_run:{tool_run.id}"],
                 )
             )
-        return _advance(machine, store, writer, task, TaskState.REVIEWING)
+        return advance_task(machine, store, writer, task, TaskState.REVIEWING)
 
     with store.transaction():
         _finalize(RunStatus.FAILED, None, artifact.id)
-    return _advance(machine, store, writer, task, TaskState.IMPLEMENTING)
+    return advance_task(machine, store, writer, task, TaskState.IMPLEMENTING)
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +818,7 @@ async def _run_review(
         )
 
     if verdict != "pass":
-        return _advance(machine, store, writer, task, TaskState.IMPLEMENTING)
+        return advance_task(machine, store, writer, task, TaskState.IMPLEMENTING)
 
     with store.transaction():
         evidence.record(
@@ -816,31 +840,30 @@ async def _run_review(
     return task
 
 
-def _request_approval(store: SqliteRelayStore, writer: EventLogWriter, task: Task) -> None:
-    """Open the human gate: one PENDING approval + APPROVAL_REQUESTED event.
+def _open_approval_gate(task: Task) -> tuple[Approval, EventLogEntry]:
+    """Build the human gate records: one PENDING approval + its request event.
 
     ``action=EDIT_FILES`` carries the vocabulary wrinkle surfaced at freeze:
     the Action enum has no task-completion member, so the approval targets
     the changes with the reason carrying the specifics (frozen-plan veto
-    item 1).
+    item 1). The records are PERSISTED BY :func:`advance_task` — created in
+    the same transaction as the ``REVIEWING -> APPROVAL_REQUIRED``
+    transition (P3 hardening: a committed approval can never outlive a
+    failed transition).
     """
-    with store.transaction():
-        approval = store.save_model(
-            Approval(
-                action=Action.EDIT_FILES,
-                task_id=task.id,
-                requested_by="relay:review",
-                reason=f"task completion approval — {task.title[:120]}",
-                status=ApprovalStatus.PENDING,
-            )
-        )
-        writer.record(
-            EventLogEntry(
-                type=EventType.APPROVAL_REQUESTED,
-                content="task completion approval requested",
-                references=[f"task:{task.id}", f"approval:{approval.id}"],
-            )
-        )
+    approval = Approval(
+        action=Action.EDIT_FILES,
+        task_id=task.id,
+        requested_by="relay:review",
+        reason=f"task completion approval — {task.title[:120]}",
+        status=ApprovalStatus.PENDING,
+    )
+    event = EventLogEntry(
+        type=EventType.APPROVAL_REQUESTED,
+        content="task completion approval requested",
+        references=[f"task:{task.id}", f"approval:{approval.id}"],
+    )
+    return approval, event
 
 
 async def run_build(
@@ -911,7 +934,7 @@ async def run_build(
 
     # 1. Context collection (relay:core) → CONTEXT_READY.
     task = _collect_context(store, writer, evidence, task, workspace_root)
-    task = _advance(machine, store, writer, task, TaskState.CONTEXT_READY)
+    task = advance_task(machine, store, writer, task, TaskState.CONTEXT_READY)
 
     # 2. Planning run (same adapter, READ_ONLY) → canonical plan → PLAN_READY.
     plan_request = request.model_copy(
@@ -928,11 +951,11 @@ async def run_build(
         # blocked at CONTEXT_READY (no plan evidence, no implementation).
         return BuildOutcome(task=task, ask=plan_outcome)
     task = _freeze_plan(store, writer, evidence, task, plan_outcome)
-    task = _advance(machine, store, writer, task, TaskState.PLAN_READY)
+    task = advance_task(machine, store, writer, task, TaskState.PLAN_READY)
 
     # 3. Implicit freeze (App. D.3): a standalone `relay build` IS the
     # human's explicit initiation — the PLAN_READY→IMPLEMENTING edge.
-    task = _advance(machine, store, writer, task, TaskState.IMPLEMENTING)
+    task = advance_task(machine, store, writer, task, TaskState.IMPLEMENTING)
 
     # 4. Implementation run — the prompt is the frozen plan artifact content,
     # not the raw prompt (App. D.3: downstream agents operate against the
@@ -1006,12 +1029,12 @@ async def run_build(
                 references=[f"task:{task.id}", f"run:{outcome.run.id}"],
             )
         )
-        task = _advance(machine, store, writer, task, TaskState.IMPLEMENTED)
+        task = advance_task(machine, store, writer, task, TaskState.IMPLEMENTED)
 
         # P3.2: auto-chained Relay-scoped verification (frozen plan Q-f) —
         # endings: REVIEWING (pass), IMPLEMENTING (test-failure rework), or
         # blocked in VERIFYING (no config / could-not-execute / timeout).
-        task = _advance(machine, store, writer, task, TaskState.VERIFYING)
+        task = advance_task(machine, store, writer, task, TaskState.VERIFYING)
         task = await _run_verification(
             store, writer, evidence, gate, machine, task, verification, workspace_root
         )
@@ -1042,27 +1065,46 @@ async def run_build(
                 if approval is not None and approval.mode == "direct":
                     # A.3 opt-out: Relay attests the empty-by-construction
                     # queue (no approval row is ever created in direct mode).
-                    with store.transaction():
-                        evidence.record(
+                    # Hardening: evidence + event + the DONE transition commit
+                    # atomically — no stranded attestation on a REVIEWING task.
+                    task = advance_task(
+                        machine,
+                        store,
+                        writer,
+                        task,
+                        TaskState.DONE,
+                        evidence_store=evidence,
+                        evidence_records=(
                             EvidenceRecord(
                                 kind=EvidenceKind.NO_PENDING_APPROVALS,
                                 task_id=task.id,
                                 produced_by="relay:review",
-                            )
-                        )
-                        writer.record(
+                            ),
+                        ),
+                        events=(
                             EventLogEntry(
                                 type=EventType.EVIDENCE_RECORDED,
                                 content=(
                                     f"{EvidenceKind.NO_PENDING_APPROVALS.value} recorded for task"
                                 ),
                                 references=[f"task:{task.id}"],
-                            )
-                        )
-                    task = _advance(machine, store, writer, task, TaskState.DONE)
+                            ),
+                        ),
+                    )
                 else:
-                    _request_approval(store, writer, task)
-                    task = _advance(machine, store, writer, task, TaskState.APPROVAL_REQUIRED)
+                    # Hardening: the PENDING approval row and its request event
+                    # commit in the SAME transaction as the gate transition —
+                    # a crash cannot open a gate the task never reached.
+                    approval_row, approval_event = _open_approval_gate(task)
+                    task = advance_task(
+                        machine,
+                        store,
+                        writer,
+                        task,
+                        TaskState.APPROVAL_REQUIRED,
+                        created_approval=approval_row,
+                        events=(approval_event,),
+                    )
 
     return BuildOutcome(
         task=task, ask=outcome, diff_artifact_id=diff_artifact_id, tool_run_ids=tool_run_ids
