@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _APPEND_ONLY_TABLES = ("event_log", "evidence_records")
 
@@ -187,6 +187,27 @@ _V2_STATEMENTS: tuple[str, ...] = (
 )
 
 _MIGRATIONS[2] = _V2_STATEMENTS
+
+#: P4.1 (App. D.5/D.11) — additive message addressing/blocking columns, and
+#: ``messages`` joining the append-only trigger family at the DB layer. v1 is
+#: shipped history and is not retro-edited: the message triggers are created
+#: here, so fresh databases traverse v1→v2→v3 and converge to the same schema.
+_V3_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE messages ADD COLUMN blocking INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN recipient_role TEXT",
+    (
+        "CREATE TRIGGER IF NOT EXISTS messages_no_update "
+        "BEFORE UPDATE ON messages BEGIN "
+        "SELECT RAISE(ABORT, 'messages is append-only'); END;"
+    ),
+    (
+        "CREATE TRIGGER IF NOT EXISTS messages_no_delete "
+        "BEFORE DELETE ON messages BEGIN "
+        "SELECT RAISE(ABORT, 'messages is append-only'); END;"
+    ),
+)
+
+_MIGRATIONS[3] = _V3_STATEMENTS
 
 
 def connect(path: str | Path) -> sqlite3.Connection:

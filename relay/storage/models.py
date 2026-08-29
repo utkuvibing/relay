@@ -114,7 +114,13 @@ class Run(BaseModel):
 
 
 class MessageType(str, enum.Enum):
-    """Vocabulary of the conversation bus (SPEC §9, §15)."""
+    """Vocabulary of the conversation bus (SPEC §9, §15; App. D.5).
+
+    The first six members are the frozen Phase-0 conversational set.
+    The D.5 extensions (P4.1) are additive, lowercase concept-form values;
+    blocking-ness is per-message ``Message.blocking`` metadata, never
+    implied by type alone (App. D.6).
+    """
 
     OPINION = "opinion"
     CHALLENGE = "challenge"
@@ -122,22 +128,45 @@ class MessageType(str, enum.Enum):
     FINAL_POSITION = "final_position"
     SYNTHESIS = "synthesis"
     REVIEW_FINDING = "review_finding"
+    #: App. D.5 additive extensions (P4.1).
+    CLARIFICATION_REQUEST = "clarification_request"
+    CLARIFICATION_RESPONSE = "clarification_response"
+    PROPOSAL = "proposal"
+    NOTE = "note"
     SYSTEM = "system"
 
 
 class Message(BaseModel):
-    """First-class inter-agent communication record (SPEC §5/§9)."""
+    """First-class inter-agent communication record (SPEC §5/§9; App. D.5).
+
+    Append-only at persistence (P4.1): ``messages`` joins the
+    ``_APPEND_ONLY_TABLES`` family, so every field is final at insert.
+    ``recipient`` always stores the RESOLVED logical-agent identity that
+    received the message; ``recipient_role`` preserves the original role
+    address when the sender addressed a role (App. D.11-P4 provenance).
+    ``references`` are generic semantic references (plans/decisions/
+    findings/artifacts/evidence); no reply-linkage representation is
+    frozen here — that is a P4.3 decision.
+    """
 
     id: str = Field(default_factory=new_id)
     sender: str
     recipient: str | None = Field(
         default=None,
-        description="None means broadcast to the room.",
+        description="Resolved logical-agent identity; None means broadcast to the room.",
+    )
+    recipient_role: str | None = Field(
+        default=None,
+        description="Original role address when the sender addressed a role; else None.",
     )
     room_id: str | None = None
     task_id: str | None = None
     type: MessageType
     content: str
+    blocking: bool = Field(
+        default=False,
+        description="Per-message metadata (App. D.6); never implied by type alone.",
+    )
     references: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)
 
