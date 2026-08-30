@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _APPEND_ONLY_TABLES = ("event_log", "evidence_records")
 
@@ -208,6 +208,15 @@ _V3_STATEMENTS: tuple[str, ...] = (
 )
 
 _MIGRATIONS[3] = _V3_STATEMENTS
+
+#: P4.2 (frozen plan D2) — additive ``Message.run_id`` authorship-provenance
+#: column. Historical rows are untouched (NULL = pre-P4.2 claimed authorship);
+#: validation of the linkage lives at the bus boundary, not in schema.
+_V4_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE messages ADD COLUMN run_id TEXT",
+)
+
+_MIGRATIONS[4] = _V4_STATEMENTS
 
 
 def connect(path: str | Path) -> sqlite3.Connection:

@@ -18,8 +18,21 @@ from relay.storage.models import (
     Message,
     MessageType,
     Room,
+    Run,
 )
 from relay.storage.store import SqliteRelayStore
+
+#: P4.2 (frozen plan D1): bare logical-agent senders prove authorship via a
+#: real Run; ``_msg`` wires the seeded run id automatically.
+_RUN_IDS: dict[str, str] = {}
+
+
+@pytest.fixture(autouse=True)
+def _authorship_runs(store):
+    _RUN_IDS.clear()
+    _RUN_IDS["claude"] = store.save_model(Run(agent="claude", role="reviewer")).id
+    yield
+    _RUN_IDS.clear()
 
 
 @pytest.fixture()
@@ -56,6 +69,10 @@ def _msg(**overrides) -> Message:
         "content": "compatibility shim is intentional",
     }
     base.update(overrides)
+    sender = base["sender"]
+    if "run_id" not in overrides and isinstance(sender, str) and ":" not in sender:
+        # P4.2 D1: auto-wire authorship provenance for bare agent senders.
+        base["run_id"] = _RUN_IDS.get(sender)
     return Message(**base)
 
 

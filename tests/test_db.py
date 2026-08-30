@@ -110,6 +110,7 @@ class TestSchemaAndConnect:
             type=MessageType.OPINION,
             content="hi there",
             blocking=True,
+            run_id="run-42",
         ),
         Artifact(kind=ArtifactKind.RUN_INPUT, run_id=None, content="payload"),
         Decision(statement="Use SQLite", supported_by=["gpt"], challenged_by=["claude"]),
@@ -554,6 +555,31 @@ class TestDurabilityAndIdentity:
             r[0] for r in upgraded.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
         }
         assert {"messages_no_update", "messages_no_delete"} <= triggers
+        upgraded.close()
+
+    def test_v3_database_upgrades_to_v4_preserving_messages(self, tmp_path):
+        """G1: the P4.2 v4 migration is ADD COLUMN-only and keeps history rows."""
+        db_path = tmp_path / "v3.sqlite3"
+        v3_conn = connect(db_path)
+        for version in (1, 2, 3):
+            for statement in _MIGRATIONS[version]:
+                v3_conn.execute(statement)
+        v3_conn.execute("PRAGMA user_version = 3")
+        v3_conn.execute(
+            "INSERT INTO messages (id, sender, recipient, type, content, created_at) "
+            "VALUES ('msg-v3', 'claude', 'codex', 'opinion', 'pre-v4', "
+            "'2026-01-01T00:00:00+00:00')"
+        )
+        v3_conn.commit()
+        v3_conn.close()
+
+        upgraded = connect(db_path)
+        assert migrate(upgraded) == SCHEMA_VERSION
+        row = upgraded.execute("SELECT * FROM messages WHERE id='msg-v3'").fetchone()
+        assert row["content"] == "pre-v4"
+        assert row["run_id"] is None
+        columns = {c[1] for c in upgraded.execute("PRAGMA table_info(messages)")}
+        assert "run_id" in columns
         upgraded.close()
 
     def test_c6_seam_columns_roundtrip_and_survive_reopen(self, tmp_path):

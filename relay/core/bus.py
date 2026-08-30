@@ -25,9 +25,14 @@ P4.1 closeout invariants (plan rev 3): broadcast (``recipient=None``
 without a role) is denied outright — P5 may permit it under explicit
 policy; self-send (sender == resolved recipient) is denied after role
 resolution; ``MessageType.SYSTEM`` is reserved for ``relay:*`` senders.
-Forward requirement for P4.2: agent-authored messages must gain real Run
-provenance (run linkage validated against ``run.agent == sender``) —
-sender strings alone are not authorship proof.
+
+P4.2 (frozen plan D1) — strict authorship: a bare logical-agent sender
+MUST carry ``run_id`` linking the Run that authored the message, and the
+bus validates ``run.agent == sender`` against the store; ``human:``/
+``relay:`` senders must NOT carry ``run_id`` (authorship provenance is
+agent-only — prefix senders cite runs via generic ``references``).
+Sender strings alone are claimed, never proven, authorship. All
+rejections happen BEFORE persistence.
 
 Reply pairing / unresolved-blocking queries are NOT here: P4.3 owns that
 semantics and the reply-linkage representation. ``references`` stay
@@ -39,7 +44,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from relay.storage.events import EventLogWriter
-from relay.storage.models import EventLogEntry, EventType, Message, MessageType
+from relay.storage.models import EventLogEntry, EventType, Message, MessageType, Run
 from relay.storage.store import SqliteRelayStore
 
 #: Frozen content bound (P4.1 plan D12): enforced at the bus boundary as a
@@ -124,6 +129,7 @@ class ConversationBus:
             raise MessageRejected("message must carry a room_id and/or a task_id")
 
         self._validate_sender(message.sender)
+        self._validate_authorship(message)
 
         if message.recipient_role is not None:
             if not _identity_is_valid(message.recipient_role):
@@ -199,6 +205,37 @@ class ConversationBus:
             return
         if self._resolver is not None and not self._resolver.knows_agent(sender):
             raise MessageRejected(f"unknown logical agent sender {sender!r}")
+
+    def _validate_authorship(self, message: Message) -> None:
+        """P4.2 (frozen plan D1): strict authorship provenance.
+
+        A bare logical-agent sender MUST carry ``run_id`` and the linked Run
+        must exist with ``run.agent == sender``. ``human:``/``relay:`` senders
+        must NOT carry ``run_id`` — authorship proof is agent-only. Every
+        rejection happens BEFORE persistence.
+        """
+        if ":" in message.sender:
+            if message.run_id is not None:
+                raise MessageRejected(
+                    f"prefix sender {message.sender!r} must not carry run_id — "
+                    "authorship provenance is agent-only; cite runs via "
+                    "generic references instead"
+                )
+            return
+        if message.run_id is None:
+            raise MessageRejected(
+                f"bare logical-agent sender {message.sender!r} requires run "
+                "provenance: set run_id to the Run that authored this message "
+                "(sender strings alone are claimed, not proven, authorship)"
+            )
+        run = self._store.load_model(Run, message.run_id)
+        if run is None:
+            raise MessageRejected(f"run_id {message.run_id!r} does not resolve to a Run")
+        if run.agent != message.sender:
+            raise MessageRejected(
+                f"authorship mismatch: run {message.run_id!r} belongs to agent "
+                f"{run.agent!r}, not sender {message.sender!r}"
+            )
 
     def _resolve_role(self, role: str) -> str:
         if self._resolver is None:
