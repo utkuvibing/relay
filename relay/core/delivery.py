@@ -286,11 +286,16 @@ class MessageDelivery:
 
 
 def _refusal_reason(exc: Exception) -> str:
-    """Public-contract errors keep their message; anything else stays type-only."""
+    """Public-contract errors keep their message; anything else stays type-only.
+
+    Registry vocabulary never appears here: ``RegistryAgentFactory``
+    normalizes its refusals to ``ConfigError`` before they reach this path,
+    so delivery depends only on the AgentFactory seam and neutral errors
+    (frozen plan D6 — core must not import the adapter registry).
+    """
     from relay.agents.errors import AgentError, AgentNotConfigured
-    from relay.agents.registry import UnknownAgentError
     from relay.context.config import ConfigError
 
-    if isinstance(exc, (AgentError, AgentNotConfigured, UnknownAgentError, ConfigError)):
+    if isinstance(exc, (AgentError, AgentNotConfigured, ConfigError)):
         return str(exc)
     return f"unexpected factory failure ({type(exc).__name__})"

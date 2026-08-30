@@ -5,6 +5,7 @@ Frozen plan: ``docs/plans/p4.2-role-resolution-delivery-plan.md`` (rev 3),
 decisions D7–D15. SPEC reference: §27 Phase 4; App. D.8/D.11-P4, C.7-P4.
 """
 
+import asyncio
 from typing import ClassVar
 
 import pytest
@@ -20,6 +21,7 @@ from relay.agents.config import AgentSettings
 from relay.context.config import ConfigError, HarnessAgentConfig
 from relay.core.delivery import (
     DELIVERY_SENDER,
+    DeliveryOutcome,
     DeliveryRefusal,
     DuplicateDeliveryRefusal,
     MessageDelivery,
@@ -496,6 +498,68 @@ class TestDeliveryRefusals:
 # ---------------------------------------------------------------------------
 # D9/D12 — delivery is not conversation and not state
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# D13 — at-most-once initiation under a real two-connection race
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentDelivery:
+    async def test_two_connections_race_one_initiation_commits_the_loser_vetoes(
+        self, tmp_path
+    ):
+        """Two independent connections deliver the SAME message concurrently
+        (WAL; Tx1 = single BEGIN IMMEDIATE): exactly one initiation commits,
+        the loser is a typed ``DuplicateDeliveryRefusal`` with ZERO persisted
+        run/artifact/event delta — and the loser's Tx1 rollback leaves no
+        trace on its own connection. Also proves the committed binding marker
+        is visible across connections, which is what makes the guard race-free."""
+        db_path = tmp_path / "race.sqlite3"
+        conn_a = connect(db_path)
+        migrate(conn_a)
+        conn_b = connect(db_path)
+        migrate(conn_b)
+
+        try:
+            store_a, store_b = SqliteRelayStore(conn_a), SqliteRelayStore(conn_b)
+            writer_a, writer_b = EventLogWriter(conn_a), EventLogWriter(conn_b)
+            store_a.save_model(Room(id="room-1", name="race-room"))
+            author_run = store_a.save_model(Run(agent="claude", role="reviewer"))
+            saved = store_a.save_model(_message(run_id=author_run.id))
+
+            fake_a, fake_b = RecordingAPIAgent(), RecordingAPIAgent()
+            delivery_a = MessageDelivery(store_a, writer_a, FakeFactory({"fixer": fake_a}))
+            delivery_b = MessageDelivery(store_b, writer_b, FakeFactory({"fixer": fake_b}))
+            baseline = store_a.counts()
+
+            outcomes = await asyncio.gather(
+                delivery_a.deliver(saved.id),
+                delivery_b.deliver(saved.id),
+                return_exceptions=True,
+            )
+
+            wins = [o for o in outcomes if isinstance(o, DeliveryOutcome)]
+            vetoes = [o for o in outcomes if isinstance(o, DuplicateDeliveryRefusal)]
+            assert len(wins) == 1
+            assert wins[0].ask.response is not None and wins[0].ask.error is None
+            assert len(vetoes) == 1
+
+            # The committed binding marker is visible across BOTH connections.
+            assert len(delivery_a.deliveries_for_message(saved.id)) == 1
+            assert len(delivery_b.deliveries_for_message(saved.id)) == 1
+
+            after = store_a.counts()
+            assert after["runs"] == baseline["runs"] + 1  # the loser added none
+            assert after["artifacts"] == baseline["artifacts"] + 2
+            assert after["event_log"] == baseline["event_log"] + 3
+            assert after["messages"] == baseline["messages"]
+
+            # Exactly one recipient run actually executed.
+            assert len(fake_a.received) + len(fake_b.received) == 1
+        finally:
+            conn_a.close()
+            conn_b.close()
 
 
 class TestDeliveryIsNotState:

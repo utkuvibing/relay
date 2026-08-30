@@ -118,10 +118,11 @@ async def run_ask(
     agent_name: str | None = None,
     pre_provider: Callable[[Run, Artifact], Iterable[EventLogEntry]] | None = None,
 ) -> AskOutcome:
-    """Execute one agent run with crash-safe persistence; never raises.
+    """Execute one agent run with crash-safe persistence.
 
-    Provider-I/O failures become durable run history (``AskOutcome`` with the
-    FAILED run and a sanitized error) — the spine owns them.
+    Provider-I/O failures never raise: they become durable run history
+    (``AskOutcome`` carrying the FAILED run and a sanitized error) — the
+    spine owns them.
 
     P4.2 pre-provider seam (frozen plan D14): when ``pre_provider`` is
     supplied, it is invoked INSIDE Tx1 after the run row and the
@@ -129,9 +130,9 @@ async def run_ask(
     same ``BEGIN IMMEDIATE`` transaction (the delivery binding marker). The
     hook may raise to VETO: the exception propagates through the transaction
     context — atomic rollback, nothing persisted, typed refusal at the
-    caller. Hook exceptions are CALLER-authored refusals; they never become
-    run history. Default ``None`` keeps this spine byte-identical for every
-    existing caller.
+    caller. Hook exceptions are CALLER-authored refusals and intentionally
+    may propagate; they never become run history. Default ``None`` keeps
+    this spine byte-identical for every existing caller.
     """
     run = Run(
         agent=agent_name or agent.name,

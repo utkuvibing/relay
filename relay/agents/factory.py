@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from relay.agents.config import resolve_settings
-from relay.agents.registry import build_agent
-from relay.context.config import RelayConfig, agent_config
+from relay.agents.registry import UnknownAgentError, build_agent
+from relay.context.config import AgentConfig, ConfigError, RelayConfig, agent_config
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from relay.agents.base import Agent
@@ -28,11 +28,14 @@ __all__ = ["RegistryAgentFactory"]
 class RegistryAgentFactory:
     """Build configured logical agents by name; report their requested model.
 
-    Unknown names fail typed with :class:`~relay.context.config.ConfigError`
-    (naming the configured agents), mirroring every other config lookup.
-    Harness adapters are constructed with their non-secret profile; no
-    process spawns and no executable is probed at build time (G0/R1
-    executability runs later, inside the adapter's ``run``).
+    Every refusal is normalized to :class:`~relay.context.config.ConfigError`
+    (the factory-neutral, config-level typed error): unknown logical agent
+    names, unknown adapter names, and backend-family mismatches all surface
+    as ``ConfigError`` naming the offending configuration — the factory never
+    leaks registry vocabulary to its consumers. Harness adapters are
+    constructed with their non-secret profile; no process spawns and no
+    executable is probed at build time (G0/R1 executability runs later,
+    inside the adapter's ``run``).
     """
 
     def __init__(self, config: RelayConfig, workspace_root: str | Path | None = None) -> None:
@@ -45,7 +48,13 @@ class RegistryAgentFactory:
 
     def build(self, name: str) -> Agent:
         cfg, settings = self._settings_for(name)
-        return build_agent(name, settings, cfg, workspace_root=self._workspace_root)
+        try:
+            return build_agent(name, settings, cfg, workspace_root=self._workspace_root)
+        except UnknownAgentError as exc:
+            # Normalize registry vocabulary (unknown adapter names) into the
+            # factory-neutral config-level error — consumers of the
+            # AgentFactory seam never need to know the registry exists.
+            raise ConfigError(str(exc)) from exc
 
     def model_of(self, name: str) -> str | None:
         _, settings = self._settings_for(name)

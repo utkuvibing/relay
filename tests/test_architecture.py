@@ -161,6 +161,46 @@ class TestAgentLayerTransportNeutrality:
         assert artifact.kind is ArtifactKind.RUN_OUTPUT
 
 
+class TestCoreNeverImportsTheRegistry:
+    """P4.2 (frozen plan D6, pre-merge fix): core consumes agents only
+    through the :class:`~relay.core.agent_factory.AgentFactory` seam.
+
+    The adapter registry — and the transports it drags in — must never be
+    imported by any ``relay/core`` module, including LAZY imports nested
+    inside function bodies (``ast.walk`` sees the whole tree, so a lazy
+    ``from relay.agents.registry import …`` cannot hide). The production
+    factory lives in ``relay/agents/factory.py``: that agents-package side
+    is the ONLY registry-touching component of the delivery path.
+    """
+
+    def test_no_core_module_imports_the_registry(self):
+        offenders: list[tuple[str, str]] = []
+        for module_path in _py_files(RELAY_ROOT / "core"):
+            tree = ast.parse(module_path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name == "relay.agents.registry" or alias.name.startswith(
+                            "relay.agents.registry."
+                        ):
+                            offenders.append((module_path.name, alias.name))
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    module = node.module or ""
+                    if module == "relay.agents.registry" or module.startswith(
+                        "relay.agents.registry."
+                    ):
+                        offenders.append((module_path.name, module))
+                    elif module == "relay.agents":
+                        for alias in node.names:
+                            if alias.name == "registry":
+                                offenders.append((module_path.name, "relay.agents.registry"))
+        assert not offenders, f"relay/core imports the adapter registry: {offenders}"
+
+    def test_the_sweep_actually_parses_core(self):
+        """Guard against a silent rename emptying the boundary sweep."""
+        assert len(_py_files(RELAY_ROOT / "core")) >= 10
+
+
 class TestConversationBusAuthorityBoundary:
     """P4.1 App. D.8 — conversation is coordination input, never state authority.
 

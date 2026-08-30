@@ -75,3 +75,18 @@ class TestRegistryAgentFactory:
             factory.build("missing")
         with pytest.raises(ConfigError, match="unknown agent 'missing'"):
             factory.model_of("missing")
+
+    def test_unknown_adapter_name_is_normalized_to_config_error(self):
+        """Frozen plan D6: the factory never leaks registry vocabulary — an
+        unknown ADAPTER name (registry-side refusal) surfaces as ConfigError
+        like every other factory refusal, so core consumers need no registry
+        error types."""
+        config = _config(
+            agents={
+                "fut": AgentConfig(backend=BackendType.HARNESS, adapter="future_cli"),
+            }
+        )
+        factory = RegistryAgentFactory(config)
+        with pytest.raises(ConfigError, match="future_cli") as exc_info:
+            factory.build("fut")
+        assert type(exc_info.value) is ConfigError  # not UnknownAgentError
