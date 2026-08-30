@@ -299,6 +299,11 @@ class EventType(str, enum.Enum):
     DECISION_PROPOSED = "decision_proposed"
     DECISION_ACCEPTED = "decision_accepted"
     DECISION_REJECTED = "decision_rejected"
+    #: P4.2 (frozen plan D10): delivery BINDING marker — Relay bound a
+    #: persisted Message to a concrete recipient Run. Committed atomically in
+    #: the delivery run's pre-provider Tx1; retained for failed runs (the
+    #: outcome lives on the Run row + AGENT_RUN_FINISHED).
+    MESSAGE_DELIVERED = "message_delivered"
 
 
 class EvidenceRecord(BaseModel):

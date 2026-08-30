@@ -188,7 +188,17 @@ class TestConversationBusAuthorityBoundary:
         )
 
     def test_bus_and_feed_import_no_canonical_authority_modules(self):
-        modules = [RELAY_ROOT / "core" / "bus.py", RELAY_ROOT / "core" / "room_feed.py"]
+        """P4.2: the conversation layer (bus, feed, delivery, resolver) is
+        covered — delivery consumes the crash-safe spine via
+        ``relay.core.orchestrator``; orchestration plumbing arrives
+        transitively, exactly like storage plumbing for the bus."""
+        modules = [
+            RELAY_ROOT / "core" / "bus.py",
+            RELAY_ROOT / "core" / "room_feed.py",
+            RELAY_ROOT / "core" / "delivery.py",
+            RELAY_ROOT / "core" / "resolver.py",
+            RELAY_ROOT / "core" / "agent_factory.py",
+        ]
         assert all(path.exists() for path in modules), "guard against silent renames"
         for module_path in modules:
             tree = ast.parse(module_path.read_text(encoding="utf-8"))
