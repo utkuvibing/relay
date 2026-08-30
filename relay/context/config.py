@@ -12,7 +12,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from relay.agents.base import BackendType
+from relay.agents.base import AgentRole, BackendType
 from relay.harness.types import ExecutionGrantKind
 
 DEFAULT_AGENT_NAME = "gpt"
@@ -107,6 +107,12 @@ class RelayConfig(BaseModel):
     reviewer: str | None = None
     #: P3.3 (frozen plan Q-e): completion policy. Gated is the default.
     approval: ApprovalPolicyConfig | None = None
+    #: P4.2 (frozen plan D4/D5): conversation-bus role vocabulary — an
+    #: ``AgentRole`` value mapped to a configured agent name. Fully DECOUPLED
+    #: from the P3.3 ``reviewer:`` build-flow selector: no fallback in either
+    #: direction and no conflict validation; each is the sole source of truth
+    #: for its own workflow.
+    roles: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _reviewer_must_be_configured(self) -> RelayConfig:
@@ -115,6 +121,22 @@ class RelayConfig(BaseModel):
                 f"reviewer '{self.reviewer}' is not a configured agent — "
                 "add it under 'agents:' first"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _roles_are_valid_agent_bindings(self) -> RelayConfig:
+        known_roles = ", ".join(member.value for member in AgentRole)
+        for role, agent in self.roles.items():
+            if role not in {member.value for member in AgentRole}:
+                raise ValueError(
+                    f"roles: '{role}' is not a valid role address — "
+                    f"known roles: {known_roles}"
+                )
+            if agent not in self.agents:
+                raise ValueError(
+                    f"roles: role '{role}' targets agent '{agent}', which is "
+                    "not configured under 'agents:'"
+                )
         return self
 
 

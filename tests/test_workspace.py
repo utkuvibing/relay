@@ -187,6 +187,56 @@ class TestRelayYamlConfig:
         with pytest.raises(ConfigError, match="relay.yaml"):
             load_config(tmp_path)
 
+    def test_roles_block_maps_roles_to_configured_agents(self, tmp_path):
+        """P4.2 (frozen plan D4/D5): roles: is the bus role vocabulary —
+        AgentRole-valued keys mapping to configured agent names."""
+        (tmp_path / "relay.yaml").write_text(
+            "agents:\n"
+            "  gpt: {backend: api, adapter: openai}\n"
+            "  claude: {backend: harness, adapter: claude_code}\n"
+            "roles:\n"
+            "  planner: gpt\n"
+            "  reviewer: claude\n",
+            encoding="utf-8",
+        )
+        config = load_config(tmp_path)
+        assert config.roles == {"planner": "gpt", "reviewer": "claude"}
+
+    @pytest.mark.parametrize("block", ["bogus_role: gpt\n", "Planner: gpt\n"])
+    def test_roles_with_unknown_role_address_is_a_config_error(self, tmp_path, block):
+        (tmp_path / "relay.yaml").write_text(
+            "agents:\n  gpt: {backend: api, adapter: openai}\nroles:\n  " + block,
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="not a valid role address"):
+            load_config(tmp_path)
+
+    def test_roles_targeting_unconfigured_agent_is_a_config_error(self, tmp_path):
+        (tmp_path / "relay.yaml").write_text(
+            "agents:\n  gpt: {backend: api, adapter: openai}\n"
+            "roles:\n  planner: missing_agent\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="not configured under 'agents:'"):
+            load_config(tmp_path)
+
+    def test_roles_and_reviewer_selector_are_decoupled(self, tmp_path):
+        """P4.2 (frozen plan D4): no fallback, no conflict validation — a
+        roles.reviewer entry MAY target a different agent than the P3.3
+        build-flow ``reviewer:`` selector. Each governs its own workflow."""
+        (tmp_path / "relay.yaml").write_text(
+            "agents:\n"
+            "  gpt: {backend: api, adapter: openai}\n"
+            "  claude: {backend: harness, adapter: claude_code}\n"
+            "roles:\n"
+            "  reviewer: claude\n"
+            "reviewer: gpt\n",
+            encoding="utf-8",
+        )
+        config = load_config(tmp_path)
+        assert config.roles["reviewer"] == "claude"  # bus vocabulary
+        assert config.reviewer == "gpt"  # P3.3 build-flow selector
+
     def test_config_never_holds_secrets(self, tmp_path):
         (tmp_path / "relay.yaml").write_text(
             "agents:\n  gpt-api: {backend: api, adapter: openai}\n", encoding="utf-8"
