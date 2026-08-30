@@ -37,8 +37,33 @@ relay why 18
 
 Runs are persisted crash-safely: the prompt lands as a `run_input` artifact
 before any provider call, so it survives failures by construction
-(SPEC App. B.1). Secrets live only in the environment (`OPENAI_API_KEY`);
+(SPEC App. B.1). Secrets live only in the environment (`OPENAI_API_KEY` or
+`DEEPSEEK_API_KEY`);
 `relay status` reports "configured / not configured" and nothing more.
+
+### DeepSeek BYOK (temporary local setup)
+
+Relay's API adapter speaks the OpenAI-compatible Chat Completions protocol, so
+DeepSeek only needs a provider-specific base URL and model. The local
+`relay.yaml` already contains a `deepseek` agent. Put your key in the ignored
+`.env` file:
+
+```dotenv
+DEEPSEEK_API_KEY=your-key-here
+RELAY_API_KEY_ENV=DEEPSEEK_API_KEY
+```
+
+Run Relay with that file loaded:
+
+```bash
+uv run --env-file .env relay status
+uv run --env-file .env relay ask deepseek "Reply with exactly: DEEPSEEK_OK"
+```
+
+The adapter targets `https://api.deepseek.com/chat/completions`; see the
+[official DeepSeek API documentation](https://api-docs.deepseek.com/) for the
+provider's current models and request details. Never put the actual key in
+`relay.yaml`, source code, or a commit.
 
 ## Development
 

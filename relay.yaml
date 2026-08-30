@@ -1,0 +1,17 @@
+# Relay configuration - non-secret provider facts only (SPEC App. B.3).
+# API keys come from the environment; never put them in this file.
+agents:
+  codex:
+    backend: harness
+    adapter: codex_cli
+    model: gpt-5.6-luna
+    harness:
+      extra_args:
+        - --ignore-user-config
+      grant: read_only
+      timeout_seconds: 120
+  deepseek:
+    backend: api
+    adapter: openai_compatible
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com
