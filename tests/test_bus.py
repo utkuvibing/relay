@@ -49,7 +49,7 @@ def _authorship_runs(store):
 
 
 class StaticResolver:
-    """Deterministic fake resolver (the registry-backed one arrives P4.2)."""
+    """Deterministic fake resolver (the production one: relay.core.resolver)."""
 
     def __init__(self, roles=None, agents=()):
         self._roles = dict(roles or {})
