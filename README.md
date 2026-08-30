@@ -1,75 +1,195 @@
 # Relay
 
-**General-purpose AI collaboration runtime** — a local-first coordination layer between AI models, coding agents, tools, and humans.
+Local-first orchestration for AI models, coding agents, tools, and people.
 
-Relay is not a model. Relay is the layer that:
+Relay runs configured agents, keeps run and task state in SQLite, and puts
+verification and approval outside the model's response. It is a runtime, not
+another model provider.
 
-- owns **state** (LLMs never own workflow state),
-- carries **context** between agents,
-- routes **messages** on a conversation bus,
-- enforces **permissions** and human approval gates,
-- persists every **run**, message, artifact, and decision,
-- refuses to close a task until verification gates pass.
+## What works today
+
+| Capability | Status | Details |
+|---|---|---|
+| Single-agent API runs | Available | `relay ask` runs one configured API or harness agent and persists its input and output. |
+| Codex OAuth | Available | The `codex` harness uses the Codex CLI's own account authentication. |
+| DeepSeek BYOK | Available | The `deepseek` agent uses DeepSeek's OpenAI-compatible Chat Completions API. |
+| Task execution | Available | `relay build` drives a task through evidence-gated context, plan, implementation, verification, review, and approval steps. |
+| Run and task inspection | Available | `relay status`, `relay history`, and `relay inspect` read the local ledger. |
+| Conversation bus core | In progress | P4.1 adds typed, addressed, append-only messages and a Room-feed read model. |
+| Automatic agent-to-agent delivery | Not yet | P4.2 through P4.4 still need routing, reply pairing, and the bounded multi-agent driver. |
+| `relay discuss` and persistent Rooms | Planned | These belong to P5 and P7. The commands are not implemented yet. |
+
+The important boundary is simple: calling two agents separately does not make
+them talk. Each call is its own run. Relay will coordinate model-to-model
+messages through the P4 bus and P5 discussion protocols once those phases land.
+
+## Quick start
+
+Relay requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-relay init
-relay ask gpt "Analyze this repository"
-relay status
-relay history
-relay discuss "Should this service use Redis?"
-relay build "Add authentication"
-relay review
-relay why 18
+uv sync --extra dev
+uv run relay init
+uv run relay status
 ```
 
-## Status
+The checked-in `relay.yaml` contains the project agents. `relay init` creates
+the local `.relay/` profile and SQLite database without overwriting an existing
+configuration.
 
-🚧 In development — see [docs/SPEC.md](docs/SPEC.md) for the full specification.
+## Run Codex with OAuth
 
-| Phase | Scope | State |
-|---|---|---|
-| P0 | Specification freeze — core abstractions in code | ✅ hardened |
-| P1 | Single-agent runtime (`relay init`, `relay ask`, SQLite) — first **API-backed** runtime (OpenAI-compatible HTTP) per SPEC App. B.4; harness-backed agents arrive in Phase 2 | ✅ |
-| P2 | **Generic harness runtime** (SPEC §27 Phase 2 + App. C): P2.1 ✅ process runtime + conformance suite (G0–G3); P2.2 ✅ Codex CLI reference adapter + `relay build` (G2); P2.3 ✅ Claude Code adapter (safe-mode tool allowlists); P2.4 ✅ Antigravity CLI adapter (read-only plan-mode grants; write tier pending a vendor clamp flag) | 🔶 |
-| P3 | **Deterministic task state machine** (SPEC §27 Phase 3 + App. A): P3.1 ✅ lifecycle wired into `relay build` (context → plan → implement, every edge evidence-gated); P3.2 ✅ Relay-scoped verification runner (exit code is the only verdict); P3.3 ✅ review + approval closure (`relay approve`, gated default + A.3 direct path); P3.4 ✅ task observability (`relay status` machine position + evidence gaps, `relay inspect <task>` ledger) | ✅ |
-| P4 | **Multi-agent messaging** (SPEC §27 Phase 4 + App. D): P4.1 ✅ conversation bus core — typed/addressed message ledger (D.5 vocabulary + blocking metadata), append-only `messages` at both enforcement layers, schema v3, Room feed read-model (D.8 invariant proven structurally + behaviorally); P4.2 role/logical-agent resolution + delivery; P4.3 blocking reply pairing + bounded round-trips; P4.4 bounded multi-agent driver + heterogeneous api→harness→different-harness exit gate | 🔶 |
-| P5+ | Discussion protocols (communication policy & budgets) → semantic execution loop with plan-freeze gate → persistent Rooms ("AI group chat" model) — see SPEC §27 roadmap + Appendix D | ⬜ |
+Authenticate the Codex CLI once with its own account flow, then run it through
+Relay:
 
-Runs are persisted crash-safely: the prompt lands as a `run_input` artifact
-before any provider call, so it survives failures by construction
-(SPEC App. B.1). Secrets live only in the environment (`OPENAI_API_KEY` or
-`DEEPSEEK_API_KEY`);
-`relay status` reports "configured / not configured" and nothing more.
+```bash
+codex login
+uv run relay ask codex "Reply with exactly: RELAY_OAUTH_OK"
+```
 
-### DeepSeek BYOK (temporary local setup)
+Relay does not read or store the Codex subscription session. The harness owns
+that authentication.
 
-Relay's API adapter speaks the OpenAI-compatible Chat Completions protocol, so
-DeepSeek only needs a provider-specific base URL and model. The local
-`relay.yaml` already contains a `deepseek` agent. Put your key in the ignored
-`.env` file:
+## Run DeepSeek with BYOK
+
+DeepSeek uses the same wire format as the OpenAI Chat Completions API. The
+provider is still DeepSeek. No OpenAI account or OpenAI key is involved.
+
+Create or edit the local, gitignored `.env` file:
 
 ```dotenv
 DEEPSEEK_API_KEY=your-key-here
 RELAY_API_KEY_ENV=DEEPSEEK_API_KEY
 ```
 
-Run Relay with that file loaded:
+Then load that file explicitly when invoking Relay:
 
 ```bash
 uv run --env-file .env relay status
 uv run --env-file .env relay ask deepseek "Reply with exactly: DEEPSEEK_OK"
 ```
 
-The adapter targets `https://api.deepseek.com/chat/completions`; see the
-[official DeepSeek API documentation](https://api-docs.deepseek.com/) for the
-provider's current models and request details. Never put the actual key in
-`relay.yaml`, source code, or a commit.
+The project configuration keeps provider facts only:
+
+```yaml
+agents:
+  deepseek:
+    backend: api
+    adapter: openai_compatible
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com
+```
+
+The adapter appends `/chat/completions` to `base_url` and sends the key as a
+Bearer token. The key stays in the environment and never enters `relay.yaml`,
+source code, or Relay history. See the [official DeepSeek API documentation](https://api-docs.deepseek.com/)
+for the current request format and model list.
+
+## How a run is recorded
+
+`relay ask` follows one agent from request to result:
+
+```text
+CLI command
+    -> configured agent
+    -> API adapter or harness adapter
+    -> SQLite run, artifacts, and lifecycle events
+```
+
+Relay writes the prompt as a `run_input` artifact before the provider call. A
+successful response becomes a `run_output` artifact. Failures are persisted as
+sanitized run errors.
+
+`relay build` adds a task state machine around harness execution. The model can
+report that it is done, but Relay only advances the task when the required
+evidence, verification, review, and human approval records exist.
+
+## Agents and adapters
+
+The adapter name selects an execution implementation. The logical name under
+`agents:` selects the configured agent you use from the CLI.
+
+| Execution family | Implemented adapters | Authentication |
+|---|---|---|
+| API | `openai`, `openai_compatible`, `gpt` | Environment-provided key |
+| Harness | `codex_cli`, `claude_code`, `antigravity_cli` | The harness owns its login or session |
+
+This separation lets an API agent such as DeepSeek and a harness agent such as
+Codex share Relay's run and task records without pretending they use the same
+transport or billing model.
+
+## Roadmap
+
+Statuses describe the repository, not a promised release date.
+
+| Phase | Scope | Status |
+|---|---|---|
+| P0 | Specification freeze and core contracts | Done |
+| P1 | Single-agent runtime, API adapter, SQLite persistence | Done |
+| P2 | Generic harness runtime, process isolation, Codex/Claude/Antigravity adapters | In progress |
+| P3 | Deterministic task state machine, verification, review, approval, and observability | Done |
+| P4 | Multi-agent messaging and heterogeneous delivery | In progress: P4.1 bus core done; P4.2-P4.4 remain |
+| P5 | Bounded discussion protocols, communication policy, and budgets | Planned |
+| P6 | Automated implementation review and fix loop | Planned |
+| P7 | Persistent Rooms and long-lived participant context | Planned |
+| P8 | Decision provenance | Planned |
+| P9 | Relay server | Planned |
+| P10 | MCP and chat interface integration | Planned |
+| P11 | Adapter ecosystem and certification | Planned |
+| P12 | TUI | Planned |
+
+### What P4 means
+
+P4 is split into four concrete slices:
+
+1. P4.1, the conversation bus core: typed and addressed messages, append-only
+   storage, and a deterministic Room-feed read model.
+2. P4.2, role and logical-agent resolution plus Relay-mediated delivery.
+3. P4.3, reply pairing, blocking replies, and bounded round trips.
+4. P4.4, a bounded multi-agent driver with API-to-harness-to-harness coverage.
+
+P4.1 gives Relay somewhere safe to store conversation traffic. It does not yet
+dispatch a prompt to two models or feed one model's answer to another. P5 adds
+the rules that decide who may speak to whom, for what purpose, and how many
+rounds are allowed. P7 turns that machinery into a persistent group-chat
+experience.
 
 ## Development
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
+Install the development dependencies and run the test suite:
 
 ```bash
 uv sync --extra dev
 uv run pytest
+uv run ruff check relay tests
 ```
+
+The full specification and design decisions live in
+[`docs/SPEC.md`](docs/SPEC.md). P4.1 implementation notes are in
+[`docs/plans/p4.1-conversation-bus-core-plan.md`](docs/plans/p4.1-conversation-bus-core-plan.md).
+
+## Project layout
+
+```text
+relay/
+  agents/       API and harness adapters
+  cli/          Typer commands and terminal rendering
+  context/      Configuration and workspace discovery
+  core/         Orchestration, state machine, and conversation bus
+  harness/      Process runtime, grants, and sanitization
+  storage/      SQLite schema, models, events, and stores
+tests/          Unit, integration, conformance, and persistence tests
+docs/           Specification, roadmap amendments, and research notes
+```
+
+## Security rules
+
+- Keep API keys in environment variables or an ignored local `.env` file.
+- Keep `relay.yaml` limited to non-secret provider facts.
+- Let harnesses own their subscription authentication.
+- Treat model claims as evidence candidates. Relay's state machine and
+  permission gates make the actual transition decisions.
+
+## License
+
+MIT
