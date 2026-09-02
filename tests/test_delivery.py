@@ -6,6 +6,7 @@ decisions D7–D15. SPEC reference: §27 Phase 4; App. D.8/D.11-P4, C.7-P4.
 """
 
 import asyncio
+import sqlite3
 from typing import ClassVar
 
 import pytest
@@ -23,6 +24,7 @@ from relay.context.config import ConfigError, HarnessAgentConfig
 from relay.core.delivery import (
     DELIVERY_SENDER,
     DeliveryOutcome,
+    DeliveryPendingRefusal,
     DeliveryRefusal,
     DeliveryReplyOutcome,
     DuplicateDeliveryRefusal,
@@ -44,6 +46,7 @@ from relay.storage.models import (
     Artifact,
     ArtifactKind,
     Decision,
+    EventLogEntry,
     EventType,
     EvidenceRecord,
     Message,
@@ -883,61 +886,139 @@ class TestDeliverAndReply:
         assert agent.calls == 1  # No re-invocation!
         assert store.counts() == baseline  # Zero store delta!
 
-    async def test_concurrent_deliver_and_reply_materialization_uniqueness(
-        self, tmp_path
+    async def test_deliver_and_reply_running_run_raises_delivery_pending_refusal(
+        self, store, writer, scope, api_agent
     ):
+        parent = store.save_model(
+            _message(recipient="fixer", type=MessageType.CLARIFICATION_REQUEST)
+        )
+        running_run = store.save_model(
+            Run(agent="fixer", role="participant", status=RunStatus.RUNNING)
+        )
+        writer.record(
+            EventLogEntry(
+                room_id=parent.room_id,
+                task_id=parent.task_id,
+                sender="relay:delivery",
+                type=EventType.MESSAGE_DELIVERED,
+                content=f"message '{parent.id}' bound to run '{running_run.id}'",
+                references=[f"message:{parent.id}", f"run:{running_run.id}"],
+            )
+        )
+        delivery = MessageDelivery(store, writer, FakeFactory({"fixer": api_agent}))
+        baseline = store.counts()
+
+        with pytest.raises(DeliveryPendingRefusal, match="still in progress or incomplete"):
+            await delivery.deliver_and_reply(parent.id)
+
+        # Agent never re-invoked
+        assert len(api_agent.received) == 0
+        # Zero store delta
+        assert store.counts() == baseline
+        # No fake failure error produced or recorded
+        finished_events = [
+            e for e in writer.all() if e.type is EventType.AGENT_RUN_FINISHED
+        ]
+        assert len(finished_events) == 0
+
+    def test_concurrent_deliver_and_reply_materialization_uniqueness(self, tmp_path):
+        """Real concurrent two-connection test using threads and Barrier synchronization.
+
+        Proves:
+        - Both threads attempt materialization simultaneously on independent SQLite connections.
+        - Exactly one reply row is persisted.
+        - Both callers return the same persisted reply ID.
+        - The uniqueness IntegrityError -> reload winner path is genuinely exercised.
+        - Agents/providers are never re-invoked during recovery.
+        """
+        import concurrent.futures
+        import threading
+
         db_path = tmp_path / "race_reply.sqlite3"
-        conn_a = connect(db_path)
-        migrate(conn_a)
-        conn_b = connect(db_path)
-        migrate(conn_b)
+        init_conn = connect(db_path)
+        migrate(init_conn)
+        init_store = SqliteRelayStore(init_conn)
+        init_writer = EventLogWriter(init_conn)
+        init_store.save_model(Room(id="room-1", name="race-room"))
+        author_run = init_store.save_model(Run(agent="claude", role="reviewer"))
+        saved = init_store.save_model(
+            Message(
+                sender="claude",
+                recipient="fixer",
+                room_id="room-1",
+                run_id=author_run.id,
+                type=MessageType.CLARIFICATION_REQUEST,
+                content="question",
+            )
+        )
 
-        try:
-            store_a, store_b = SqliteRelayStore(conn_a), SqliteRelayStore(conn_b)
-            writer_a, writer_b = EventLogWriter(conn_a), EventLogWriter(conn_b)
-            store_a.save_model(Room(id="room-1", name="race-room"))
-            author_run = store_a.save_model(Run(agent="claude", role="reviewer"))
-            saved = store_a.save_model(
-                _message(
-                    sender="claude",
-                    recipient="fixer",
-                    run_id=author_run.id,
-                    type=MessageType.CLARIFICATION_REQUEST,
+        init_agent = RecordingAPIAgent()
+        init_delivery = MessageDelivery(init_store, init_writer, FakeFactory({"fixer": init_agent}))
+        outcome_init = asyncio.run(init_delivery.deliver(saved.id))
+        assert outcome_init.ask.run.status is RunStatus.SUCCEEDED
+        assert len(init_delivery._bus.replies_for(saved.id)) == 0
+        init_conn.close()
+
+        barrier = threading.Barrier(2)
+        integrity_errors_caught: list[tuple[int, str]] = []
+
+        def worker(worker_id: int):
+            worker_conn = connect(db_path)
+            try:
+                worker_store = SqliteRelayStore(worker_conn)
+                worker_writer = EventLogWriter(worker_conn)
+                worker_agent = RecordingAPIAgent()
+                worker_delivery = MessageDelivery(
+                    worker_store, worker_writer, FakeFactory({"fixer": worker_agent})
                 )
+
+                # Hook worker_delivery._bus.send so that both threads reach the
+                # materialization send point at the exact same moment.
+                orig_send = worker_delivery._bus.send
+
+                def synchronized_send(reply, **kwargs):
+                    barrier.wait(timeout=5)
+                    try:
+                        return orig_send(reply, **kwargs)
+                    except sqlite3.IntegrityError as exc:
+                        integrity_errors_caught.append((worker_id, type(exc).__name__))
+                        raise
+
+                worker_delivery._bus.send = synchronized_send
+
+                outcome = asyncio.run(worker_delivery.deliver_and_reply(saved.id))
+                return outcome, len(worker_agent.received)
+            finally:
+                worker_conn.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_a = executor.submit(worker, 1)
+            future_b = executor.submit(worker, 2)
+            outcome_a, agent_calls_a = future_a.result(timeout=10)
+            outcome_b, agent_calls_b = future_b.result(timeout=10)
+
+        # Exactly one reply row is persisted in the database
+        verify_conn = connect(db_path)
+        try:
+            verify_store = SqliteRelayStore(verify_conn)
+            replies = list(
+                verify_store.all_models(Message, "WHERE reply_to_id = ?", [saved.id])
             )
-
-            fake_a, fake_b = RecordingAPIAgent(), RecordingAPIAgent()
-            delivery_a = MessageDelivery(store_a, writer_a, FakeFactory({"fixer": fake_a}))
-            delivery_b = MessageDelivery(store_b, writer_b, FakeFactory({"fixer": fake_b}))
-
-            # Initial delivery run succeeded (simulates crash window before reply materialization)
-            outcome1 = await delivery_a.deliver(saved.id)
-            assert outcome1.ask.run.status is RunStatus.SUCCEEDED
-            assert len(delivery_a._bus.replies_for(saved.id)) == 0
-
-            # Both connections race deliver_and_reply concurrently for the same (parent, delivery_run)
-            outcomes = await asyncio.gather(
-                delivery_a.deliver_and_reply(saved.id),
-                delivery_b.deliver_and_reply(saved.id),
-            )
-
-            outcome_a, outcome_b = outcomes
-            assert outcome_a.reply is not None
-            assert outcome_b.reply is not None
-            # Both callers resolve to the exact same persisted winner
-            assert outcome_a.reply.id == outcome_b.reply.id
-            assert outcome_a.reply.content == "api reply"
-
-            # Exactly one reply message exists in the store
-            replies_a = delivery_a._bus.replies_for(saved.id)
-            replies_b = delivery_b._bus.replies_for(saved.id)
-            assert len(replies_a) == 1
-            assert len(replies_b) == 1
-            assert replies_a[0].id == outcome_a.reply.id
-
-            # Fake agents were never called again during reply recovery
-            assert len(fake_a.received) == 1
-            assert len(fake_b.received) == 0
+            assert len(replies) == 1
         finally:
-            conn_a.close()
-            conn_b.close()
+            verify_conn.close()
+
+        # Both callers return the same persisted reply ID
+        assert outcome_a.reply is not None
+        assert outcome_b.reply is not None
+        assert outcome_a.reply.id == outcome_b.reply.id
+        assert outcome_a.reply.id == replies[0].id
+        assert outcome_a.reply.content == "api reply"
+
+        # The uniqueness IntegrityError -> reload winner path was genuinely exercised by one worker
+        assert len(integrity_errors_caught) == 1
+        assert integrity_errors_caught[0][1] == "IntegrityError"
+
+        # Neither worker re-invoked the agent during recovery
+        assert agent_calls_a == 0
+        assert agent_calls_b == 0

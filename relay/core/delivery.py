@@ -73,6 +73,7 @@ from relay.storage.store import SqliteRelayStore
 __all__ = [
     "DELIVERY_SENDER",
     "DeliveryOutcome",
+    "DeliveryPendingRefusal",
     "DeliveryRefusal",
     "DeliveryReplyOutcome",
     "DuplicateDeliveryRefusal",
@@ -105,6 +106,10 @@ class DeliveryRefusal(RuntimeError):
 class DuplicateDeliveryRefusal(DeliveryRefusal):
     """At-most-once initiation (frozen plan D13): this Message is already
     bound to a Run; re-initiation is refused unconditionally in P4.2."""
+
+
+class DeliveryPendingRefusal(DeliveryRefusal):
+    """Delivery run is currently pending or incomplete; re-initiation is refused."""
 
 
 class InvalidReplyTypeRefusal(DeliveryRefusal, ValueError):
@@ -265,12 +270,22 @@ class MessageDelivery:
             if f"message:{message.id}" not in marker.references or f"run:{run.id}" not in marker.references:
                 raise DeliveryRefusal("corrupt causal provenance: marker references mismatch")
 
-            if run.status is not RunStatus.SUCCEEDED:
+            if run.status is RunStatus.RUNNING:
+                raise DeliveryPendingRefusal(
+                    f"delivery run '{run.id}' for message '{message.id}' is still in progress or incomplete"
+                )
+
+            if run.status is RunStatus.FAILED:
                 error = self._error_for_failed_run(run.id, run.agent)
                 return DeliveryReplyOutcome(
                     message=message,
                     ask=AskOutcome(run=run, error=error),
                     reply=None,
+                )
+
+            if run.status is not RunStatus.SUCCEEDED:
+                raise DeliveryRefusal(
+                    f"delivery run '{run.id}' in unhandled status '{run.status.value}'"
                 )
 
             output_artifacts = self._store.artifacts_for_run(run.id, kind=ArtifactKind.RUN_OUTPUT)
