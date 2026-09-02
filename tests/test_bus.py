@@ -779,3 +779,36 @@ class TestAnsweringQueries:
         )
         partial_chain = bus.reply_chain("child-of-orphan")
         assert [m.id for m in partial_chain] == ["orphan", "child-of-orphan"]
+
+    def test_reply_chain_genuine_two_node_cycle_terminates_safely(self, bus, store):
+        # Create raw A <-> B cycle in SQLite
+        store.conn.execute(
+            "INSERT INTO messages (id, sender, recipient, room_id, type, content, reply_to_id, created_at) "
+            "VALUES ('cycle-node-a', 'claude', 'codex', 'room-1', 'opinion', 'a', 'cycle-node-b', '2026-01-01T00:00:00+00:00')"
+        )
+        store.conn.execute(
+            "INSERT INTO messages (id, sender, recipient, room_id, type, content, reply_to_id, created_at) "
+            "VALUES ('cycle-node-b', 'codex', 'claude', 'room-1', 'opinion', 'b', 'cycle-node-a', '2026-01-01T00:00:01+00:00')"
+        )
+
+        chain_a = bus.reply_chain("cycle-node-a")
+        assert len(chain_a) == 2
+        assert [m.id for m in chain_a] == ["cycle-node-b", "cycle-node-a"]
+
+        chain_b = bus.reply_chain("cycle-node-b")
+        assert len(chain_b) == 2
+        assert [m.id for m in chain_b] == ["cycle-node-a", "cycle-node-b"]
+
+    def test_preflight_depth_on_genuine_two_node_cycle_raises_reply_rejected(self, bus, store):
+        store.conn.execute(
+            "INSERT INTO messages (id, sender, recipient, room_id, type, content, reply_to_id, created_at) "
+            "VALUES ('cycle-x', 'claude', 'codex', 'room-1', 'opinion', 'x', 'cycle-y', '2026-01-01T00:00:00+00:00')"
+        )
+        store.conn.execute(
+            "INSERT INTO messages (id, sender, recipient, room_id, type, content, reply_to_id, created_at) "
+            "VALUES ('cycle-y', 'codex', 'claude', 'room-1', 'opinion', 'y', 'cycle-x', '2026-01-01T00:00:01+00:00')"
+        )
+
+        parent = store.load_model(Message, "cycle-x")
+        with pytest.raises(ReplyRejected, match="corrupt/cyclic reply ancestry detected"):
+            bus.preflight_reply_depth(parent)

@@ -249,7 +249,18 @@ class ConversationBus:
                 f"reply sender {message.sender!r} must match parent recipient {parent.recipient!r}"
             )
 
-        self._calculate_thread_depth(parent, max_thread_depth)
+        self.preflight_reply_depth(parent, max_thread_depth=max_thread_depth)
+
+    def preflight_reply_depth(
+        self, parent: Message, max_thread_depth: int = DEFAULT_MAX_THREAD_DEPTH
+    ) -> int:
+        """Preflight depth check for a prospective reply to parent.
+
+        Raises ReplyRejected if ancestry has cycles or broken links.
+        Raises RoundTripLimitExceeded if prospective reply would exceed max_thread_depth.
+        Returns the prospective reply depth (>= 1).
+        """
+        return self._calculate_thread_depth(parent, max_thread_depth)
 
     def _calculate_thread_depth(self, parent: Message, max_thread_depth: int) -> int:
         """Traverse ancestry upwards with cycle and bound guards (P4.3 D12)."""

@@ -26,7 +26,9 @@ from relay.core.delivery import (
     DeliveryRefusal,
     DeliveryReplyOutcome,
     DuplicateDeliveryRefusal,
+    InvalidReplyTypeRefusal,
     MessageDelivery,
+    ThreadDepthRefusal,
 )
 from relay.core.evidence import EvidenceKind
 from relay.core.permissions import Action
@@ -122,7 +124,7 @@ def _authorship_runs(store):
     RecordingHarnessAgent.received_grants.clear()
     RecordingHarnessAgent.received_requests.clear()
     _RUN_IDS.clear()
-    for name in ("claude", "gpt"):
+    for name in ("claude", "gpt", "fixer"):
         _RUN_IDS[name] = store.save_model(Run(agent=name, role="reviewer")).id
     yield
     _RUN_IDS.clear()
@@ -180,9 +182,11 @@ def _message(**overrides) -> Message:
         "room_id": "room-1",
         "type": MessageType.NOTE,
         "content": "the shim is intentional",
-        "run_id": _RUN_IDS.get("claude"),
     }
     base.update(overrides)
+    sender = base["sender"]
+    if "run_id" not in overrides and isinstance(sender, str) and ":" not in sender:
+        base["run_id"] = _RUN_IDS.get(sender)
     return Message(**base)
 
 
@@ -698,7 +702,9 @@ class TestDeliverAndReply:
                 raise AgentError("provider exploded")
 
         failing_delivery = MessageDelivery(store, writer, FakeFactory({"fail": FailingAgent()}))
-        parent = store.save_model(_message(recipient="fail"))
+        parent = store.save_model(
+            _message(recipient="fail", type=MessageType.CLARIFICATION_REQUEST)
+        )
         outcome = await failing_delivery.deliver_and_reply(parent.id)
 
         assert outcome.ask.response is None
@@ -750,3 +756,188 @@ class TestDeliverAndReply:
         outcome = await delivery.deliver_and_reply(parent.id, reply_type=MessageType.OPINION)
         assert outcome.reply is not None
         assert outcome.reply.type == MessageType.OPINION
+
+    async def test_deliver_and_reply_preflight_invalid_reply_type_zero_invocation(
+        self, delivery, store, api_agent
+    ):
+        parent = store.save_model(_message(recipient="fixer", type=MessageType.PROPOSAL))
+        baseline = store.counts()
+
+        with pytest.raises(InvalidReplyTypeRefusal, match="explicit reply_type required"):
+            await delivery.deliver_and_reply(parent.id)
+
+        # Zero delta: no run, no artifacts, no markers, no messages
+        assert store.counts() == baseline
+        # Agent invocation count remains strictly 0
+        assert len(api_agent.received) == 0
+
+    async def test_deliver_and_reply_preflight_exhausted_thread_depth_zero_invocation(
+        self, delivery, store, api_agent
+    ):
+        m0 = delivery._bus.send(
+            _message(sender="claude", recipient="fixer", type=MessageType.CLARIFICATION_REQUEST)
+        )
+        m1 = delivery._bus.send(
+            _message(
+                sender="fixer",
+                recipient="claude",
+                reply_to_id=m0.id,
+                type=MessageType.CLARIFICATION_RESPONSE,
+            ),
+            max_thread_depth=3,
+        )
+        m2 = delivery._bus.send(
+            _message(
+                sender="claude",
+                recipient="fixer",
+                reply_to_id=m1.id,
+                type=MessageType.CLARIFICATION_REQUEST,
+            ),
+            max_thread_depth=3,
+        )
+        # Depth 3 reached
+        m3 = delivery._bus.send(
+            _message(
+                sender="fixer",
+                recipient="claude",
+                reply_to_id=m2.id,
+                type=MessageType.CLARIFICATION_RESPONSE,
+            ),
+            max_thread_depth=3,
+        )
+        # Parent message to fixer at depth 4
+        m_parent = delivery._bus.send(
+            _message(
+                sender="claude",
+                recipient="fixer",
+                reply_to_id=m3.id,
+                type=MessageType.CLARIFICATION_REQUEST,
+            ),
+            max_thread_depth=4,
+        )
+        baseline = store.counts()
+
+        with pytest.raises(ThreadDepthRefusal, match="exceeding the maximum thread depth ceiling"):
+            await delivery.deliver_and_reply(m_parent.id, max_thread_depth=3)
+
+        assert store.counts() == baseline
+        assert len(api_agent.received) == 0
+
+    async def test_deliver_and_reply_preflight_corrupt_ancestry_zero_invocation(
+        self, delivery, store, api_agent
+    ):
+        # Create raw cycle in SQLite
+        store.conn.execute(
+            "INSERT INTO messages (id, sender, recipient, room_id, type, content, reply_to_id, created_at) "
+            "VALUES ('cycle-a', 'claude', 'fixer', 'room-1', 'clarification_request', 'a', 'cycle-b', '2026-01-01T00:00:00+00:00')"
+        )
+        store.conn.execute(
+            "INSERT INTO messages (id, sender, recipient, room_id, type, content, reply_to_id, created_at) "
+            "VALUES ('cycle-b', 'fixer', 'claude', 'room-1', 'clarification_response', 'b', 'cycle-a', '2026-01-01T00:00:01+00:00')"
+        )
+        baseline = store.counts()
+
+        with pytest.raises(ThreadDepthRefusal, match="corrupt/cyclic reply ancestry detected"):
+            await delivery.deliver_and_reply("cycle-a")
+
+        assert store.counts() == baseline
+        assert len(api_agent.received) == 0
+
+    async def test_deliver_and_reply_failure_recovery_preserves_error_semantics(
+        self, store, writer, scope
+    ):
+        class ExplodingAgent(Agent):
+            name = "exploding"
+            backend = BackendType.API
+
+            def __init__(self):
+                self.calls = 0
+
+            async def run(self, request):
+                self.calls += 1
+                raise AgentError("simulated provider explosion")
+
+        agent = ExplodingAgent()
+        failing_delivery = MessageDelivery(store, writer, FakeFactory({"exploding": agent}))
+        parent = store.save_model(
+            _message(recipient="exploding", type=MessageType.CLARIFICATION_REQUEST)
+        )
+
+        # First call: delivery fails honestly
+        outcome1 = await failing_delivery.deliver_and_reply(parent.id)
+        assert outcome1.ask.response is None
+        assert outcome1.ask.error == "simulated provider explosion"
+        assert outcome1.reply is None
+        assert outcome1.ask.run.status is RunStatus.FAILED
+        assert agent.calls == 1
+
+        baseline = store.counts()
+
+        # Second/recovery call: returns same Run, no re-invocation, same failure semantics
+        outcome2 = await failing_delivery.deliver_and_reply(parent.id)
+        assert outcome2.ask.run.id == outcome1.ask.run.id
+        assert outcome2.ask.response is None
+        assert outcome2.ask.error == "simulated provider explosion"
+        assert outcome2.reply is None
+        assert outcome2.ask.run.status is RunStatus.FAILED
+        assert agent.calls == 1  # No re-invocation!
+        assert store.counts() == baseline  # Zero store delta!
+
+    async def test_concurrent_deliver_and_reply_materialization_uniqueness(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "race_reply.sqlite3"
+        conn_a = connect(db_path)
+        migrate(conn_a)
+        conn_b = connect(db_path)
+        migrate(conn_b)
+
+        try:
+            store_a, store_b = SqliteRelayStore(conn_a), SqliteRelayStore(conn_b)
+            writer_a, writer_b = EventLogWriter(conn_a), EventLogWriter(conn_b)
+            store_a.save_model(Room(id="room-1", name="race-room"))
+            author_run = store_a.save_model(Run(agent="claude", role="reviewer"))
+            saved = store_a.save_model(
+                _message(
+                    sender="claude",
+                    recipient="fixer",
+                    run_id=author_run.id,
+                    type=MessageType.CLARIFICATION_REQUEST,
+                )
+            )
+
+            fake_a, fake_b = RecordingAPIAgent(), RecordingAPIAgent()
+            delivery_a = MessageDelivery(store_a, writer_a, FakeFactory({"fixer": fake_a}))
+            delivery_b = MessageDelivery(store_b, writer_b, FakeFactory({"fixer": fake_b}))
+
+            # Initial delivery run succeeded (simulates crash window before reply materialization)
+            outcome1 = await delivery_a.deliver(saved.id)
+            assert outcome1.ask.run.status is RunStatus.SUCCEEDED
+            assert len(delivery_a._bus.replies_for(saved.id)) == 0
+
+            # Both connections race deliver_and_reply concurrently for the same (parent, delivery_run)
+            outcomes = await asyncio.gather(
+                delivery_a.deliver_and_reply(saved.id),
+                delivery_b.deliver_and_reply(saved.id),
+            )
+
+            outcome_a, outcome_b = outcomes
+            assert outcome_a.reply is not None
+            assert outcome_b.reply is not None
+            # Both callers resolve to the exact same persisted winner
+            assert outcome_a.reply.id == outcome_b.reply.id
+            assert outcome_a.reply.content == "api reply"
+
+            # Exactly one reply message exists in the store
+            replies_a = delivery_a._bus.replies_for(saved.id)
+            replies_b = delivery_b._bus.replies_for(saved.id)
+            assert len(replies_a) == 1
+            assert len(replies_b) == 1
+            assert replies_a[0].id == outcome_a.reply.id
+
+            # Fake agents were never called again during reply recovery
+            assert len(fake_a.received) == 1
+            assert len(fake_b.received) == 0
+        finally:
+            conn_a.close()
+            conn_b.close()

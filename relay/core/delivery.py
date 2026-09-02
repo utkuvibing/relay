@@ -45,12 +45,18 @@ state, evidence, approvals, or decisions. Proven structurally
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 from relay.agents.base import Agent, AgentRequest, AgentResponse, AgentRole
 from relay.core.agent_factory import AgentFactory
-from relay.core.bus import DEFAULT_MAX_THREAD_DEPTH, ConversationBus
+from relay.core.bus import (
+    DEFAULT_MAX_THREAD_DEPTH,
+    ConversationBus,
+    ReplyRejected,
+    RoundTripLimitExceeded,
+)
 from relay.core.orchestrator import AskOutcome, run_ask
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
@@ -70,7 +76,9 @@ __all__ = [
     "DeliveryRefusal",
     "DeliveryReplyOutcome",
     "DuplicateDeliveryRefusal",
+    "InvalidReplyTypeRefusal",
     "MessageDelivery",
+    "ThreadDepthRefusal",
 ]
 
 #: Producer convention (App. A.1): the delivery machinery is a relay:*
@@ -97,6 +105,14 @@ class DeliveryRefusal(RuntimeError):
 class DuplicateDeliveryRefusal(DeliveryRefusal):
     """At-most-once initiation (frozen plan D13): this Message is already
     bound to a Run; re-initiation is refused unconditionally in P4.2."""
+
+
+class InvalidReplyTypeRefusal(DeliveryRefusal, ValueError):
+    """Explicit reply_type required or invalid reply_type for delivery."""
+
+
+class ThreadDepthRefusal(DeliveryRefusal, RoundTripLimitExceeded):
+    """Prospective reply exceeds thread depth ceiling or has cyclic ancestry."""
 
 
 @dataclass(frozen=True)
@@ -201,7 +217,10 @@ class MessageDelivery:
 
         Enforces:
         - Parent message deliverability (bare logical-agent recipient).
-        - Reuses existing successful run if delivery already occurred (crash recovery).
+        - Preflight validation of prospective reply_type and thread depth / ancestry
+          BEFORE delivery initiation or provider execution.
+        - Reuses existing run if delivery already occurred (crash recovery for both
+          SUCCEEDED and FAILED runs, preserving sanitized failure error).
         - Dual provenance verification: run.agent == reply.sender AND causal
           MESSAGE_DELIVERED(message, run) binding.
         - Reconstructs full AskOutcome(run=run, response=recovered_response) on recovery.
@@ -218,6 +237,12 @@ class MessageDelivery:
                 f"message '{message_id}' has no deliverable recipient: "
                 f"{recipient!r} — recipients are bare logical-agent identities"
             )
+
+        # Preflight 1: resolve/validate prospective reply_type BEFORE delivery initiation
+        actual_reply_type = self._resolve_reply_type(message.type, reply_type)
+
+        # Preflight 2: validate prospective thread depth & cycle safety BEFORE delivery initiation
+        self._preflight_thread_depth(message, max_thread_depth)
 
         deliveries = self.deliveries_for_message(message_id)
         if deliveries:
@@ -241,9 +266,10 @@ class MessageDelivery:
                 raise DeliveryRefusal("corrupt causal provenance: marker references mismatch")
 
             if run.status is not RunStatus.SUCCEEDED:
+                error = self._error_for_failed_run(run.id, run.agent)
                 return DeliveryReplyOutcome(
                     message=message,
-                    ask=AskOutcome(run=run),
+                    ask=AskOutcome(run=run, error=error),
                     reply=None,
                 )
 
@@ -269,10 +295,7 @@ class MessageDelivery:
                     f"authorship violation: delivery run belongs to {run.agent!r}, not recipient {message.recipient!r}"
                 )
 
-            actual_reply_type = self._resolve_reply_type(message.type, reply_type)
             reply = self._build_reply(message, run, output_content, actual_reply_type)
-            import sqlite3
-
             try:
                 saved_reply = self._bus.send(reply, max_thread_depth=max_thread_depth)
             except sqlite3.IntegrityError:
@@ -294,10 +317,7 @@ class MessageDelivery:
                 f"authorship violation: delivery run belongs to {run.agent!r}, not recipient {message.recipient!r}"
             )
 
-        actual_reply_type = self._resolve_reply_type(message.type, reply_type)
         reply = self._build_reply(message, run, outcome.ask.response.output, actual_reply_type)
-        import sqlite3
-
         try:
             saved_reply = self._bus.send(reply, max_thread_depth=max_thread_depth)
         except sqlite3.IntegrityError:
@@ -308,13 +328,39 @@ class MessageDelivery:
 
         return DeliveryReplyOutcome(message=message, ask=outcome.ask, reply=saved_reply)
 
+    def _preflight_thread_depth(self, parent: Message, max_thread_depth: int) -> None:
+        try:
+            self._bus.preflight_reply_depth(parent, max_thread_depth=max_thread_depth)
+        except RoundTripLimitExceeded as exc:
+            raise ThreadDepthRefusal(str(exc)) from exc
+        except ReplyRejected as exc:
+            raise ThreadDepthRefusal(f"preflight thread ancestry check failed: {exc}") from exc
+
+    def _error_for_failed_run(self, run_id: str, agent_name: str) -> str:
+        """Extract the sanitized failure error from AGENT_RUN_FINISHED event."""
+        run_ref = f"run:{run_id}"
+        for entry in self._store.all_models(
+            EventLogEntry,
+            "WHERE type = ?",
+            [EventType.AGENT_RUN_FINISHED.value],
+            order_by="sequence DESC",
+        ):
+            if run_ref in entry.references:
+                prefix = f"agent '{agent_name}' failed: "
+                if entry.content.startswith(prefix):
+                    return entry.content[len(prefix):]
+                return entry.content
+        return "delivery run failed"
+
     @staticmethod
-    def _resolve_reply_type(parent_type: MessageType, reply_type: MessageType | None) -> MessageType:
+    def _resolve_reply_type(
+        parent_type: MessageType, reply_type: MessageType | None
+    ) -> MessageType:
         if reply_type is not None:
             return reply_type
         if parent_type is MessageType.CLARIFICATION_REQUEST:
             return MessageType.CLARIFICATION_RESPONSE
-        raise ValueError(
+        raise InvalidReplyTypeRefusal(
             f"explicit reply_type required when replying to message of type '{parent_type.value}'"
         )
 
