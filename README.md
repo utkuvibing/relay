@@ -16,7 +16,7 @@ another model provider.
 | Task execution | Available | `relay build` drives a task through evidence-gated context, plan, implementation, verification, review, and approval steps. |
 | Run and task inspection | Available | `relay status`, `relay history`, and `relay inspect` read the local ledger. |
 | Conversation bus core | In progress | P4.1 adds typed, addressed, append-only messages and a Room-feed read model. |
-| Automatic agent-to-agent delivery | Not yet | P4.2 through P4.4 still need routing, reply pairing, and the bounded multi-agent driver. |
+| Automatic agent-to-agent delivery | In progress | P4.2 role resolution and Relay-mediated delivery are done; P4.3 reply pairing and the P4.4 bounded multi-agent driver remain. |
 | `relay discuss` and persistent Rooms | Planned | These belong to P5 and P7. The commands are not implemented yet. |
 
 The important boundary is simple: calling two agents separately does not make
@@ -128,7 +128,7 @@ Statuses describe the repository, not a promised release date.
 | P1 | Single-agent runtime, API adapter, SQLite persistence | Done |
 | P2 | Generic harness runtime, process isolation, Codex/Claude/Antigravity adapters | In progress |
 | P3 | Deterministic task state machine, verification, review, approval, and observability | Done |
-| P4 | Multi-agent messaging and heterogeneous delivery | In progress: P4.1 bus core done; P4.2-P4.4 remain |
+| P4 | Multi-agent messaging and heterogeneous delivery | In progress: P4.1 bus core and P4.2 role resolution + delivery done; P4.3-P4.4 remain |
 | P5 | Bounded discussion protocols, communication policy, and budgets | Planned |
 | P6 | Automated implementation review and fix loop | Planned |
 | P7 | Persistent Rooms and long-lived participant context | Planned |
@@ -167,6 +167,8 @@ uv run ruff check relay tests
 The full specification and design decisions live in
 [`docs/SPEC.md`](docs/SPEC.md). P4.1 implementation notes are in
 [`docs/plans/p4.1-conversation-bus-core-plan.md`](docs/plans/p4.1-conversation-bus-core-plan.md).
+P4.2 implementation notes are in
+[`docs/plans/p4.2-role-resolution-delivery-plan.md`](docs/plans/p4.2-role-resolution-delivery-plan.md).
 
 ## Project layout
 

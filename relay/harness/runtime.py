@@ -27,6 +27,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from relay.agents.base import (
     Agent,
@@ -39,8 +40,14 @@ from relay.agents.base import (
 )
 from relay.agents.config import AgentSettings
 from relay.agents.errors import AgentError
-from relay.context.config import HarnessAgentConfig
 from relay.harness.capabilities import HarnessCapability, ensure
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # Lazy: keeps the context.config-first import order cycle-free
+    # (context.config → agents.base → agents/__init__ → registry → adapters
+    # → harness.runtime must not re-enter the partial context.config module).
+    from relay.context.config import HarnessAgentConfig
+
 from relay.harness.discovery import (
     ResolvedExecutable,
     describe_version,

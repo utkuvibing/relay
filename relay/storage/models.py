@@ -159,6 +159,15 @@ class Message(BaseModel):
         default=None,
         description="Original role address when the sender addressed a role; else None.",
     )
+    run_id: str | None = Field(
+        default=None,
+        description=(
+            "Authorship provenance (P4.2): the Run that authored this message. "
+            "Required for bare logical-agent senders, validated against "
+            "run.agent == sender at the bus boundary; forbidden for "
+            "human:/relay: senders."
+        ),
+    )
     room_id: str | None = None
     task_id: str | None = None
     type: MessageType
@@ -290,6 +299,11 @@ class EventType(str, enum.Enum):
     DECISION_PROPOSED = "decision_proposed"
     DECISION_ACCEPTED = "decision_accepted"
     DECISION_REJECTED = "decision_rejected"
+    #: P4.2 (frozen plan D10): delivery BINDING marker — Relay bound a
+    #: persisted Message to a concrete recipient Run. Committed atomically in
+    #: the delivery run's pre-provider Tx1; retained for failed runs (the
+    #: outcome lives on the Run row + AGENT_RUN_FINISHED).
+    MESSAGE_DELIVERED = "message_delivered"
 
 
 class EvidenceRecord(BaseModel):

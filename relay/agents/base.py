@@ -28,6 +28,9 @@ class AgentRole(str, enum.Enum):
     DOMAIN_EXPERT = "domain_expert"
     REPOSITORY_EXPERT = "repository_expert"
     MODERATOR = "moderator"
+    #: P4.2 (frozen plan D11): role of a direct-addressed (non-role-addressed)
+    #: conversation delivery — the recipient speaks as a room participant.
+    PARTICIPANT = "participant"
 
 
 class BackendType(str, enum.Enum):

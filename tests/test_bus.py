@@ -21,13 +21,35 @@ from relay.storage.models import (
     Message,
     MessageType,
     Room,
+    Run,
     Task,
 )
 from relay.storage.store import SqliteEvidenceStore, SqliteRelayStore
 
+#: P4.2 (frozen plan D1): bare logical-agent senders prove authorship via a
+#: real Run. This maps agent name → seeded run id for the senders used across
+#: this module; ``_message`` wires the matching ``run_id`` automatically.
+_RUN_IDS: dict[str, str] = {}
+
+
+def _seed_run(store, agent: str) -> str:
+    """Persist one authorship run; tests addressing unusual senders call this."""
+    return store.save_model(Run(agent=agent, role="reviewer")).id
+
+
+@pytest.fixture(autouse=True)
+def _authorship_runs(store):
+    """Seed authorship runs before any test body runs (so ``counts()``
+    baselines taken inside tests always include them)."""
+    _RUN_IDS.clear()
+    for name in ("claude", "gpt", "codex"):
+        _RUN_IDS[name] = _seed_run(store, name)
+    yield
+    _RUN_IDS.clear()
+
 
 class StaticResolver:
-    """Deterministic fake resolver (the registry-backed one arrives P4.2)."""
+    """Deterministic fake resolver (the production one: relay.core.resolver)."""
 
     def __init__(self, roles=None, agents=()):
         self._roles = dict(roles or {})
@@ -95,6 +117,10 @@ def _message(**overrides) -> Message:
         "content": "the diff misses the pagination guard",
     }
     base.update(overrides)
+    sender = base["sender"]
+    if "run_id" not in overrides and isinstance(sender, str) and ":" not in sender:
+        # P4.2 D1: auto-wire authorship provenance for bare agent senders.
+        base["run_id"] = _RUN_IDS.get(sender)
     return Message(**base)
 
 
@@ -264,9 +290,65 @@ class TestSenderValidation:
         with pytest.raises(MessageRejected, match="unknown logical agent"):
             resolved_bus.send(_message(sender="stranger"))
 
-    def test_unknown_bare_sender_accepted_without_resolver(self, bus):
+    def test_unknown_bare_sender_accepted_without_resolver(self, bus, store):
+        _RUN_IDS["stranger"] = _seed_run(store, "stranger")
         saved = bus.send(_message(sender="stranger"))
         assert saved.sender == "stranger"
+
+
+# --------------------------------------------------------------------------
+# G2 matrix — strict authorship provenance (P4.2, plan D1)
+# --------------------------------------------------------------------------
+
+
+class TestAuthorshipProvenance:
+    """Bare logical-agent senders prove authorship via ``run_id`` validated
+    against ``run.agent == sender``; prefix senders must not carry it. Every
+    rejection is typed and persists nothing."""
+
+    def test_bare_sender_without_run_id_is_rejected(self, bus, store):
+        before = store.counts()
+        with pytest.raises(MessageRejected, match="requires run provenance"):
+            bus.send(_message(run_id=None))
+        assert store.counts() == before
+
+    def test_prefix_sender_with_run_id_is_rejected(self, bus, store):
+        before = store.counts()
+        with pytest.raises(MessageRejected, match="authorship provenance is agent-only"):
+            bus.send(_message(sender="human:utku", run_id="run-something"))
+        assert store.counts() == before
+
+    def test_unknown_run_id_is_rejected(self, bus, store):
+        before = store.counts()
+        with pytest.raises(MessageRejected, match="does not resolve to a Run"):
+            bus.send(_message(run_id="no-such-run"))
+        assert store.counts() == before
+
+    def test_authorship_mismatch_is_rejected(self, bus, store):
+        """A run belonging to another agent never proves this sender."""
+        before = store.counts()
+        with pytest.raises(MessageRejected, match="authorship mismatch"):
+            bus.send(_message(sender="claude", run_id=_RUN_IDS["gpt"]))
+        assert store.counts() == before
+
+    def test_valid_linkage_persists_with_run_provenance(self, bus, store):
+        saved = bus.send(_message())
+        loaded = store.load_model(Message, saved.id)
+        assert loaded.run_id == _RUN_IDS["claude"]
+        assert store.load_model(Run, loaded.run_id).agent == "claude"
+
+    def test_strict_authorship_applies_with_resolver_too(self, resolved_bus, store):
+        before = store.counts()
+        with pytest.raises(MessageRejected, match="requires run provenance"):
+            resolved_bus.send(
+                _message(
+                    sender="gpt",
+                    recipient=None,
+                    recipient_role="reviewer",
+                    run_id=None,
+                )
+            )
+        assert store.counts() == before
 
 
 # --------------------------------------------------------------------------

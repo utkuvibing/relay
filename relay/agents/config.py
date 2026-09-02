@@ -13,15 +13,17 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
-
-from relay.context.config import DEFAULT_MODEL, AgentConfig
 
 #: Environment variables consulted by resolution (in precedence order).
 ENV_MODEL = "RELAY_MODEL"
 ENV_BASE_URL = "OPENAI_BASE_URL"
 ENV_API_KEY = "OPENAI_API_KEY"
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from relay.context.config import AgentConfig
 
 
 class AgentSettings(BaseModel):
@@ -64,6 +66,10 @@ def resolve_settings(
     """
     env = os.environ if env is None else env
     cli = cli or CliOverrides()
+
+    # Lazy import: keeps the agents-package import graph cycle-free
+    # (context.config → agents.base → agents/__init__ → agents.config).
+    from relay.context.config import DEFAULT_MODEL
 
     model = _first_non_none(cli.model, env.get(ENV_MODEL), yaml_agent.model if yaml_agent else None)
     if model is None:

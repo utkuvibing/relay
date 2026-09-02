@@ -32,7 +32,6 @@ from pathlib import Path
 from relay.agents.base import AgentRequest, AgentRole
 from relay.agents.config import AgentSettings
 from relay.agents.errors import AgentError
-from relay.context.config import HarnessAgentConfig
 from relay.harness.capabilities import HarnessCapability
 from relay.harness.env_policy import DEFAULT_CONFLICT_VARIABLES
 from relay.harness.errors import (
@@ -120,6 +119,11 @@ def default_factory_for(cls: type[HarnessAgent], *, timeout_s: float = 25.0):
     """Standard ``factory(root) -> agent`` binding a fake to a fresh ws dir."""
 
     def _make(root: Path) -> HarnessAgent:
+        # Lazy import: conformance must be importable in a context.config-first
+        # order without re-entering the partial context.config module (see
+        # harness.runtime for the same pattern).
+        from relay.context.config import HarnessAgentConfig
+
         return cls(
             settings=AgentSettings(adapter=cls.name),
             profile=HarnessAgentConfig(executable_path=str(PY), timeout_seconds=timeout_s),
@@ -433,6 +437,8 @@ def _case_b06_tree_termination(report, factory, root):
     hb_path = g2_dir / "_heartbeat.py"
     hb_path.write_text(HEARTBEAT_SRC, encoding="utf-8")
     tombstone = g2_dir / "tombstone.log"
+
+    from relay.context.config import HarnessAgentConfig
 
     tight = HarnessAgentConfig(
         executable_path=str(PY),
