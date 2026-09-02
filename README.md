@@ -128,7 +128,7 @@ Statuses describe the repository, not a promised release date.
 | P1 | Single-agent runtime, API adapter, SQLite persistence | Done |
 | P2 | Generic harness runtime, process isolation, Codex/Claude/Antigravity adapters | In progress |
 | P3 | Deterministic task state machine, verification, review, approval, and observability | Done |
-| P4 | Multi-agent messaging and heterogeneous delivery | In progress: P4.1 bus core and P4.2 role resolution + delivery done; P4.3-P4.4 remain |
+| P4 | Multi-agent messaging and heterogeneous delivery | In progress: P4.1 bus core, P4.2 role resolution + delivery, and P4.3 reply pairing done; P4.4 remains |
 | P5 | Bounded discussion protocols, communication policy, and budgets | Planned |
 | P6 | Automated implementation review and fix loop | Planned |
 | P7 | Persistent Rooms and long-lived participant context | Planned |
@@ -169,6 +169,8 @@ The full specification and design decisions live in
 [`docs/plans/p4.1-conversation-bus-core-plan.md`](docs/plans/p4.1-conversation-bus-core-plan.md).
 P4.2 implementation notes are in
 [`docs/plans/p4.2-role-resolution-delivery-plan.md`](docs/plans/p4.2-role-resolution-delivery-plan.md).
+P4.3 implementation notes are in
+[`docs/plans/p4.3-reply-pairing-blocking-replies-plan.md`](docs/plans/p4.3-reply-pairing-blocking-replies-plan.md).
 
 ## Project layout
 

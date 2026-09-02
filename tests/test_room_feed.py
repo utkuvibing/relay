@@ -31,6 +31,7 @@ _RUN_IDS: dict[str, str] = {}
 def _authorship_runs(store):
     _RUN_IDS.clear()
     _RUN_IDS["claude"] = store.save_model(Run(agent="claude", role="reviewer")).id
+    _RUN_IDS["codex"] = store.save_model(Run(agent="codex", role="implementer")).id
     yield
     _RUN_IDS.clear()
 
@@ -88,9 +89,12 @@ def _event(**overrides) -> EventLogEntry:
 
 class TestFeedComposition:
     def test_composes_messages_and_events_chronologically(self, store, bus, db):
-        bus.send(_msg(content="first"))
-        EventLogWriter(db).record(_event(content="system did a thing"))
-        bus.send(_msg(content="third"))
+        t0 = datetime.now(UTC)
+        bus.send(_msg(content="first", created_at=t0))
+        EventLogWriter(db).record(
+            _event(content="system did a thing", created_at=t0 + timedelta(seconds=1))
+        )
+        bus.send(_msg(content="third", created_at=t0 + timedelta(seconds=2)))
 
         feed = build_room_feed(store, "room-1")
 
@@ -139,12 +143,31 @@ class TestFeedComposition:
         assert [entry.text for entry in feed] == ["this room"]
 
     def test_source_classes_follow_producer_conventions(self, store, bus):
-        bus.send(_msg(sender="human:utku"))
-        bus.send(_msg(sender="relay:review"))
-        bus.send(_msg(sender="claude"))
+        t0 = datetime.now(UTC)
+        bus.send(_msg(sender="human:utku", created_at=t0))
+        bus.send(_msg(sender="relay:review", created_at=t0 + timedelta(seconds=1)))
+        bus.send(_msg(sender="claude", created_at=t0 + timedelta(seconds=2)))
 
         feed = build_room_feed(store, "room-1")
         assert [entry.source for entry in feed] == ["human", "relay", "agent"]
+
+    def test_feed_entry_projects_reply_to_id(self, store, bus):
+        t0 = datetime.now(UTC)
+        parent = bus.send(_msg(content="parent", created_at=t0))
+        bus.send(
+            _msg(
+                sender="codex",
+                recipient="claude",
+                reply_to_id=parent.id,
+                content="reply",
+                created_at=t0 + timedelta(seconds=1),
+            )
+        )
+
+        feed = build_room_feed(store, "room-1")
+        assert len(feed) == 2
+        assert feed[0].reply_to_id is None
+        assert feed[1].reply_to_id == parent.id
 
 
 class TestFeedDeterminism:
