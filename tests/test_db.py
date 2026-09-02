@@ -582,6 +582,64 @@ class TestDurabilityAndIdentity:
         assert "run_id" in columns
         upgraded.close()
 
+    def test_v4_database_upgrades_to_v5_preserving_messages(self, tmp_path):
+        """G1: the P4.3 v5 migration is ADD COLUMN-only and keeps history rows."""
+        db_path = tmp_path / "v4.sqlite3"
+        v4_conn = connect(db_path)
+        for version in (1, 2, 3, 4):
+            for statement in _MIGRATIONS[version]:
+                v4_conn.execute(statement)
+        v4_conn.execute("PRAGMA user_version = 4")
+        v4_conn.execute(
+            "INSERT INTO messages (id, sender, recipient, type, content, run_id, created_at) "
+            "VALUES ('msg-v4', 'claude', 'codex', 'opinion', 'pre-v5', 'run-1', "
+            "'2026-01-01T00:00:00+00:00')"
+        )
+        v4_conn.commit()
+        v4_conn.close()
+
+        upgraded = connect(db_path)
+        assert migrate(upgraded) == SCHEMA_VERSION
+        row = upgraded.execute("SELECT * FROM messages WHERE id='msg-v4'").fetchone()
+        assert row["content"] == "pre-v5"
+        assert row["run_id"] == "run-1"
+        assert row["reply_to_id"] is None
+        columns = {c[1] for c in upgraded.execute("PRAGMA table_info(messages)")}
+        assert "reply_to_id" in columns
+        indices = {r[1] for r in upgraded.execute("PRAGMA index_list(messages)")}
+        assert "idx_messages_reply_to" in indices
+        assert "idx_messages_unique_reply_run" in indices
+        upgraded.close()
+
+    def test_message_reply_to_id_roundtrip_and_unique_constraint(self, tmp_path):
+        conn = connect(tmp_path / "relay.sqlite3")
+        migrate(conn)
+        store = SqliteRelayStore(conn)
+        parent = store.save_model(
+            Message(sender="claude", recipient="codex", type=MessageType.OPINION, content="parent")
+        )
+        reply = store.save_model(
+            Message(
+                sender="codex",
+                recipient="claude",
+                type=MessageType.OPINION,
+                content="reply",
+                run_id="run-10",
+                reply_to_id=parent.id,
+            )
+        )
+        loaded = store.load_model(Message, reply.id)
+        assert loaded.reply_to_id == parent.id
+        assert loaded.run_id == "run-10"
+
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO messages (id, sender, recipient, type, content, run_id, reply_to_id, created_at) "
+                "VALUES ('msg-dup', 'codex', 'claude', 'opinion', 'dup', 'run-10', ?, '2026-01-01T00:00:00+00:00')",
+                [parent.id],
+            )
+        conn.close()
+
     def test_c6_seam_columns_roundtrip_and_survive_reopen(self, tmp_path):
         conn = connect(tmp_path / "relay.sqlite3")
         migrate(conn)

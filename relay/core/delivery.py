@@ -48,17 +48,27 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from relay.agents.base import Agent, AgentRequest, AgentRole
+from relay.agents.base import Agent, AgentRequest, AgentResponse, AgentRole
 from relay.core.agent_factory import AgentFactory
+from relay.core.bus import DEFAULT_MAX_THREAD_DEPTH, ConversationBus
 from relay.core.orchestrator import AskOutcome, run_ask
 from relay.storage.events import EventLogWriter
-from relay.storage.models import EventLogEntry, EventType, Message, Run
+from relay.storage.models import (
+    ArtifactKind,
+    EventLogEntry,
+    EventType,
+    Message,
+    MessageType,
+    Run,
+    RunStatus,
+)
 from relay.storage.store import SqliteRelayStore
 
 __all__ = [
     "DELIVERY_SENDER",
     "DeliveryOutcome",
     "DeliveryRefusal",
+    "DeliveryReplyOutcome",
     "DuplicateDeliveryRefusal",
     "MessageDelivery",
 ]
@@ -102,6 +112,18 @@ class DeliveryOutcome:
     ask: AskOutcome
 
 
+@dataclass(frozen=True)
+class DeliveryReplyOutcome:
+    """Outcome of a deliver_and_reply call.
+
+    ``reply`` is None if the recipient run failed or was refused.
+    """
+
+    message: Message
+    ask: AskOutcome
+    reply: Message | None = None
+
+
 class MessageDelivery:
     """Deliver one persisted message into one recipient agent run."""
 
@@ -110,10 +132,12 @@ class MessageDelivery:
         store: SqliteRelayStore,
         writer: EventLogWriter,
         factory: AgentFactory,
+        bus: ConversationBus | None = None,
     ) -> None:
         self._store = store
         self._writer = writer
         self._factory = factory
+        self._bus = bus if bus is not None else ConversationBus(store, writer)
 
     # -- public path ---------------------------------------------------------
 
@@ -165,6 +189,154 @@ class MessageDelivery:
             pre_provider=self._binding_hook(message),
         )
         return DeliveryOutcome(message=message, ask=ask)
+
+    async def deliver_and_reply(
+        self,
+        message_id: str,
+        *,
+        reply_type: MessageType | None = None,
+        max_thread_depth: int = DEFAULT_MAX_THREAD_DEPTH,
+    ) -> DeliveryReplyOutcome:
+        """P4.3 (frozen plan D12-D15): deliver message and materialize reply idempotently.
+
+        Enforces:
+        - Parent message deliverability (bare logical-agent recipient).
+        - Reuses existing successful run if delivery already occurred (crash recovery).
+        - Dual provenance verification: run.agent == reply.sender AND causal
+          MESSAGE_DELIVERED(message, run) binding.
+        - Reconstructs full AskOutcome(run=run, response=recovered_response) on recovery.
+        - Repeated calls return existing reply with zero store delta.
+        - Uniqueness constraint prevents duplicate reply generation under concurrency.
+        """
+        message = self._store.load_model(Message, message_id)
+        if message is None:
+            raise DeliveryRefusal(f"message '{message_id}' does not exist")
+
+        recipient = message.recipient
+        if recipient is None or ":" in recipient:
+            raise DeliveryRefusal(
+                f"message '{message_id}' has no deliverable recipient: "
+                f"{recipient!r} — recipients are bare logical-agent identities"
+            )
+
+        deliveries = self.deliveries_for_message(message_id)
+        if deliveries:
+            marker = deliveries[0]
+            run_id = None
+            for ref in marker.references:
+                if ref.startswith("run:"):
+                    run_id = ref[4:]
+                    break
+            if run_id is None:
+                raise DeliveryRefusal(
+                    f"corrupt delivery marker '{marker.id}': missing run reference"
+                )
+
+            run = self._store.load_model(Run, run_id)
+            if run is None:
+                raise DeliveryRefusal(f"delivery run '{run_id}' not found in store")
+
+            # Causal provenance: verify marker references parent message and run
+            if f"message:{message.id}" not in marker.references or f"run:{run.id}" not in marker.references:
+                raise DeliveryRefusal("corrupt causal provenance: marker references mismatch")
+
+            if run.status is not RunStatus.SUCCEEDED:
+                return DeliveryReplyOutcome(
+                    message=message,
+                    ask=AskOutcome(run=run),
+                    reply=None,
+                )
+
+            output_artifacts = self._store.artifacts_for_run(run.id, kind=ArtifactKind.RUN_OUTPUT)
+            output_content = output_artifacts[0].content if output_artifacts else ""
+            recovered_response = AgentResponse(
+                output=output_content,
+                agent=run.agent,
+                role=self._role_for(message),
+            )
+            ask = AskOutcome(run=run, response=recovered_response)
+
+            # Idempotency check: if reply already exists for this (message.id, run.id)
+            existing_replies = [
+                m for m in self._bus.replies_for(message.id) if m.run_id == run.id
+            ]
+            if existing_replies:
+                return DeliveryReplyOutcome(message=message, ask=ask, reply=existing_replies[0])
+
+            # Authorship verification
+            if run.agent != message.recipient:
+                raise DeliveryRefusal(
+                    f"authorship violation: delivery run belongs to {run.agent!r}, not recipient {message.recipient!r}"
+                )
+
+            actual_reply_type = self._resolve_reply_type(message.type, reply_type)
+            reply = self._build_reply(message, run, output_content, actual_reply_type)
+            import sqlite3
+
+            try:
+                saved_reply = self._bus.send(reply, max_thread_depth=max_thread_depth)
+            except sqlite3.IntegrityError:
+                existing = [m for m in self._bus.replies_for(message.id) if m.run_id == run.id]
+                if existing:
+                    return DeliveryReplyOutcome(message=message, ask=ask, reply=existing[0])
+                raise
+
+            return DeliveryReplyOutcome(message=message, ask=ask, reply=saved_reply)
+
+        # Fresh delivery
+        outcome = await self.deliver(message_id)
+        if outcome.ask.response is None:
+            return DeliveryReplyOutcome(message=message, ask=outcome.ask, reply=None)
+
+        run = outcome.ask.run
+        if run.agent != message.recipient:
+            raise DeliveryRefusal(
+                f"authorship violation: delivery run belongs to {run.agent!r}, not recipient {message.recipient!r}"
+            )
+
+        actual_reply_type = self._resolve_reply_type(message.type, reply_type)
+        reply = self._build_reply(message, run, outcome.ask.response.output, actual_reply_type)
+        import sqlite3
+
+        try:
+            saved_reply = self._bus.send(reply, max_thread_depth=max_thread_depth)
+        except sqlite3.IntegrityError:
+            existing = [m for m in self._bus.replies_for(message.id) if m.run_id == run.id]
+            if existing:
+                return DeliveryReplyOutcome(message=message, ask=outcome.ask, reply=existing[0])
+            raise
+
+        return DeliveryReplyOutcome(message=message, ask=outcome.ask, reply=saved_reply)
+
+    @staticmethod
+    def _resolve_reply_type(parent_type: MessageType, reply_type: MessageType | None) -> MessageType:
+        if reply_type is not None:
+            return reply_type
+        if parent_type is MessageType.CLARIFICATION_REQUEST:
+            return MessageType.CLARIFICATION_RESPONSE
+        raise ValueError(
+            f"explicit reply_type required when replying to message of type '{parent_type.value}'"
+        )
+
+    @staticmethod
+    def _build_reply(
+        parent: Message,
+        run: Run,
+        content: str,
+        reply_type: MessageType,
+    ) -> Message:
+        assert parent.recipient is not None
+        return Message(
+            sender=parent.recipient,
+            recipient=parent.sender,
+            reply_to_id=parent.id,
+            run_id=run.id,
+            room_id=parent.room_id,
+            task_id=parent.task_id,
+            type=reply_type,
+            content=content,
+            blocking=False,
+        )
 
     # -- read model ----------------------------------------------------------
 

@@ -43,6 +43,7 @@ class FeedEntry:
     references: tuple[str, ...]
     #: Stable tie-break id: "message:<id>" or "event:<sequence>".
     entry_id: str
+    reply_to_id: str | None = None
 
 
 _MESSAGE_ORIGIN_RANK = 0
@@ -69,6 +70,7 @@ def _from_message(message: Message) -> FeedEntry:
         text=message.content,
         references=tuple(message.references),
         entry_id=f"message:{message.id}",
+        reply_to_id=message.reply_to_id,
     )
 
 

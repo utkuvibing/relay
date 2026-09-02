@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _APPEND_ONLY_TABLES = ("event_log", "evidence_records")
 
@@ -217,6 +217,21 @@ _V4_STATEMENTS: tuple[str, ...] = (
 )
 
 _MIGRATIONS[4] = _V4_STATEMENTS
+
+#: P4.3 (frozen plan D1, D2) — additive ``Message.reply_to_id`` reply-linkage
+#: column, indexed lookup, and a partial unique index ensuring at most one
+#: materialized reply per (reply_to_id, run_id) delivery pairing.
+_V5_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE messages ADD COLUMN reply_to_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_id)",
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_unique_reply_run "
+        "ON messages(reply_to_id, run_id) "
+        "WHERE reply_to_id IS NOT NULL AND run_id IS NOT NULL"
+    ),
+)
+
+_MIGRATIONS[5] = _V5_STATEMENTS
 
 
 def connect(path: str | Path) -> sqlite3.Connection:

@@ -6,7 +6,15 @@ SPEC reference: §9, §27 Phase 4; App. D.5–D.8, D.11-P4; plan
 
 import pytest
 
-from relay.core.bus import MESSAGE_CONTENT_CAP_CHARS, ConversationBus, MessageRejected
+from relay.core.bus import (
+    MESSAGE_CONTENT_CAP_CHARS,
+    ConversationBus,
+    MessageRejected,
+    ReplyRejected,
+    ReplyScopeMismatch,
+    ReplySymmetryViolation,
+    RoundTripLimitExceeded,
+)
 from relay.core.evidence import EvidenceKind
 from relay.core.permissions import Action
 from relay.core.state_machine import TaskState
@@ -232,9 +240,17 @@ class TestAddressingValidation:
         with pytest.raises(MessageRejected, match="do not pre-fill"):
             resolved_bus.send(_message(recipient="codex", recipient_role="reviewer"))
 
-    def test_recipient_must_be_bare_identity(self, bus):
-        with pytest.raises(MessageRejected, match="bare logical-agent"):
-            bus.send(_message(recipient="human:utku"))
+    def test_invalid_prefix_recipient_is_rejected(self, bus):
+        with pytest.raises(MessageRejected, match="human: / relay:"):
+            bus.send(_message(recipient="unknown:utku"))
+
+    def test_human_recipient_convention_is_accepted(self, bus):
+        saved = bus.send(_message(recipient="human:utku"))
+        assert saved.recipient == "human:utku"
+
+    def test_relay_recipient_convention_is_accepted(self, bus):
+        saved = bus.send(_message(recipient="relay:system"))
+        assert saved.recipient == "relay:system"
 
     def test_scope_is_required(self, bus):
         with pytest.raises(MessageRejected, match="room_id and/or a task_id"):
@@ -540,3 +556,226 @@ class TestConversationIsNotState:
         )
         records = SqliteEvidenceStore(store).records_for_task(seeded_state["task"].id)
         assert records == seeded_state["evidence"]
+
+
+# --------------------------------------------------------------------------
+# P4.3: Reply pairing & validation matrix (SPEC App. D.5, D.11-P4; plan D3-D5, D9, D12)
+# --------------------------------------------------------------------------
+
+
+class TestReplyValidation:
+    def test_reply_to_nonexistent_parent_rejected(self, bus, store):
+        before = store.counts()
+        with pytest.raises(ReplyRejected, match="parent message 'nonexistent' not found"):
+            bus.send(_message(reply_to_id="nonexistent"))
+        assert store.counts() == before
+
+    def test_reply_exact_scope_equality(self, bus):
+        parent = bus.send(_message(room_id="room-1", task_id="t1"))
+
+        # Mismatched room
+        with pytest.raises(ReplyScopeMismatch, match="must exactly match parent scope"):
+            bus.send(
+                _message(
+                    sender="codex",
+                    recipient="claude",
+                    reply_to_id=parent.id,
+                    room_id="room-2",
+                    task_id="t1",
+                )
+            )
+
+        # Removed task
+        with pytest.raises(ReplyScopeMismatch, match="must exactly match parent scope"):
+            bus.send(
+                _message(
+                    sender="codex",
+                    recipient="claude",
+                    reply_to_id=parent.id,
+                    room_id="room-1",
+                    task_id=None,
+                )
+            )
+
+        # Added task to room-only parent
+        room_parent = bus.send(_message(room_id="room-1", task_id=None))
+        with pytest.raises(ReplyScopeMismatch, match="must exactly match parent scope"):
+            bus.send(
+                _message(
+                    sender="codex",
+                    recipient="claude",
+                    reply_to_id=room_parent.id,
+                    room_id="room-1",
+                    task_id="t1",
+                )
+            )
+
+    def test_reply_addressing_symmetry(self, bus):
+        parent = bus.send(_message(sender="claude", recipient="codex"))
+
+        # Recipient does not match parent sender
+        with pytest.raises(
+            ReplySymmetryViolation, match="reply recipient 'gpt' must match parent sender 'claude'"
+        ):
+            bus.send(
+                _message(
+                    sender="codex",
+                    recipient="gpt",
+                    reply_to_id=parent.id,
+                )
+            )
+
+        # Sender does not match parent recipient
+        with pytest.raises(
+            ReplySymmetryViolation, match="reply sender 'gpt' must match parent recipient 'codex'"
+        ):
+            bus.send(
+                _message(
+                    sender="gpt",
+                    recipient="claude",
+                    reply_to_id=parent.id,
+                )
+            )
+
+    def test_reply_to_human_sender_accepted(self, bus, store):
+        parent = bus.send(_message(sender="human:utku", recipient="claude"))
+        reply = bus.send(
+            _message(
+                sender="claude",
+                recipient="human:utku",
+                reply_to_id=parent.id,
+                content="here is the answer",
+            )
+        )
+        loaded = store.load_model(Message, reply.id)
+        assert loaded.reply_to_id == parent.id
+        assert loaded.recipient == "human:utku"
+        assert loaded.sender == "claude"
+
+    def test_reply_to_relay_sender_accepted(self, bus, store):
+        parent = bus.send(_message(sender="relay:build", recipient="claude"))
+        reply = bus.send(
+            _message(
+                sender="claude",
+                recipient="relay:build",
+                reply_to_id=parent.id,
+                content="acknowledged build request",
+            )
+        )
+        loaded = store.load_model(Message, reply.id)
+        assert loaded.reply_to_id == parent.id
+        assert loaded.recipient == "relay:build"
+
+    def test_structural_reply_linkage_accepts_valid_scope(self, bus):
+        parent = bus.send(_message(sender="claude", recipient="codex"))
+        reply = bus.send(
+            _message(
+                sender="codex",
+                recipient="claude",
+                reply_to_id=parent.id,
+                type=MessageType.CHALLENGE,
+            )
+        )
+        assert reply.reply_to_id == parent.id
+        assert bus.replies_for(parent.id) == [reply]
+
+    def test_thread_depth_boundaries(self, bus):
+        m0 = bus.send(_message(sender="claude", recipient="codex"))
+        m1 = bus.send(
+            _message(sender="codex", recipient="claude", reply_to_id=m0.id), max_thread_depth=3
+        )
+        m2 = bus.send(
+            _message(sender="claude", recipient="codex", reply_to_id=m1.id), max_thread_depth=3
+        )
+        m3 = bus.send(
+            _message(sender="codex", recipient="claude", reply_to_id=m2.id), max_thread_depth=3
+        )
+        assert m3.reply_to_id == m2.id
+
+        with pytest.raises(
+            RoundTripLimitExceeded, match="exceeding the maximum thread depth ceiling"
+        ):
+            bus.send(
+                _message(sender="claude", recipient="codex", reply_to_id=m3.id), max_thread_depth=3
+            )
+
+    def test_write_path_cycle_detection(self, bus, store):
+        # Insert a raw message row that references itself (UPDATE is blocked by append-only trigger)
+        store.conn.execute(
+            "INSERT INTO messages (id, sender, recipient, room_id, type, content, reply_to_id, created_at) "
+            "VALUES ('cycle-msg', 'claude', 'codex', 'room-1', 'opinion', 'self-ref', 'cycle-msg', '2026-01-01T00:00:00+00:00')"
+        )
+        with pytest.raises(ReplyRejected, match="corrupt/cyclic reply ancestry detected"):
+            bus.send(_message(sender="codex", recipient="claude", room_id="room-1", reply_to_id="cycle-msg"))
+
+
+# --------------------------------------------------------------------------
+# P4.3: Answering queries & reply chains
+# --------------------------------------------------------------------------
+
+
+class TestAnsweringQueries:
+    def test_non_answering_reply_does_not_clear_blocking(self, bus):
+        parent = bus.send(
+            _message(
+                sender="claude",
+                recipient="codex",
+                type=MessageType.CLARIFICATION_REQUEST,
+                blocking=True,
+            )
+        )
+        assert bus.has_answering_reply(parent.id) is False
+        assert parent in bus.unanswered_blocking_messages(room_id="room-1")
+
+        # Child is a CHALLENGE (valid structural reply, but NOT answering)
+        bus.send(
+            _message(
+                sender="codex",
+                recipient="claude",
+                type=MessageType.CHALLENGE,
+                reply_to_id=parent.id,
+            )
+        )
+        assert bus.has_answering_reply(parent.id) is False
+        assert parent in bus.unanswered_blocking_messages(room_id="room-1")
+
+    def test_canonical_answering_reply_clears_blocking(self, bus):
+        parent = bus.send(
+            _message(
+                sender="claude",
+                recipient="codex",
+                type=MessageType.CLARIFICATION_REQUEST,
+                blocking=True,
+            )
+        )
+        # Child is CLARIFICATION_RESPONSE
+        bus.send(
+            _message(
+                sender="codex",
+                recipient="claude",
+                type=MessageType.CLARIFICATION_RESPONSE,
+                reply_to_id=parent.id,
+            )
+        )
+        assert bus.has_answering_reply(parent.id) is True
+        assert parent not in bus.unanswered_blocking_messages(room_id="room-1")
+
+    def test_reply_chain_traversal_and_cycle_guard(self, bus, store):
+        m0 = bus.send(_message(sender="claude", recipient="codex"))
+        m1 = bus.send(_message(sender="codex", recipient="claude", reply_to_id=m0.id))
+        m2 = bus.send(_message(sender="claude", recipient="codex", reply_to_id=m1.id))
+
+        chain = bus.reply_chain(m2.id)
+        assert [m.id for m in chain] == [m0.id, m1.id, m2.id]
+
+        # Insert a message with broken non-existent parent
+        store.conn.execute(
+            "INSERT INTO messages (id, sender, recipient, type, content, reply_to_id, created_at) "
+            "VALUES ('orphan', 'codex', 'claude', 'opinion', 'orphan', 'nonexistent', '2026-01-01T00:00:00+00:00')"
+        )
+        store.conn.execute(
+            "INSERT INTO messages (id, sender, recipient, type, content, reply_to_id, created_at) "
+            "VALUES ('child-of-orphan', 'claude', 'codex', 'opinion', 'child', 'orphan', '2026-01-01T00:00:00+00:00')"
+        )
+        partial_chain = bus.reply_chain("child-of-orphan")
+        assert [m.id for m in partial_chain] == ["orphan", "child-of-orphan"]

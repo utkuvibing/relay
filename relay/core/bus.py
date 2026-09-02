@@ -66,13 +66,33 @@ _BLOCKING_CAPABLE_TYPES = frozenset(
 )
 
 _ALLOWED_SENDER_PREFIXES = ("human:", "relay:")
+_ALLOWED_RECIPIENT_PREFIXES = ("human:", "relay:")
 
 #: P4.1 (plan D15): only relay:* senders may author SYSTEM messages.
 _SYSTEM_SENDER_PREFIX = "relay:"
 
+#: P4.3 (frozen plan D12): protocol-independent hard thread depth ceiling.
+DEFAULT_MAX_THREAD_DEPTH = 10
+
 
 class MessageRejected(ValueError):
     """Typed pre-persistence rejection: nothing was written to the store."""
+
+
+class ReplyRejected(MessageRejected):
+    """Base error for reply linkage and pairing rejections."""
+
+
+class ReplyScopeMismatch(ReplyRejected):
+    """Reply room_id or task_id does not match parent."""
+
+
+class ReplySymmetryViolation(ReplyRejected):
+    """Reply sender/recipient does not match parent conversational direction."""
+
+
+class RoundTripLimitExceeded(ReplyRejected):
+    """Reply exceeds the protocol-independent hard thread depth ceiling."""
 
 
 class RoleResolver(Protocol):
@@ -109,7 +129,12 @@ class ConversationBus:
 
     # -- write path ----------------------------------------------------------
 
-    def send(self, message: Message) -> Message:
+    def send(
+        self,
+        message: Message,
+        *,
+        max_thread_depth: int = DEFAULT_MAX_THREAD_DEPTH,
+    ) -> Message:
         """Validate, then persist message + MESSAGE_SENT marker atomically.
 
         Returns the persisted message with its final addressing (role-
@@ -117,13 +142,17 @@ class ConversationBus:
         Every rejection happens BEFORE persistence: a rejected send leaves
         the store byte-identical.
         """
-        validated = self._validate(message)
+        validated = self._validate(message, max_thread_depth=max_thread_depth)
         with self._store.transaction():
             saved = self._store.save_model(validated)
             self._writer.record(self._marker_for(saved))
         return saved
 
-    def _validate(self, message: Message) -> Message:
+    def _validate(
+        self,
+        message: Message,
+        max_thread_depth: int = DEFAULT_MAX_THREAD_DEPTH,
+    ) -> Message:
         """Full G2 validation matrix; returns the message to persist."""
         if message.room_id is None and message.task_id is None:
             raise MessageRejected("message must carry a room_id and/or a task_id")
@@ -141,11 +170,12 @@ class ConversationBus:
             resolved = self._resolve_role(message.recipient_role)
             message = message.model_copy(update={"recipient": resolved})
         elif message.recipient is not None:
-            if ":" in message.recipient:
-                # recipient is a RESOLVED logical-agent identity (D3); the
-                # human:/relay: producer conventions are sender-side.
+            if ":" in message.recipient and not message.recipient.startswith(
+                _ALLOWED_RECIPIENT_PREFIXES
+            ):
                 raise MessageRejected(
-                    f"recipient must be a bare logical-agent identity, got {message.recipient!r}"
+                    f"recipient {message.recipient!r} must be a bare logical-agent identity "
+                    f"or use the {' / '.join(_ALLOWED_RECIPIENT_PREFIXES)} conventions"
                 )
             if not _identity_is_valid(message.recipient):
                 raise MessageRejected(f"invalid recipient {message.recipient!r}")
@@ -191,7 +221,61 @@ class ConversationBus:
             if not isinstance(reference, str) or not reference.strip():
                 raise MessageRejected("references must be non-empty strings")
 
+        if message.reply_to_id is not None:
+            self._validate_reply(message, max_thread_depth)
+
         return message
+
+    def _validate_reply(self, message: Message, max_thread_depth: int) -> None:
+        """P4.3 (frozen plan D3-D5, D9, D12): structural reply validation."""
+        assert message.reply_to_id is not None
+        parent = self._store.load_model(Message, message.reply_to_id)
+        if parent is None:
+            raise ReplyRejected(f"parent message {message.reply_to_id!r} not found")
+
+        if message.room_id != parent.room_id or message.task_id != parent.task_id:
+            raise ReplyScopeMismatch(
+                f"reply scope (room={message.room_id!r}, task={message.task_id!r}) must exactly "
+                f"match parent scope (room={parent.room_id!r}, task={parent.task_id!r})"
+            )
+
+        if message.recipient != parent.sender:
+            raise ReplySymmetryViolation(
+                f"reply recipient {message.recipient!r} must match parent sender {parent.sender!r}"
+            )
+
+        if message.sender != parent.recipient:
+            raise ReplySymmetryViolation(
+                f"reply sender {message.sender!r} must match parent recipient {parent.recipient!r}"
+            )
+
+        self._calculate_thread_depth(parent, max_thread_depth)
+
+    def _calculate_thread_depth(self, parent: Message, max_thread_depth: int) -> int:
+        """Traverse ancestry upwards with cycle and bound guards (P4.3 D12)."""
+        seen = {parent.id}
+        depth = 1
+        current = parent
+        while current.reply_to_id is not None:
+            if current.reply_to_id in seen:
+                raise ReplyRejected(
+                    f"corrupt/cyclic reply ancestry detected at message {current.reply_to_id!r}"
+                )
+            seen.add(current.reply_to_id)
+            ancestor = self._store.load_model(Message, current.reply_to_id)
+            if ancestor is None:
+                raise ReplyRejected(f"broken ancestry: parent {current.reply_to_id!r} not found")
+            depth += 1
+            if depth > max_thread_depth:
+                raise RoundTripLimitExceeded(
+                    f"reply would reach depth {depth}, exceeding the maximum thread depth ceiling of {max_thread_depth}"
+                )
+            current = ancestor
+        if depth > max_thread_depth:
+            raise RoundTripLimitExceeded(
+                f"reply would reach depth {depth}, exceeding the maximum thread depth ceiling of {max_thread_depth}"
+            )
+        return depth
 
     def _validate_sender(self, sender: str) -> None:
         if not _identity_is_valid(sender):
@@ -298,3 +382,75 @@ class ConversationBus:
                 order_by="created_at ASC, rowid ASC",
             )
         )
+
+    def replies_for(self, message_id: str) -> list[Message]:
+        """Direct children of message_id ordered chronologically using indexed lookup."""
+        return list(
+            self._store.all_models(
+                Message,
+                "WHERE reply_to_id = ?",
+                [message_id],
+                order_by="created_at ASC, rowid ASC",
+            )
+        )
+
+    def has_answering_reply(self, message_id: str) -> bool:
+        """True iff message_id has a qualifying canonical answering reply (P4.3 canonical pair)."""
+        parent = self._store.load_model(Message, message_id)
+        if parent is None or parent.type is not MessageType.CLARIFICATION_REQUEST:
+            return False
+        clause = "WHERE reply_to_id = ? AND type = ?"
+        return (
+            next(
+                self._store.all_models(
+                    Message,
+                    clause,
+                    [message_id, MessageType.CLARIFICATION_RESPONSE.value],
+                    limit=1,
+                ),
+                None,
+            )
+            is not None
+        )
+
+    def unanswered_blocking_messages(
+        self, room_id: str | None = None, task_id: str | None = None
+    ) -> list[Message]:
+        """Blocking clarification requests in scope that lack an answering response."""
+        clauses = ["blocking = 1", "type = ?"]
+        params: list[object] = [MessageType.CLARIFICATION_REQUEST.value]
+        if room_id is not None:
+            clauses.append("room_id = ?")
+            params.append(room_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+
+        candidates = self._store.all_models(
+            Message,
+            f"WHERE {' AND '.join(clauses)}",
+            params,
+            order_by="created_at ASC, rowid ASC",
+        )
+        return [msg for msg in candidates if not self.has_answering_reply(msg.id)]
+
+    def reply_chain(self, message_id: str, max_traversal: int = 50) -> list[Message]:
+        """Root-to-leaf thread leading to message_id, with cycle and depth guards."""
+        current = self._store.load_model(Message, message_id)
+        if current is None:
+            return []
+
+        chain = [current]
+        seen = {current.id}
+
+        while current.reply_to_id is not None:
+            if current.reply_to_id in seen or len(chain) >= max_traversal:
+                break
+            seen.add(current.reply_to_id)
+            parent = self._store.load_model(Message, current.reply_to_id)
+            if parent is None:
+                break
+            chain.append(parent)
+            current = parent
+
+        return list(reversed(chain))

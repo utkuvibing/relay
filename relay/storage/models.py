@@ -168,6 +168,10 @@ class Message(BaseModel):
             "human:/relay: senders."
         ),
     )
+    reply_to_id: str | None = Field(
+        default=None,
+        description="Parent message id when this message is a reply; else None (P4.3).",
+    )
     room_id: str | None = None
     task_id: str | None = None
     type: MessageType

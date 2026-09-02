@@ -18,11 +18,13 @@ from relay.agents.base import (
     BackendType,
 )
 from relay.agents.config import AgentSettings
+from relay.agents.errors import AgentError
 from relay.context.config import ConfigError, HarnessAgentConfig
 from relay.core.delivery import (
     DELIVERY_SENDER,
     DeliveryOutcome,
     DeliveryRefusal,
+    DeliveryReplyOutcome,
     DuplicateDeliveryRefusal,
     MessageDelivery,
 )
@@ -642,3 +644,109 @@ class TestDeliveriesForMessage:
         markers = delivery.deliveries_for_message(delivered.id)
         assert len(markers) == 1
         assert delivery.deliveries_for_message(other.id) == ()
+
+
+# ---------------------------------------------------------------------------
+# P4.3: deliver_and_reply, crash recovery & idempotent materialization
+# ---------------------------------------------------------------------------
+
+
+class TestDeliverAndReply:
+    async def test_delivery_to_prefix_recipients_refused(self, delivery, store):
+        msg_human = store.save_model(_message(recipient="human:utku"))
+        msg_relay = store.save_model(_message(recipient="relay:system"))
+
+        with pytest.raises(DeliveryRefusal, match="no deliverable recipient"):
+            await delivery.deliver(msg_human.id)
+
+        with pytest.raises(DeliveryRefusal, match="no deliverable recipient"):
+            await delivery.deliver_and_reply(msg_human.id)
+
+        with pytest.raises(DeliveryRefusal, match="no deliverable recipient"):
+            await delivery.deliver(msg_relay.id)
+
+        with pytest.raises(DeliveryRefusal, match="no deliverable recipient"):
+            await delivery.deliver_and_reply(msg_relay.id)
+
+    async def test_deliver_and_reply_success_creates_reply(self, delivery, store):
+        parent = store.save_model(
+            _message(recipient="fixer", type=MessageType.CLARIFICATION_REQUEST)
+        )
+        outcome = await delivery.deliver_and_reply(parent.id)
+        assert isinstance(outcome, DeliveryReplyOutcome)
+
+        assert outcome.ask.response is not None
+        assert outcome.ask.response.output == "api reply"
+        assert outcome.reply is not None
+        assert outcome.reply.reply_to_id == parent.id
+        assert outcome.reply.sender == "fixer"
+        assert outcome.reply.recipient == parent.sender
+        assert outcome.reply.run_id == outcome.ask.run.id
+        assert outcome.reply.type == MessageType.CLARIFICATION_RESPONSE
+        assert outcome.reply.content == "api reply"
+
+        loaded = store.load_model(Message, outcome.reply.id)
+        assert loaded is not None
+        assert loaded.reply_to_id == parent.id
+
+    async def test_deliver_and_reply_failure_creates_no_reply(self, store, writer, scope):
+        class FailingAgent(Agent):
+            name = "fail"
+            backend = BackendType.API
+
+            async def run(self, request):
+                raise AgentError("provider exploded")
+
+        failing_delivery = MessageDelivery(store, writer, FakeFactory({"fail": FailingAgent()}))
+        parent = store.save_model(_message(recipient="fail"))
+        outcome = await failing_delivery.deliver_and_reply(parent.id)
+
+        assert outcome.ask.response is None
+        assert outcome.ask.error == "provider exploded"
+        assert outcome.reply is None
+        assert outcome.ask.run.status is RunStatus.FAILED
+
+    async def test_crash_recovery_materializes_reply_without_reinvocation(
+        self, delivery, store, api_agent
+    ):
+        parent = store.save_model(
+            _message(recipient="fixer", type=MessageType.CLARIFICATION_REQUEST)
+        )
+        # Step 1: Initial delivery completes, but simulates crash before reply insert
+        outcome1 = await delivery.deliver(parent.id)
+        assert outcome1.ask.run.status is RunStatus.SUCCEEDED
+        assert len(api_agent.received) == 1
+
+        # Verify no reply message in store yet
+        assert delivery._bus.replies_for(parent.id) == []
+
+        # Step 2: Crash recovery via deliver_and_reply
+        outcome2 = await delivery.deliver_and_reply(parent.id)
+        # Agent must NOT be re-invoked
+        assert len(api_agent.received) == 1
+        assert outcome2.ask.response is not None
+        assert outcome2.ask.response.output == "api reply"
+        assert outcome2.reply is not None
+        assert outcome2.reply.reply_to_id == parent.id
+        assert outcome2.reply.run_id == outcome1.ask.run.id
+
+    async def test_repeated_deliver_and_reply_is_idempotent(self, delivery, store):
+        parent = store.save_model(
+            _message(recipient="fixer", type=MessageType.CLARIFICATION_REQUEST)
+        )
+        first = await delivery.deliver_and_reply(parent.id)
+        assert first.reply is not None
+
+        counts_before = store.counts()
+        second = await delivery.deliver_and_reply(parent.id)
+        assert second.reply == first.reply
+        assert store.counts() == counts_before
+
+    async def test_deliver_and_reply_explicit_type_required(self, delivery, store):
+        parent = store.save_model(_message(recipient="fixer", type=MessageType.PROPOSAL))
+        with pytest.raises(ValueError, match="explicit reply_type required"):
+            await delivery.deliver_and_reply(parent.id)
+
+        outcome = await delivery.deliver_and_reply(parent.id, reply_type=MessageType.OPINION)
+        assert outcome.reply is not None
+        assert outcome.reply.type == MessageType.OPINION
