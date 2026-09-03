@@ -15,13 +15,14 @@ another model provider.
 | DeepSeek BYOK | Available | The `deepseek` agent uses DeepSeek's OpenAI-compatible Chat Completions API. |
 | Task execution | Available | `relay build` drives a task through evidence-gated context, plan, implementation, verification, review, and approval steps. |
 | Run and task inspection | Available | `relay status`, `relay history`, and `relay inspect` read the local ledger. |
-| Conversation bus core | In progress | P4.1 adds typed, addressed, append-only messages and a Room-feed read model. |
-| Automatic agent-to-agent delivery | In progress | P4.2 role resolution and Relay-mediated delivery are done; P4.3 reply pairing and the P4.4 bounded multi-agent driver remain. |
+| Conversation bus core | Available | Typed, addressed, append-only messages, a deterministic Room feed, reply pairing, and bounded round trips. |
+| Automatic agent-to-agent delivery | Available | Role resolution, Relay-mediated delivery, and the P4.4 bounded multi-agent driver chain multi-hop agent conversations with zero human copy-paste. |
 | `relay discuss` and persistent Rooms | Planned | These belong to P5 and P7. The commands are not implemented yet. |
 
 The important boundary is simple: calling two agents separately does not make
-them talk. Each call is its own run. Relay will coordinate model-to-model
-messages through the P4 bus and P5 discussion protocols once those phases land.
+them talk. Each call is its own run. Relay's P4 bus and bounded driver
+coordinate model-to-model messages on one ledger; P5 adds the discussion
+protocols that decide who may speak, when, and how much.
 
 ## Quick start
 
@@ -128,7 +129,7 @@ Statuses describe the repository, not a promised release date.
 | P1 | Single-agent runtime, API adapter, SQLite persistence | Done |
 | P2 | Generic harness runtime, process isolation, Codex/Claude/Antigravity adapters | In progress |
 | P3 | Deterministic task state machine, verification, review, approval, and observability | Done |
-| P4 | Multi-agent messaging and heterogeneous delivery | In progress: P4.1 bus core, P4.2 role resolution + delivery, and P4.3 reply pairing done; P4.4 remains |
+| P4 | Multi-agent messaging and heterogeneous delivery | Done |
 | P5 | Bounded discussion protocols, communication policy, and budgets | Planned |
 | P6 | Automated implementation review and fix loop | Planned |
 | P7 | Persistent Rooms and long-lived participant context | Planned |
@@ -148,11 +149,13 @@ P4 is split into four concrete slices:
 3. P4.3, reply pairing, blocking replies, and bounded round trips.
 4. P4.4, a bounded multi-agent driver with API-to-harness-to-harness coverage.
 
-P4.1 gives Relay somewhere safe to store conversation traffic. It does not yet
-dispatch a prompt to two models or feed one model's answer to another. P5 adds
-the rules that decide who may speak to whom, for what purpose, and how many
-rounds are allowed. P7 turns that machinery into a persistent group-chat
-experience.
+P4.1 gives Relay somewhere safe to store conversation traffic, P4.2 dispatches
+each message to its resolved recipient, P4.3 pairs replies and bounds the
+round trips, and P4.4 chains those deliveries into a bounded multi-hop
+conversation (the exit gate: one driver call runs api → harness → a different
+harness with zero human copy-paste). P5 adds the rules that decide who may
+speak to whom, for what purpose, and how many rounds are allowed. P7 turns
+that machinery into a persistent group-chat experience.
 
 ## Development
 
@@ -169,6 +172,8 @@ The full specification and design decisions live in
 [`docs/plans/p4.1-conversation-bus-core-plan.md`](docs/plans/p4.1-conversation-bus-core-plan.md).
 P4.2 implementation notes are in
 [`docs/plans/p4.2-role-resolution-delivery-plan.md`](docs/plans/p4.2-role-resolution-delivery-plan.md).
+P4.4 implementation notes are in
+[`docs/plans/p4.4-bounded-multi-agent-driver-plan.md`](docs/plans/p4.4-bounded-multi-agent-driver-plan.md).
 P4.3 implementation notes are in
 [`docs/plans/p4.3-reply-pairing-blocking-replies-plan.md`](docs/plans/p4.3-reply-pairing-blocking-replies-plan.md).
 

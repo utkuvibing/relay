@@ -231,13 +231,16 @@ class TestConversationBusAuthorityBoundary:
         """P4.2: the conversation layer (bus, feed, delivery, resolver) is
         covered — delivery consumes the crash-safe spine via
         ``relay.core.orchestrator``; orchestration plumbing arrives
-        transitively, exactly like storage plumbing for the bus."""
+        transitively, exactly like storage plumbing for the bus. P4.4: the
+        driver joins the same boundary — it authors messages via the bus and
+        causes runs via the delivery service, nothing else."""
         modules = [
             RELAY_ROOT / "core" / "bus.py",
             RELAY_ROOT / "core" / "room_feed.py",
             RELAY_ROOT / "core" / "delivery.py",
             RELAY_ROOT / "core" / "resolver.py",
             RELAY_ROOT / "core" / "agent_factory.py",
+            RELAY_ROOT / "core" / "driver.py",
         ]
         assert all(path.exists() for path in modules), "guard against silent renames"
         for module_path in modules:
@@ -270,3 +273,89 @@ class TestConversationBusAuthorityBoundary:
                 assert not offenders, (
                     f"{module_path.name} imports canonical-authority module(s) {offenders}"
                 )
+
+
+class TestDriverRoutesOnIdentityNotProviders:
+    """P4.4 (frozen plan D4, App. C.7): the driver's routing speaks only
+    logical identity and role. No backend-family or provider vocabulary may
+    appear anywhere in ``relay/core/driver.py`` — not in identifiers, not in
+    string constants, and therefore not in a condition. Docstrings are
+    excluded: documentation may discuss the boundary the code enforces, the
+    code itself may not know families or providers exist."""
+
+    _FORBIDDEN_TOKENS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "codex",
+            "claude",
+            "antigravity",
+            "deepseek",
+            "openai",
+            "anthropic",
+            "gpt",
+            "gemini",
+            "harness",
+            "api",
+            "backend",
+            "adapter",
+            "provider",
+        }
+    )
+
+    @staticmethod
+    def _docstring_node_ids(tree: ast.AST) -> set[int]:
+        docstrings: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(
+                node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                body = getattr(node, "body", [])
+                if (
+                    body
+                    and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)
+                ):
+                    docstrings.add(id(body[0].value))
+        return docstrings
+
+    def test_driver_module_carries_no_provider_vocabulary(self):
+        import re
+
+        path = RELAY_ROOT / "core" / "driver.py"
+        assert path.exists(), "guard against a silent rename"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docstrings = self._docstring_node_ids(tree)
+
+        offenders: list[str] = []
+        for node in ast.walk(tree):
+            texts: list[str] = []
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in docstrings
+            ):
+                texts.append(node.value)
+            elif isinstance(node, ast.Name):
+                texts.append(node.id)
+            elif isinstance(node, ast.Attribute):
+                texts.append(node.attr)
+            elif isinstance(node, ast.arg):
+                texts.append(node.arg)
+            for text in texts:
+                lowered = text.lower()
+                for token in self._FORBIDDEN_TOKENS:
+                    if re.search(rf"\b{re.escape(token)}\b", lowered):
+                        offenders.append(f"{token} in {text!r}")
+        assert not offenders, f"driver.py carries provider vocabulary: {offenders}"
+
+    def test_the_driver_module_actually_parses(self):
+        """Guard against a silent rename emptying the scan."""
+        path = RELAY_ROOT / "core" / "driver.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        assert "ConversationDriver" in names
+        assert "derive_message_id" in names
