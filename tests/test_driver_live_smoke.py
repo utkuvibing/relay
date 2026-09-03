@@ -1,6 +1,6 @@
 """Live P4.4 driver smoke — doubly gated, CI-inert by construction.
 
-Gate 1: explicit env opt-in ``RELAY_LIVE_DRIVER_SMOKE=1``.
+Gate 1: explicit env opt-in ``RELAY_LIVE_DRIVER_SMOKE=1`` (exact match).
 Gate 2: environment readiness — the checked-in ``relay.yaml`` still configures
 the ``deepseek`` (api) + ``codex`` (harness) pair, the ``codex`` executable is
 discoverable on PATH, and the DeepSeek key is present in the environment
@@ -44,7 +44,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def _live_stack(tmp_path: Path) -> ConversationDriver | None:
     """Return a production driver stack when BOTH gates pass; else None."""
-    if "RELAY_LIVE_DRIVER_SMOKE" not in os.environ:
+    if os.environ.get("RELAY_LIVE_DRIVER_SMOKE") != "1":
         return None
     config = load_config(_REPO_ROOT)
     names = set(config.agents)

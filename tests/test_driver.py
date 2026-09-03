@@ -628,6 +628,32 @@ class TestBoundedRetries:
         runs = [r for r in store.all_models(Run) if r.agent == "alpha"]
         assert len(runs) == 2 and all(r.status is RunStatus.FAILED for r in runs)
 
+    async def test_failed_blocking_clarification_is_never_retried_as_a_note(
+        self, driver, store, bus
+    ):
+        """D6 (rev 4 pre-merge amendment): a failed blocking clarification
+        stops the hop with HOP_FAILED — no NOTE retry Message exists — and the
+        request stays honestly unanswered in P4.3's canonical query."""
+        failing = AlwaysFailingAgent("alpha")
+        failing_driver = self._driver_over(store, {"alpha": failing})
+        spec = _spec(
+            participants=(ParticipantAddress(agent="alpha"),),
+            seed_type=MessageType.CLARIFICATION_REQUEST,
+            seed_blocking=True,
+        )
+        result = await failing_driver.start(spec)
+        assert result.stop_reason is StopReason.HOP_FAILED
+        assert result.hops[0].attempts == 1  # no second attempt was made
+        assert result.final_answer is None
+        driver_messages = _messages_where(store, "WHERE sender = ?", [DRIVER_SENDER])
+        assert len(driver_messages) == 1  # the seed only — no retry Message
+        assert driver_messages[0].type is MessageType.CLARIFICATION_REQUEST
+        runs = [r for r in store.all_models(Run) if r.agent == "alpha"]
+        assert len(runs) == 1 and runs[0].status is RunStatus.FAILED
+        # P4.3 canonical unanswered semantics preserved
+        unanswered = bus.unanswered_blocking_messages(room_id="room-1")
+        assert [m.id for m in unanswered] == [result.seed.id]
+
     async def test_pending_delivery_stops_without_retry(self, driver, store, writer):
         """RUNNING = crash-safe pending re-entry (D6): typed stop, no retry,
         no re-invocation, no fabricated outcome."""

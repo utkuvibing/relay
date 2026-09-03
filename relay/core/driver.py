@@ -8,7 +8,9 @@ each materialized answer to the next participant — hub style, with the driver
 visible in the ledger as ``relay:driver`` (frozen plan D1). The traversal is
 structurally bounded: the participant sequence is finite, every hop is capped
 at ``MAX_HOP_RETRIES`` attempts, and nothing waits or polls. There is no
-unbounded loop. Termination reasons are exactly SEQUENCE_EXHAUSTED,
+unbounded loop. A failed blocking clarification is never retried as a NOTE —
+the hop stops HOP_FAILED and the request stays canonically unanswered (D6,
+pre-merge amendment). Termination reasons are exactly SEQUENCE_EXHAUSTED,
 HOP_FAILED, and DELIVERY_PENDING — an unfinished provider run is honestly
 "initiated, outcome pending" and a later same-key re-entry resolves it; the
 driver never waits, polls, or fabricates outcomes (frozen plan D6/D7).
@@ -592,7 +594,15 @@ class ConversationDriver:
             if outcome is None:
                 return self._stop(seed, hops, StopReason.DELIVERY_PENDING, final_answer)
 
-            if outcome.reply is None and attempts <= MAX_HOP_RETRIES:
+            # D6 (rev 4 pre-merge amendment): a failed blocking clarification
+            # is never retried as a NOTE — the retry's reply would be a NOTE,
+            # replacing the canonical clarification_request →
+            # clarification_response answering pair (P4.3 D10) and corrupting
+            # the unanswered semantics. The hop stops HOP_FAILED and the
+            # request stays honestly in ``unanswered_blocking_messages``.
+            # Bounded new-Message retries stand for ordinary NOTE parents.
+            retryable = terminal.type is not MessageType.CLARIFICATION_REQUEST
+            if outcome.reply is None and retryable and attempts <= MAX_HOP_RETRIES:
                 failed_run_id = outcome.ask.run.id
                 terminal = self._compose_and_send_retry(
                     spec,
