@@ -19,3 +19,9 @@ build/
 # Environment / secrets
 .env
 .env.*
+
+# Site (Next.js)
+site/.next/
+site/out/
+site/node_modules/
+site/.turbo/
