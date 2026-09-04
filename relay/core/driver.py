@@ -61,6 +61,13 @@ from relay.core.delivery import (
     DuplicateDeliveryRefusal,
     MessageDelivery,
 )
+from relay.core.policy import (
+    BlockingBudgetExhausted,
+    BudgetExhausted,
+    CommunicationPolicyGate,
+    CommunicationPolicyRefusal,
+    PolicyEnvelope,
+)
 from relay.storage.events import EventLogWriter
 from relay.storage.models import Message, MessageType
 from relay.storage.store import SqliteRelayStore
@@ -80,6 +87,7 @@ __all__ = [
     "DriverRefusal",
     "MessageKind",
     "ParticipantAddress",
+    "PolicyRefusal",
     "ResumeSeedRefusal",
     "SpecRefusal",
     "StopReason",
@@ -114,11 +122,12 @@ class MessageKind(str, enum.Enum):
 
 
 class StopReason(str, enum.Enum):
-    """Why a driver traversal stopped (frozen plan D7) — the only three exits."""
+    """Why a driver traversal stopped (frozen plan D7 plus P5.1 budget stop)."""
 
     SEQUENCE_EXHAUSTED = "sequence_exhausted"
     HOP_FAILED = "hop_failed"
     DELIVERY_PENDING = "delivery_pending"
+    BUDGET_EXHAUSTED = "budget_exhausted"
 
 
 class DriverRefusal(RuntimeError):
@@ -127,6 +136,10 @@ class DriverRefusal(RuntimeError):
 
 class SpecRefusal(DriverRefusal):
     """The conversation spec is invalid — validation happens before any write."""
+
+
+class PolicyRefusal(SpecRefusal):
+    """The participant chain violates the configured communication policy."""
 
 
 class ResumeSeedRefusal(DriverRefusal):
@@ -202,6 +215,7 @@ class ConversationResult:
     hops: tuple[DriverHop, ...]
     stop_reason: StopReason
     final_answer: Message | None
+    refusal: CommunicationPolicyRefusal | None = None
 
 
 def foreign_conversation_key(seed_id: str) -> str:
@@ -292,12 +306,14 @@ class ConversationDriver:
         bus: ConversationBus,
         delivery: MessageDelivery,
         resolver: RoleResolver,
+        policy: CommunicationPolicyGate | None = None,
     ) -> None:
         self._store = store
         self._writer = writer
         self._bus = bus
         self._delivery = delivery
         self._resolver = resolver
+        self._policy = policy
 
     # -- spec validation (frozen plan D3/D4) ---------------------------------
 
@@ -306,9 +322,7 @@ class ConversationDriver:
         if not isinstance(key, str) or not key.strip():
             raise SpecRefusal("conversation_key is required and must be a non-empty string")
         if len(key) > MAX_CONVERSATION_KEY_CHARS:
-            raise SpecRefusal(
-                f"conversation_key exceeds {MAX_CONVERSATION_KEY_CHARS} characters"
-            )
+            raise SpecRefusal(f"conversation_key exceeds {MAX_CONVERSATION_KEY_CHARS} characters")
         if for_start and key.startswith(FOREIGN_KEY_PREFIX):
             raise SpecRefusal(
                 f"conversation_key must not begin with the reserved '{FOREIGN_KEY_PREFIX}' "
@@ -330,19 +344,43 @@ class ConversationDriver:
                 )
         for index, participant in enumerate(spec.participants):
             self._resolved_participant(participant, index)
+        self._validate_policy_chain(spec)
         if for_start:
             if spec.seed_content is None or not spec.seed_content.strip():
                 raise SpecRefusal("start() requires non-empty seed_content")
         else:
             if spec.seed_content is not None:
-                raise SpecRefusal(
-                    "resume() adopts the persisted seed — seed_content must be unset"
-                )
+                raise SpecRefusal("resume() adopts the persisted seed — seed_content must be unset")
             if spec.seed_type is not MessageType.NOTE or spec.seed_blocking:
                 raise SpecRefusal(
                     "seed_type/seed_blocking are start-only — the persisted seed "
                     "is authoritative on resume"
                 )
+
+    def _validate_policy_chain(self, spec: ConversationSpec) -> None:
+        """Validate every role-to-role forward before the first write."""
+        if self._policy is None:
+            return
+        for index in range(1, len(spec.participants)):
+            previous = spec.participants[index - 1]
+            current = spec.participants[index]
+            sender = previous.role or AgentRole.PARTICIPANT
+            recipient = current.role or AgentRole.PARTICIPANT
+            envelope = PolicyEnvelope(
+                sender=sender,
+                recipient=recipient,
+                type=MessageType.NOTE,
+                blocking=False,
+                room_id=spec.room_id,
+                task_id=spec.task_id,
+            )
+            try:
+                self._policy.check_edge(envelope)
+            except CommunicationPolicyRefusal as exc:
+                raise PolicyRefusal(
+                    f"participant chain hop {index + 1} is not permitted by communication "
+                    f"policy: {exc}"
+                ) from exc
 
     def _resolved_participant(
         self, participant: ParticipantAddress, index: int
@@ -410,9 +448,7 @@ class ConversationDriver:
             references=list(references),
         )
 
-    def _send_driver_message(
-        self, message: Message, resolved_recipient: str
-    ) -> Message:
+    def _send_driver_message(self, message: Message, resolved_recipient: str) -> Message:
         """Persist via the bus with create-or-reuse on the deterministic id.
 
         A PRIMARY-KEY collision means a creator raced us (crash re-entry,
@@ -424,8 +460,18 @@ class ConversationDriver:
         bus-resolved identity while the composed message leaves ``recipient``
         empty for the bus to fill.
         """
+        existing = self._store.load_model(Message, message.id)
+        if existing is not None:
+            self._verify_identity(existing, message, resolved_recipient)
+            return existing
         try:
             return self._bus.send(message)
+        except BlockingBudgetExhausted:
+            existing = self._store.load_model(Message, message.id)
+            if existing is None:
+                raise
+            self._verify_identity(existing, message, resolved_recipient)
+            return existing
         except sqlite3.IntegrityError:
             existing = self._store.load_model(Message, message.id)
             if existing is None:
@@ -433,10 +479,33 @@ class ConversationDriver:
             self._verify_identity(existing, message, resolved_recipient)
             return existing
 
+    def _driver_message_exists(
+        self,
+        spec: ConversationSpec,
+        *,
+        kind: MessageKind,
+        hop_index: int,
+        attempt_index: int,
+        prev_message_id: str | None,
+        participant: tuple[str, str | None],
+    ) -> bool:
+        """Check for an exact deterministic row before spending a new turn."""
+        resolved_recipient, recipient_role = participant
+        message_id = derive_message_id(
+            conversation_key=spec.conversation_key,
+            room_id=spec.room_id,
+            task_id=spec.task_id,
+            hop_index=hop_index,
+            attempt_index=attempt_index,
+            kind=kind,
+            prev_message_id=prev_message_id,
+            recipient_role=recipient_role,
+            resolved_recipient=resolved_recipient,
+        )
+        return self._store.load_model(Message, message_id) is not None
+
     @staticmethod
-    def _verify_identity(
-        existing: Message, intended: Message, resolved_recipient: str
-    ) -> None:
+    def _verify_identity(existing: Message, intended: Message, resolved_recipient: str) -> None:
         """Exact semantic equality at a derived id (frozen plan D13).
 
         NULL-strict on role provenance and scope; ordered reference equality;
@@ -501,9 +570,7 @@ class ConversationDriver:
         persisted_seed = self._send_driver_message(seed, first[0])
         return await self._traverse(spec, persisted_seed)
 
-    async def resume(
-        self, spec: ConversationSpec, seed_message_id: str
-    ) -> ConversationResult:
+    async def resume(self, spec: ConversationSpec, seed_message_id: str) -> ConversationResult:
         """Adopt an existing persisted Message as the immutable root and traverse.
 
         The seed may be driver-composed (crash/re-entry recovery for
@@ -566,9 +633,7 @@ class ConversationDriver:
                 f"key {expected_key!r}, got {spec.conversation_key!r}"
             )
 
-    async def _traverse(
-        self, spec: ConversationSpec, seed: Message
-    ) -> ConversationResult:
+    async def _traverse(self, spec: ConversationSpec, seed: Message) -> ConversationResult:
         """Walk the participant sequence; hop 1 is the seed (frozen plan D5).
 
         Bounded by construction: one iteration per participant, at most
@@ -585,12 +650,38 @@ class ConversationDriver:
                 terminal = seed
             else:
                 assert final_answer is not None
+                forward_exists = self._driver_message_exists(
+                    spec,
+                    kind=MessageKind.FORWARD,
+                    hop_index=hop_index,
+                    attempt_index=1,
+                    prev_message_id=final_answer.id,
+                    participant=participant,
+                )
+                if not forward_exists:
+                    refusal = self._turn_budget_preflight(spec)
+                    if refusal is not None:
+                        return self._stop(
+                            seed,
+                            hops,
+                            StopReason.BUDGET_EXHAUSTED,
+                            final_answer,
+                            refusal=refusal,
+                        )
                 terminal = self._compose_and_send_forward(
                     spec, hop_index=hop_index, answer=final_answer, participant=participant
                 )
 
             attempts = 1
             outcome = await self._attempt_delivery(terminal)
+            if isinstance(outcome, BudgetExhausted):
+                return self._stop(
+                    seed,
+                    hops,
+                    StopReason.BUDGET_EXHAUSTED,
+                    final_answer,
+                    refusal=outcome,
+                )
             if outcome is None:
                 return self._stop(seed, hops, StopReason.DELIVERY_PENDING, final_answer)
 
@@ -603,7 +694,28 @@ class ConversationDriver:
             # Bounded new-Message retries stand for ordinary NOTE parents.
             retryable = terminal.type is not MessageType.CLARIFICATION_REQUEST
             if outcome.reply is None and retryable and attempts <= MAX_HOP_RETRIES:
+                failed_terminal = terminal
+                failed_outcome = outcome
                 failed_run_id = outcome.ask.run.id
+                retry_exists = self._driver_message_exists(
+                    spec,
+                    kind=MessageKind.RETRY,
+                    hop_index=hop_index,
+                    attempt_index=MAX_HOP_RETRIES + 1,
+                    prev_message_id=terminal.id,
+                    participant=participant,
+                )
+                if not retry_exists:
+                    refusal = self._turn_budget_preflight(spec)
+                    if refusal is not None:
+                        hops.append(DriverHop(forward=terminal, outcome=outcome, attempts=attempts))
+                        return self._stop(
+                            seed,
+                            hops,
+                            StopReason.BUDGET_EXHAUSTED,
+                            final_answer,
+                            refusal=refusal,
+                        )
                 terminal = self._compose_and_send_retry(
                     spec,
                     hop_index=hop_index,
@@ -613,10 +725,23 @@ class ConversationDriver:
                 )
                 attempts += 1
                 outcome = await self._attempt_delivery(terminal)
-                if outcome is None:
-                    return self._stop(
-                        seed, hops, StopReason.DELIVERY_PENDING, final_answer
+                if isinstance(outcome, BudgetExhausted):
+                    hops.append(
+                        DriverHop(
+                            forward=failed_terminal,
+                            outcome=failed_outcome,
+                            attempts=attempts - 1,
+                        )
                     )
+                    return self._stop(
+                        seed,
+                        hops,
+                        StopReason.BUDGET_EXHAUSTED,
+                        final_answer,
+                        refusal=outcome,
+                    )
+                if outcome is None:
+                    return self._stop(seed, hops, StopReason.DELIVERY_PENDING, final_answer)
 
             if outcome.reply is None:
                 hops.append(DriverHop(forward=terminal, outcome=outcome, attempts=attempts))
@@ -633,15 +758,29 @@ class ConversationDriver:
         hops: list[DriverHop],
         stop_reason: StopReason,
         final_answer: Message | None,
+        refusal: CommunicationPolicyRefusal | None = None,
     ) -> ConversationResult:
         return ConversationResult(
             seed=seed,
             hops=tuple(hops),
             stop_reason=stop_reason,
             final_answer=final_answer,
+            refusal=refusal,
         )
 
-    async def _attempt_delivery(self, message: Message) -> DeliveryReplyOutcome | None:
+    def _turn_budget_preflight(self, spec: ConversationSpec) -> CommunicationPolicyRefusal | None:
+        """Read-only admission before composing a forward or retry."""
+        if self._policy is None:
+            return None
+        try:
+            self._policy.check_turn_budget(spec.room_id, spec.task_id)
+        except BudgetExhausted as exc:
+            return exc
+        return None
+
+    async def _attempt_delivery(
+        self, message: Message
+    ) -> DeliveryReplyOutcome | BudgetExhausted | None:
         """One delivery attempt; ``None`` means the run is still pending.
 
         A pending delivery (RUNNING run behind a committed binding marker) is
@@ -657,6 +796,8 @@ class ConversationDriver:
             )
         except (DeliveryPendingRefusal, DuplicateDeliveryRefusal):
             return None
+        except BudgetExhausted as exc:
+            return exc
 
     def _compose_and_send_forward(
         self,

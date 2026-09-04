@@ -42,6 +42,8 @@ The implemented P4 runtime provides:
 
 The driver supports an `API -> harness -> different harness` chain with zero human copy-paste in the flow. This is a runtime capability today. The user-facing discussion protocol is not implemented yet.
 
+- Communication policy and budgets — Available (core; no CLI yet).
+
 ### Adapters and authentication
 
 The current adapter registry includes OpenAI-compatible API adapters and harness adapters for Codex CLI, Claude Code, and Antigravity CLI. API keys stay in environment variables. Harnesses own their login and session authentication.
@@ -50,7 +52,7 @@ The current adapter registry includes OpenAI-compatible API adapters and harness
 
 These are roadmap items, not current capabilities:
 
-- P5: `relay discuss`, bounded discussion protocols, communication policy, and message budgets;
+- P5: `relay discuss`, bounded discussion protocols, communication policy, and message budgets (in progress; policy/budgets core available);
 - P6: automated implementation review and fix loops;
 - P7: persistent Rooms, seats, and long-lived participant context;
 - P8: decision provenance;

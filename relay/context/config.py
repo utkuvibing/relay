@@ -10,10 +10,20 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    ValidationError,
+    model_validator,
+)
 
 from relay.agents.base import AgentRole, BackendType
+from relay.core.policy import BLOCKING_CAPABLE_TYPES
 from relay.harness.types import ExecutionGrantKind
+from relay.storage.models import MessageType
 
 DEFAULT_AGENT_NAME = "gpt"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -92,6 +102,72 @@ class ApprovalPolicyConfig(BaseModel):
     mode: Literal["gated", "direct"] = "gated"
 
 
+class CommunicationBudgetsConfig(BaseModel):
+    """Ledger-derived communication limits for one room/task scope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_agent_turns: StrictInt = Field(default=16, ge=1, le=1000)
+    max_blocking_messages: StrictInt = Field(default=3, ge=0, le=1000)
+
+
+class CommunicationEdgeConfig(BaseModel):
+    """One exact role-to-role edge from the optional communication matrix."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    from_: AgentRole = Field(alias="from")
+    to: AgentRole
+    types: frozenset[MessageType]
+    blocking: StrictBool = False
+
+    @property
+    def from_role(self) -> AgentRole:
+        """Python-friendly spelling of the YAML ``from`` key."""
+        return self.from_
+
+    @model_validator(mode="after")
+    def _validate_edge(self) -> CommunicationEdgeConfig:
+        if not self.types:
+            raise ValueError("communication edge types must not be empty")
+        if self.from_ is self.to:
+            raise ValueError(
+                f"communication edge '{self.from_.value}' -> '{self.to.value}' is a self-send"
+            )
+        if MessageType.SYSTEM in self.types:
+            raise ValueError("communication edges may not permit system messages")
+        if self.blocking and not (self.types & BLOCKING_CAPABLE_TYPES):
+            raise ValueError(
+                "blocking: true requires at least one blocking-capable message type"
+            )
+        return self
+
+
+class CommunicationConfig(BaseModel):
+    """Optional declarative communication policy settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    budgets: CommunicationBudgetsConfig | None = None
+    #: ``None`` means unrestricted pairs; an explicit empty list denies all
+    #: role-to-role pairs until protocol definitions supply edges.
+    edges: list[CommunicationEdgeConfig] | None = None
+
+    @model_validator(mode="after")
+    def _edges_are_unique(self) -> CommunicationConfig:
+        if self.edges is None:
+            return self
+        seen: set[tuple[AgentRole, AgentRole]] = set()
+        for edge in self.edges:
+            pair = (edge.from_, edge.to)
+            if pair in seen:
+                raise ValueError(
+                    f"duplicate communication edge '{edge.from_.value}' -> '{edge.to.value}'"
+                )
+            seen.add(pair)
+        return self
+
+
 class RelayConfig(BaseModel):
     """The full parsed ``relay.yaml``; unknown top-level fields are rejected."""
 
@@ -113,6 +189,9 @@ class RelayConfig(BaseModel):
     #: direction and no conflict validation; each is the sole source of truth
     #: for its own workflow.
     roles: dict[str, str] = Field(default_factory=dict)
+    #: P5.1 — optional policy and budget vocabulary; absent is additive and
+    #: resolves to frozen defaults when converted by ``policy_from_config``.
+    communication: CommunicationConfig | None = None
 
     @model_validator(mode="after")
     def _reviewer_must_be_configured(self) -> RelayConfig:

@@ -119,6 +119,17 @@ class TestPersistedVocabularyHygiene:
         for message_type in MessageType:
             assert message_type.value not in {"run_input", "run_output"}
 
+    def test_communication_config_has_no_secret_shaped_fields(self):
+        from relay.context.config import (
+            CommunicationBudgetsConfig,
+            CommunicationConfig,
+            CommunicationEdgeConfig,
+        )
+
+        banned_names = {"api_key", "apikey", "token", "credential", "password", "session_id"}
+        for model in (CommunicationBudgetsConfig, CommunicationEdgeConfig, CommunicationConfig):
+            assert not (set(model.model_fields) & banned_names), model.__name__
+
 
 class TestAgentLayerTransportNeutrality:
     """App. B.2/B.4: the seam admits harnesses without touching domain models."""
@@ -241,6 +252,7 @@ class TestConversationBusAuthorityBoundary:
             RELAY_ROOT / "core" / "resolver.py",
             RELAY_ROOT / "core" / "agent_factory.py",
             RELAY_ROOT / "core" / "driver.py",
+            RELAY_ROOT / "core" / "policy.py",
         ]
         assert all(path.exists() for path in modules), "guard against silent renames"
         for module_path in modules:
@@ -347,6 +359,49 @@ class TestDriverRoutesOnIdentityNotProviders:
                     if re.search(rf"\b{re.escape(token)}\b", lowered):
                         offenders.append(f"{token} in {text!r}")
         assert not offenders, f"driver.py carries provider vocabulary: {offenders}"
+
+    def test_policy_module_carries_no_provider_vocabulary(self):
+        """P5.1 policy is a role/ledger layer, not an execution-family layer."""
+        import re
+
+        path = RELAY_ROOT / "core" / "policy.py"
+        assert path.exists(), "guard against a silent rename"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docstrings = self._docstring_node_ids(tree)
+
+        offenders: list[str] = []
+        for node in ast.walk(tree):
+            texts: list[str] = []
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in docstrings
+            ):
+                texts.append(node.value)
+            elif isinstance(node, ast.Name):
+                texts.append(node.id)
+            elif isinstance(node, ast.Attribute):
+                texts.append(node.attr)
+            elif isinstance(node, ast.arg):
+                texts.append(node.arg)
+            for text in texts:
+                lowered = text.lower()
+                for token in self._FORBIDDEN_TOKENS:
+                    if re.search(rf"\b{re.escape(token)}\b", lowered):
+                        offenders.append(f"{token} in {text!r}")
+        assert not offenders, f"policy.py carries provider vocabulary: {offenders}"
+
+    def test_policy_module_actually_parses(self):
+        """P5.1 guard against a silent rename emptying the policy scan."""
+        path = RELAY_ROOT / "core" / "policy.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        assert "CommunicationPolicy" in names
+        assert "evaluate_edge" in names
 
     def test_the_driver_module_actually_parses(self):
         """Guard against a silent rename emptying the scan."""

@@ -58,6 +58,13 @@ from relay.core.bus import (
     RoundTripLimitExceeded,
 )
 from relay.core.orchestrator import AskOutcome, run_ask
+from relay.core.policy import (
+    REPLY_ADMISSION_REFERENCE_PREFIX,
+    CommunicationPolicyGate,
+    PolicyEnvelope,
+    principal_for_sender,
+    reply_admission_reference,
+)
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     ArtifactKind,
@@ -154,11 +161,13 @@ class MessageDelivery:
         writer: EventLogWriter,
         factory: AgentFactory,
         bus: ConversationBus | None = None,
+        policy: CommunicationPolicyGate | None = None,
     ) -> None:
         self._store = store
         self._writer = writer
         self._factory = factory
-        self._bus = bus if bus is not None else ConversationBus(store, writer)
+        self._bus = bus if bus is not None else ConversationBus(store, writer, policy=policy)
+        self._policy = policy if policy is not None else getattr(self._bus, "_policy", None)
 
     # -- public path ---------------------------------------------------------
 
@@ -170,6 +179,15 @@ class MessageDelivery:
         exceptions with ZERO store delta. Run failures are NOT refusals —
         the spine records them honestly and the binding marker is retained.
         """
+        return await self._deliver(message_id, admitted_reply_type=None)
+
+    async def _deliver(
+        self,
+        message_id: str,
+        *,
+        admitted_reply_type: MessageType | None,
+    ) -> DeliveryOutcome:
+        """Initiate delivery, optionally binding a pre-admitted reply type."""
         message = self._store.load_model(Message, message_id)
         if message is None:
             raise DeliveryRefusal(f"message '{message_id}' does not exist")
@@ -207,7 +225,7 @@ class MessageDelivery:
             request,
             model=model,
             agent_name=recipient,
-            pre_provider=self._binding_hook(message),
+            pre_provider=self._binding_hook(message, admitted_reply_type),
         )
         return DeliveryOutcome(message=message, ask=ask)
 
@@ -250,6 +268,9 @@ class MessageDelivery:
         self._preflight_thread_depth(message, max_thread_depth)
 
         deliveries = self.deliveries_for_message(message_id)
+        if not deliveries and self._policy is not None:
+            delivery_role = self._role_for(message)
+            self._check_reply_edge(message, actual_reply_type, delivery_role)
         if deliveries:
             marker = deliveries[0]
             run_id = None
@@ -267,7 +288,10 @@ class MessageDelivery:
                 raise DeliveryRefusal(f"delivery run '{run_id}' not found in store")
 
             # Causal provenance: verify marker references parent message and run
-            if f"message:{message.id}" not in marker.references or f"run:{run.id}" not in marker.references:
+            if (
+                f"message:{message.id}" not in marker.references
+                or f"run:{run.id}" not in marker.references
+            ):
                 raise DeliveryRefusal("corrupt causal provenance: marker references mismatch")
 
             if run.status is RunStatus.RUNNING:
@@ -298,16 +322,23 @@ class MessageDelivery:
             ask = AskOutcome(run=run, response=recovered_response)
 
             # Idempotency check: if reply already exists for this (message.id, run.id)
-            existing_replies = [
-                m for m in self._bus.replies_for(message.id) if m.run_id == run.id
-            ]
+            existing_replies = [m for m in self._bus.replies_for(message.id) if m.run_id == run.id]
             if existing_replies:
-                return DeliveryReplyOutcome(message=message, ask=ask, reply=existing_replies[0])
+                existing_reply = self._existing_reply_for_type(
+                    existing_replies, actual_reply_type
+                )
+                self._marker_admits_reply_type(marker, actual_reply_type)
+                return DeliveryReplyOutcome(message=message, ask=ask, reply=existing_reply)
 
             # Authorship verification
             if run.agent != message.recipient:
                 raise DeliveryRefusal(
                     f"authorship violation: delivery run belongs to {run.agent!r}, not recipient {message.recipient!r}"
+                )
+
+            if self._policy is not None:
+                self._check_recovery_reply_admission(
+                    marker, message, actual_reply_type, self._role_for(message)
                 )
 
             reply = self._build_reply(message, run, output_content, actual_reply_type)
@@ -316,13 +347,21 @@ class MessageDelivery:
             except sqlite3.IntegrityError:
                 existing = [m for m in self._bus.replies_for(message.id) if m.run_id == run.id]
                 if existing:
-                    return DeliveryReplyOutcome(message=message, ask=ask, reply=existing[0])
+                    existing_reply = self._existing_reply_for_type(
+                        existing, actual_reply_type
+                    )
+                    return DeliveryReplyOutcome(message=message, ask=ask, reply=existing_reply)
                 raise
 
             return DeliveryReplyOutcome(message=message, ask=ask, reply=saved_reply)
 
         # Fresh delivery
-        outcome = await self.deliver(message_id)
+        outcome = await self._deliver(
+            message_id,
+            admitted_reply_type=(
+                actual_reply_type if self._policy is not None else None
+            ),
+        )
         if outcome.ask.response is None:
             return DeliveryReplyOutcome(message=message, ask=outcome.ask, reply=None)
 
@@ -338,7 +377,10 @@ class MessageDelivery:
         except sqlite3.IntegrityError:
             existing = [m for m in self._bus.replies_for(message.id) if m.run_id == run.id]
             if existing:
-                return DeliveryReplyOutcome(message=message, ask=outcome.ask, reply=existing[0])
+                existing_reply = self._existing_reply_for_type(existing, actual_reply_type)
+                return DeliveryReplyOutcome(
+                    message=message, ask=outcome.ask, reply=existing_reply
+                )
             raise
 
         return DeliveryReplyOutcome(message=message, ask=outcome.ask, reply=saved_reply)
@@ -350,6 +392,95 @@ class MessageDelivery:
             raise ThreadDepthRefusal(str(exc)) from exc
         except ReplyRejected as exc:
             raise ThreadDepthRefusal(f"preflight thread ancestry check failed: {exc}") from exc
+
+    def _check_reply_edge(
+        self, message: Message, reply_type: MessageType, delivery_role: AgentRole
+    ) -> None:
+        """Admit a fresh delivery's prospective reply before provider I/O."""
+        author_role: str | None = None
+        if not message.sender.startswith(("human:", "relay:")):
+            if message.run_id is None:
+                raise DeliveryRefusal(
+                    f"bare sender {message.sender!r} has no authorship Run; "
+                    "policy reply admission requires persisted role provenance"
+                )
+            author_run = self._store.load_model(Run, message.run_id)
+            if author_run is None:
+                raise DeliveryRefusal(
+                    f"authorship Run {message.run_id!r} for sender "
+                    f"{message.sender!r} does not exist"
+                )
+            if author_run.agent != message.sender:
+                raise DeliveryRefusal(
+                    f"authorship Run {message.run_id!r} belongs to "
+                    f"{author_run.agent!r}, not sender {message.sender!r}"
+                )
+            author_role = author_run.role
+        try:
+            recipient = principal_for_sender(message.sender, run_role=author_role)
+        except (TypeError, ValueError) as exc:
+            raise DeliveryRefusal(f"invalid sender policy provenance: {exc}") from exc
+        self._policy.check_edge(
+            PolicyEnvelope(
+                sender=delivery_role,
+                recipient=recipient,
+                type=reply_type,
+                blocking=False,
+                room_id=message.room_id,
+                task_id=message.task_id,
+            )
+        )
+
+    def _check_recovery_reply_admission(
+        self,
+        marker: EventLogEntry,
+        message: Message,
+        reply_type: MessageType,
+        delivery_role: AgentRole,
+    ) -> None:
+        """Trust an exact prior admission or re-evaluate a standalone delivery."""
+        if self._marker_admits_reply_type(marker, reply_type):
+            return
+        self._check_reply_edge(message, reply_type, delivery_role)
+
+    @staticmethod
+    def _marker_admits_reply_type(
+        marker: EventLogEntry, reply_type: MessageType
+    ) -> bool:
+        """Return typed admission presence and reject contradictory marker claims."""
+        admission_refs = [
+            ref for ref in marker.references if ref.startswith(REPLY_ADMISSION_REFERENCE_PREFIX)
+        ]
+        if not admission_refs:
+            return False
+        expected = reply_admission_reference(reply_type)
+        if admission_refs != [expected]:
+            admitted = ", ".join(
+                repr(ref.removeprefix(REPLY_ADMISSION_REFERENCE_PREFIX))
+                for ref in admission_refs
+            )
+            raise DeliveryRefusal(
+                f"delivery marker at sequence {marker.sequence!r} admitted reply type "
+                f"{admitted}, not reply type {reply_type.value!r}"
+            )
+        return True
+
+    @staticmethod
+    def _existing_reply_for_type(
+        existing_replies: list[Message], requested_reply_type: MessageType
+    ) -> Message:
+        """Return the idempotent reply only when it matches its admission."""
+        existing_reply = existing_replies[0]
+        if existing_reply.type is not requested_reply_type:
+            raise DeliveryRefusal(
+                f"existing reply type {existing_reply.type.value!r} does not match "
+                f"requested reply type {requested_reply_type.value!r}"
+            )
+        if existing_reply.blocking:
+            raise DeliveryRefusal(
+                "existing delivery-bound reply must be non-blocking"
+            )
+        return existing_reply
 
     def _error_for_failed_run(self, run_id: str, agent_name: str) -> str:
         """Extract the sanitized failure error from AGENT_RUN_FINISHED event."""
@@ -363,7 +494,7 @@ class MessageDelivery:
             if run_ref in entry.references:
                 prefix = f"agent '{agent_name}' failed: "
                 if entry.content.startswith(prefix):
-                    return entry.content[len(prefix):]
+                    return entry.content[len(prefix) :]
                 return entry.content
         return "delivery run failed"
 
@@ -372,6 +503,10 @@ class MessageDelivery:
         parent_type: MessageType, reply_type: MessageType | None
     ) -> MessageType:
         if reply_type is not None:
+            if reply_type is MessageType.SYSTEM:
+                raise InvalidReplyTypeRefusal(
+                    "MessageType.SYSTEM is reserved for relay-authored system messages"
+                )
             return reply_type
         if parent_type is MessageType.CLARIFICATION_REQUEST:
             return MessageType.CLARIFICATION_RESPONSE
@@ -475,7 +610,11 @@ class MessageDelivery:
             workspace_root=agent._workspace_root,
         )
 
-    def _binding_hook(self, message: Message) -> object:
+    def _binding_hook(
+        self,
+        message: Message,
+        admitted_reply_type: MessageType | None,
+    ) -> object:
         """D10/D13/D14 Tx1 hook: bind atomically, veto duplicates.
 
         Runs INSIDE the delivery run's pre-provider Tx1 (single
@@ -491,12 +630,18 @@ class MessageDelivery:
                     "at-most-once delivery initiation (frozen plan D13); "
                     "redelivery/retry semantics are P4.4+ work"
                 )
-            return [self._marker_for(message, run)]
+            if self._policy is not None:
+                self._policy.check_turn_budget(message.room_id, message.task_id)
+            return [self._marker_for(message, run, admitted_reply_type)]
 
         return bind
 
     @staticmethod
-    def _marker_for(message: Message, run: Run) -> EventLogEntry:
+    def _marker_for(
+        message: Message,
+        run: Run,
+        admitted_reply_type: MessageType | None = None,
+    ) -> EventLogEntry:
         """D10 binding marker: bounded metadata, message+run+scope refs."""
         role_note = f" via role '{message.recipient_role}'" if message.recipient_role else ""
         references = [f"message:{message.id}", f"run:{run.id}"]
@@ -504,6 +649,8 @@ class MessageDelivery:
             references.append(f"room:{message.room_id}")
         if message.task_id:
             references.append(f"task:{message.task_id}")
+        if admitted_reply_type is not None:
+            references.append(reply_admission_reference(admitted_reply_type))
         return EventLogEntry(
             room_id=message.room_id,
             task_id=message.task_id,
