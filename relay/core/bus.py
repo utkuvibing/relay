@@ -43,6 +43,17 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from relay.agents.base import AgentRole
+from relay.core.policy import (
+    BLOCKING_CAPABLE_TYPES,
+    REPLY_ADMISSION_REFERENCE_PREFIX,
+    CommunicationPolicyGate,
+    MessageRejected,
+    PolicyEnvelope,
+    principal_for_recipient,
+    principal_for_sender,
+    reply_admission_reference,
+)
 from relay.storage.events import EventLogWriter
 from relay.storage.models import EventLogEntry, EventType, Message, MessageType, Run
 from relay.storage.store import SqliteRelayStore
@@ -56,14 +67,7 @@ MESSAGE_CONTENT_CAP_CHARS = 50_000
 #: App. D.5: blocking-ness is metadata, legal only on the clarification
 #: request and the D.5 "blocker" renderings (challenge/proposal/finding).
 #: ``note`` can never block; no other type may carry the flag.
-_BLOCKING_CAPABLE_TYPES = frozenset(
-    {
-        MessageType.CLARIFICATION_REQUEST,
-        MessageType.CHALLENGE,
-        MessageType.PROPOSAL,
-        MessageType.REVIEW_FINDING,
-    }
-)
+_BLOCKING_CAPABLE_TYPES = BLOCKING_CAPABLE_TYPES
 
 _ALLOWED_SENDER_PREFIXES = ("human:", "relay:")
 _ALLOWED_RECIPIENT_PREFIXES = ("human:", "relay:")
@@ -73,10 +77,6 @@ _SYSTEM_SENDER_PREFIX = "relay:"
 
 #: P4.3 (frozen plan D12): protocol-independent hard thread depth ceiling.
 DEFAULT_MAX_THREAD_DEPTH = 10
-
-
-class MessageRejected(ValueError):
-    """Typed pre-persistence rejection: nothing was written to the store."""
 
 
 class ReplyRejected(MessageRejected):
@@ -122,10 +122,12 @@ class ConversationBus:
         store: SqliteRelayStore,
         writer: EventLogWriter,
         resolver: RoleResolver | None = None,
+        policy: CommunicationPolicyGate | None = None,
     ) -> None:
         self._store = store
         self._writer = writer
         self._resolver = resolver
+        self._policy = policy
 
     # -- write path ----------------------------------------------------------
 
@@ -144,6 +146,12 @@ class ConversationBus:
         """
         validated = self._validate(message, max_thread_depth=max_thread_depth)
         with self._store.transaction():
+            if (
+                self._policy is not None
+                and validated.blocking
+                and not validated.sender.startswith("human:")
+            ):
+                self._policy.check_blocking_budget(validated.room_id, validated.task_id)
             saved = self._store.save_model(validated)
             self._writer.record(self._marker_for(saved))
         return saved
@@ -158,7 +166,7 @@ class ConversationBus:
             raise MessageRejected("message must carry a room_id and/or a task_id")
 
         self._validate_sender(message.sender)
-        self._validate_authorship(message)
+        authorship_run = self._validate_authorship(message)
 
         if message.recipient_role is not None:
             if not _identity_is_valid(message.recipient_role):
@@ -223,6 +231,14 @@ class ConversationBus:
 
         if message.reply_to_id is not None:
             self._validate_reply(message, max_thread_depth)
+
+        delivery_bound_reply = self._is_delivery_bound_reply(message)
+        if (
+            self._policy is not None
+            and authorship_run is not None
+            and not delivery_bound_reply
+        ):
+            self._policy.check_edge(self._policy_envelope(message, authorship_run))
 
         return message
 
@@ -301,7 +317,7 @@ class ConversationBus:
         if self._resolver is not None and not self._resolver.knows_agent(sender):
             raise MessageRejected(f"unknown logical agent sender {sender!r}")
 
-    def _validate_authorship(self, message: Message) -> None:
+    def _validate_authorship(self, message: Message) -> Run | None:
         """P4.2 (frozen plan D1): strict authorship provenance.
 
         A bare logical-agent sender MUST carry ``run_id`` and the linked Run
@@ -316,7 +332,7 @@ class ConversationBus:
                     "authorship provenance is agent-only; cite runs via "
                     "generic references instead"
                 )
-            return
+            return None
         if message.run_id is None:
             raise MessageRejected(
                 f"bare logical-agent sender {message.sender!r} requires run "
@@ -331,6 +347,93 @@ class ConversationBus:
                 f"authorship mismatch: run {message.run_id!r} belongs to agent "
                 f"{run.agent!r}, not sender {message.sender!r}"
             )
+        return run
+
+    def _policy_envelope(self, message: Message, authorship_run: Run) -> PolicyEnvelope:
+        """Build policy vocabulary from the validated persisted facts."""
+        try:
+            sender = principal_for_sender(message.sender, run_role=authorship_run.role)
+            if message.reply_to_id is None:
+                recipient = principal_for_recipient(
+                    message.recipient, recipient_role=message.recipient_role
+                )
+            else:
+                parent = self._store.load_model(Message, message.reply_to_id)
+                if parent is None:
+                    raise ValueError(
+                        f"reply parent {message.reply_to_id!r} is missing during policy evaluation"
+                    )
+                parent_role: AgentRole | str | None = None
+                if not parent.sender.startswith(("human:", "relay:")):
+                    if parent.run_id is None:
+                        raise ValueError(
+                            f"bare parent sender {parent.sender!r} requires authorship Run provenance"
+                        )
+                    parent_run = self._store.load_model(Run, parent.run_id)
+                    if parent_run is None:
+                        raise ValueError(
+                            f"parent authorship Run {parent.run_id!r} does not exist"
+                        )
+                    if parent_run.agent != parent.sender:
+                        raise ValueError(
+                            f"parent authorship Run {parent.run_id!r} belongs to "
+                            f"{parent_run.agent!r}, not sender {parent.sender!r}"
+                        )
+                    parent_role = parent_run.role
+                recipient = principal_for_sender(parent.sender, run_role=parent_role)
+        except (TypeError, ValueError) as exc:
+            raise MessageRejected(f"invalid policy principal provenance: {exc}") from exc
+        return PolicyEnvelope(
+            sender=sender,
+            recipient=recipient,
+            type=message.type,
+            blocking=message.blocking,
+            room_id=message.room_id,
+            task_id=message.task_id,
+        )
+
+    def _is_delivery_bound_reply(self, message: Message) -> bool:
+        """Return exact typed admission; reject contradictory marker claims."""
+        if message.reply_to_id is None or message.run_id is None:
+            return False
+        message_ref = f"message:{message.reply_to_id}"
+        run_ref = f"run:{message.run_id}"
+        admission_ref = reply_admission_reference(message.type)
+        for marker in self._store.all_models(
+            EventLogEntry,
+            "WHERE type = ?",
+            [EventType.MESSAGE_DELIVERED.value],
+            order_by="sequence ASC",
+        ):
+            if not (
+                message_ref in marker.references
+                and run_ref in marker.references
+                and marker.room_id == message.room_id
+                and marker.task_id == message.task_id
+            ):
+                continue
+            admission_refs = [
+                ref
+                for ref in marker.references
+                if ref.startswith(REPLY_ADMISSION_REFERENCE_PREFIX)
+            ]
+            if not admission_refs:
+                continue
+            if admission_refs == [admission_ref]:
+                if message.blocking:
+                    raise MessageRejected(
+                        "delivery-bound reply materialization must be non-blocking"
+                    )
+                return True
+            admitted = ", ".join(
+                repr(ref.removeprefix(REPLY_ADMISSION_REFERENCE_PREFIX))
+                for ref in admission_refs
+            )
+            raise MessageRejected(
+                f"delivery marker at sequence {marker.sequence!r} admitted reply type "
+                f"{admitted}, not materialized reply type {message.type.value!r}"
+            )
+        return False
 
     def _resolve_role(self, role: str) -> str:
         if self._resolver is None:
