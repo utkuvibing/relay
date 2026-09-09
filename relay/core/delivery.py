@@ -65,6 +65,8 @@ from relay.core.policy import (
     principal_for_sender,
     reply_admission_reference,
 )
+from relay.core.protocols import ProtocolDefinition, StageContext
+from relay.core.stage_policy import StageContextRefusal, stage_admission
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     ArtifactKind,
@@ -162,12 +164,26 @@ class MessageDelivery:
         factory: AgentFactory,
         bus: ConversationBus | None = None,
         policy: CommunicationPolicyGate | None = None,
+        *,
+        stage_context: StageContext | None = None,
+        protocol: ProtocolDefinition | None = None,
     ) -> None:
         self._store = store
         self._writer = writer
         self._factory = factory
-        self._bus = bus if bus is not None else ConversationBus(store, writer, policy=policy)
+        self._bus = bus if bus is not None else ConversationBus(
+            store, writer, policy=policy, stage_context=stage_context, protocol=protocol
+        )
         self._policy = policy if policy is not None else getattr(self._bus, "_policy", None)
+        self._stage = stage_admission(stage_context, protocol, self._policy)
+        bus_stage = getattr(self._bus, "_stage", None)
+        if (self._stage is not None or bus_stage is not None) and (
+            self._stage is None or bus_stage is None
+            or self._stage.context != bus_stage.context
+            or self._stage.definition != bus_stage.definition
+            or self._policy is not self._bus._policy
+        ):
+            raise StageContextRefusal("delivery and bus must share stage context, definition, gate")
 
     # -- public path ---------------------------------------------------------
 
@@ -191,6 +207,12 @@ class MessageDelivery:
         message = self._store.load_model(Message, message_id)
         if message is None:
             raise DeliveryRefusal(f"message '{message_id}' does not exist")
+
+        self._check_stage_record(message)
+        if self._stage is not None:
+            envelope = self._bus._policy_envelope(message, self._bus._validate_authorship(message))
+            self._stage.check_edge(envelope)
+            self._policy.check_edge(envelope)
 
         recipient = message.recipient
         if recipient is None or ":" in recipient:
@@ -254,6 +276,8 @@ class MessageDelivery:
         if message is None:
             raise DeliveryRefusal(f"message '{message_id}' does not exist")
 
+        self._check_stage_record(message)
+
         recipient = message.recipient
         if recipient is None or ":" in recipient:
             raise DeliveryRefusal(
@@ -272,6 +296,10 @@ class MessageDelivery:
             delivery_role = self._role_for(message)
             self._check_reply_edge(message, actual_reply_type, delivery_role)
         if deliveries:
+            if self._stage is not None:
+                if len(deliveries) != 1:
+                    raise StageContextRefusal("stage request has contradictory delivery bindings")
+                self._stage.check_record(deliveries[0])
             marker = deliveries[0]
             run_id = None
             for ref in marker.references:
@@ -286,6 +314,16 @@ class MessageDelivery:
             run = self._store.load_model(Run, run_id)
             if run is None:
                 raise DeliveryRefusal(f"delivery run '{run_id}' not found in store")
+
+            if self._stage is not None and (
+                run.agent != message.recipient or run.role != self._role_for(message).value
+                or run.task_id != message.task_id or marker.sender != DELIVERY_SENDER
+                or marker.recipient != message.recipient
+                or [ref for ref in marker.references if ref.startswith("run:")] != [f"run:{run.id}"]
+                or [ref for ref in marker.references if ref.startswith("message:")]
+                != [f"message:{message.id}"]
+            ):
+                raise StageContextRefusal("stage delivery binding has contradictory provenance")
 
             # Causal provenance: verify marker references parent message and run
             if (
@@ -328,6 +366,12 @@ class MessageDelivery:
                     existing_replies, actual_reply_type
                 )
                 self._marker_admits_reply_type(marker, actual_reply_type)
+                self._check_stage_record(existing_reply)
+                if self._stage is not None and (
+                    existing_reply.sender != message.recipient
+                    or existing_reply.recipient != message.sender or existing_reply.blocking
+                ):
+                    raise StageContextRefusal("existing stage reply contradicts its parent")
                 return DeliveryReplyOutcome(message=message, ask=ask, reply=existing_reply)
 
             # Authorship verification
@@ -420,16 +464,23 @@ class MessageDelivery:
             recipient = principal_for_sender(message.sender, run_role=author_role)
         except (TypeError, ValueError) as exc:
             raise DeliveryRefusal(f"invalid sender policy provenance: {exc}") from exc
-        self._policy.check_edge(
-            PolicyEnvelope(
-                sender=delivery_role,
-                recipient=recipient,
-                type=reply_type,
-                blocking=False,
-                room_id=message.room_id,
-                task_id=message.task_id,
-            )
+        envelope = PolicyEnvelope(
+            sender=delivery_role,
+            recipient=recipient,
+            type=reply_type,
+            blocking=False,
+            room_id=message.room_id,
+            task_id=message.task_id,
         )
+        if self._stage is not None:
+            self._stage.check_edge(envelope)
+        self._policy.check_edge(envelope)
+
+    def _check_stage_record(self, message: Message) -> None:
+        if self._stage is not None:
+            self._stage.check_record(message)
+        elif message.stage_key is not None:
+            raise StageContextRefusal("unscoped delivery refuses stage-tagged traffic")
 
     def _check_recovery_reply_admission(
         self,
@@ -523,6 +574,7 @@ class MessageDelivery:
     ) -> Message:
         assert parent.recipient is not None
         return Message(
+            stage_key=parent.stage_key,
             sender=parent.recipient,
             recipient=parent.sender,
             reply_to_id=parent.id,
@@ -632,6 +684,8 @@ class MessageDelivery:
                 )
             if self._policy is not None:
                 self._policy.check_turn_budget(message.room_id, message.task_id)
+                if self._stage is not None:
+                    self._stage.check_turn_budget()
             return [self._marker_for(message, run, admitted_reply_type)]
 
         return bind
@@ -652,6 +706,7 @@ class MessageDelivery:
         if admitted_reply_type is not None:
             references.append(reply_admission_reference(admitted_reply_type))
         return EventLogEntry(
+            stage_key=message.stage_key,
             room_id=message.room_id,
             task_id=message.task_id,
             sender=DELIVERY_SENDER,

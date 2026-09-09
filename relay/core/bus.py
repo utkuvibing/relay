@@ -54,6 +54,8 @@ from relay.core.policy import (
     principal_for_sender,
     reply_admission_reference,
 )
+from relay.core.protocols import ProtocolDefinition, StageContext
+from relay.core.stage_policy import StageContextRefusal, stage_admission
 from relay.storage.events import EventLogWriter
 from relay.storage.models import EventLogEntry, EventType, Message, MessageType, Run
 from relay.storage.store import SqliteRelayStore
@@ -123,11 +125,15 @@ class ConversationBus:
         writer: EventLogWriter,
         resolver: RoleResolver | None = None,
         policy: CommunicationPolicyGate | None = None,
+        *,
+        stage_context: StageContext | None = None,
+        protocol: ProtocolDefinition | None = None,
     ) -> None:
         self._store = store
         self._writer = writer
         self._resolver = resolver
         self._policy = policy
+        self._stage = stage_admission(stage_context, protocol, policy)
 
     # -- write path ----------------------------------------------------------
 
@@ -152,6 +158,8 @@ class ConversationBus:
                 and not validated.sender.startswith("human:")
             ):
                 self._policy.check_blocking_budget(validated.room_id, validated.task_id)
+                if self._stage is not None:
+                    self._stage.check_blocking_budget()
             saved = self._store.save_model(validated)
             self._writer.record(self._marker_for(saved))
         return saved
@@ -162,6 +170,11 @@ class ConversationBus:
         max_thread_depth: int = DEFAULT_MAX_THREAD_DEPTH,
     ) -> Message:
         """Full G2 validation matrix; returns the message to persist."""
+        if self._stage is not None:
+            self._stage.check_record(message, allow_unstamped=True)
+            message = message.model_copy(update={"stage_key": self._stage.context.stage_key})
+        elif message.stage_key is not None:
+            raise StageContextRefusal("unscoped bus refuses stage-tagged traffic")
         if message.room_id is None and message.task_id is None:
             raise MessageRejected("message must carry a room_id and/or a task_id")
 
@@ -233,6 +246,8 @@ class ConversationBus:
             self._validate_reply(message, max_thread_depth)
 
         delivery_bound_reply = self._is_delivery_bound_reply(message)
+        if self._stage is not None and not delivery_bound_reply:
+            self._stage.check_edge(self._policy_envelope(message, authorship_run))
         if (
             self._policy is not None
             and authorship_run is not None
@@ -248,6 +263,9 @@ class ConversationBus:
         parent = self._store.load_model(Message, message.reply_to_id)
         if parent is None:
             raise ReplyRejected(f"parent message {message.reply_to_id!r} not found")
+
+        if message.stage_key != parent.stage_key:
+            raise StageContextRefusal("reply stage must match its parent; use references across stages")
 
         if message.room_id != parent.room_id or message.task_id != parent.task_id:
             raise ReplyScopeMismatch(
@@ -349,10 +367,12 @@ class ConversationBus:
             )
         return run
 
-    def _policy_envelope(self, message: Message, authorship_run: Run) -> PolicyEnvelope:
+    def _policy_envelope(self, message: Message, authorship_run: Run | None) -> PolicyEnvelope:
         """Build policy vocabulary from the validated persisted facts."""
         try:
-            sender = principal_for_sender(message.sender, run_role=authorship_run.role)
+            sender = principal_for_sender(
+                message.sender, run_role=authorship_run.role if authorship_run is not None else None
+            )
             if message.reply_to_id is None:
                 recipient = principal_for_recipient(
                     message.recipient, recipient_role=message.recipient_role
@@ -412,6 +432,14 @@ class ConversationBus:
                 and marker.task_id == message.task_id
             ):
                 continue
+            if marker.stage_key != message.stage_key:
+                raise StageContextRefusal("delivery admission marker has a different stage key")
+            if message.stage_key is not None and (
+                marker.sender != "relay:delivery" or marker.recipient != message.sender
+                or [ref for ref in marker.references if ref.startswith("message:")] != [message_ref]
+                or [ref for ref in marker.references if ref.startswith("run:")] != [run_ref]
+            ):
+                raise StageContextRefusal("stage delivery marker has contradictory provenance")
             admission_refs = [
                 ref
                 for ref in marker.references
@@ -462,6 +490,7 @@ class ConversationBus:
         if saved.task_id:
             scope_refs.append(f"task:{saved.task_id}")
         return EventLogEntry(
+            stage_key=saved.stage_key,
             room_id=saved.room_id,
             task_id=saved.task_id,
             sender=saved.sender,

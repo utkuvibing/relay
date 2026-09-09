@@ -253,6 +253,9 @@ class TestConversationBusAuthorityBoundary:
             RELAY_ROOT / "core" / "agent_factory.py",
             RELAY_ROOT / "core" / "driver.py",
             RELAY_ROOT / "core" / "policy.py",
+            RELAY_ROOT / "core" / "protocols.py",
+            RELAY_ROOT / "core" / "stage_policy.py",
+            RELAY_ROOT / "core" / "stage_facts.py",
         ]
         assert all(path.exists() for path in modules), "guard against silent renames"
         for module_path in modules:
