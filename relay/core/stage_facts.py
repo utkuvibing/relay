@@ -109,7 +109,11 @@ def _request_fact(
     if run.status is not RunStatus.SUCCEEDED:
         if replies:
             raise ProtocolFactsError("unsuccessful Run has materialized replies")
-        state = RequestState.FAILED if run.status is RunStatus.FAILED else RequestState.PENDING
+        state = (
+            RequestState.FAILED
+            if run.status in (RunStatus.FAILED, RunStatus.CANCELLED)
+            else RequestState.PENDING
+        )
         return StageRequestFact(role, request_id, state), request
     if not replies:
         # Successful provider output still needs canonical reply materialization.

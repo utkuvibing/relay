@@ -12,7 +12,7 @@ import pytest
 from relay.agents.base import Agent, AgentRequest, AgentResponse, AgentRole, BackendType
 from relay.context.protocols import load_protocol
 from relay.core.bus import ConversationBus
-from relay.core.delivery import MessageDelivery
+from relay.core.delivery import DeliveryPendingRefusal, DeliveryRefusal, MessageDelivery
 from relay.core.policy import (
     BlockingBudgetExhausted,
     CommunicationBudgets,
@@ -460,6 +460,62 @@ async def test_collector_clarification_early_stop_and_failed_retry_accounting(st
     with pytest.raises(TurnBudgetExhausted):
         await delivery.deliver_and_reply(retry.id, reply_type=MessageType.OPINION)
     assert agent.calls == 2 and snapshot(store) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "run_status, request_state, stage_status",
+    [
+        (RunStatus.RUNNING, RequestState.PENDING, EvaluationStatus.CONTINUE),
+        (RunStatus.FAILED, RequestState.FAILED, EvaluationStatus.BLOCKED),
+        (RunStatus.CANCELLED, RequestState.FAILED, EvaluationStatus.BLOCKED),
+        (RunStatus.SUCCEEDED, RequestState.SUCCEEDED, EvaluationStatus.COMPLETE),
+    ],
+)
+async def test_delivery_run_status_drives_stage_completion(
+    store, run_status, request_state, stage_status
+):
+    definition = protocol(turns=1)
+    bus, delivery, gate, agent = scoped(store, definition)
+    parent = bus.send(request())
+    outcome = await delivery.deliver(parent.id)
+    store.update_model(outcome.ask.run.model_copy(update={"status": run_status}))
+    if run_status is RunStatus.SUCCEEDED:
+        await delivery.deliver_and_reply(parent.id, reply_type=MessageType.OPINION)
+    before = snapshot(store)
+    facts = collect_stage_facts(
+        store, definition, ctx(definition), {AgentRole.ARCHITECT: parent.id}
+    )
+    assert facts.requests[0].state is request_state
+    assert evaluate_stage(definition, facts).status is stage_status
+    if run_status is RunStatus.CANCELLED:
+        assert evaluate_stage(definition, facts).reason is EvaluationReason.REQUEST_FAILED
+        # Cancellation remains terminal even when the delivered turn exhausted its budget.
+        exhausted = collect_stage_facts(
+            store, definition, ctx(definition), {AgentRole.ARCHITECT: parent.id}, policy=gate
+        )
+        assert exhausted.budget_exhaustion.scope == "stage"
+        assert evaluate_stage(definition, exhausted).reason is EvaluationReason.REQUEST_FAILED
+        with pytest.raises(DeliveryRefusal) as refusal:
+            await delivery.deliver_and_reply(parent.id, reply_type=MessageType.OPINION)
+        assert not isinstance(refusal.value, DeliveryPendingRefusal)
+    assert snapshot(store) == before
+    assert agent.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", [RunStatus.FAILED, RunStatus.CANCELLED])
+async def test_terminal_unsuccessful_run_cannot_supply_completion_reply(store, terminal_status):
+    definition = protocol()
+    bus, delivery, _, _ = scoped(store, definition)
+    parent = bus.send(request())
+    outcome = await delivery.deliver_and_reply(parent.id, reply_type=MessageType.OPINION)
+    # A terminal status change must not leave a prior reply usable as success evidence.
+    store.update_model(outcome.ask.run.model_copy(update={"status": terminal_status}))
+    before = snapshot(store)
+    with pytest.raises(ProtocolFactsError, match="unsuccessful Run"):
+        collect_stage_facts(store, definition, ctx(definition), {AgentRole.ARCHITECT: parent.id})
+    assert snapshot(store) == before
 
 
 def test_collector_rejects_foreign_duplicate_and_unbound_reply_facts(store):
