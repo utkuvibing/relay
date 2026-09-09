@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _APPEND_ONLY_TABLES = ("event_log", "evidence_records")
 
@@ -232,6 +232,13 @@ _V5_STATEMENTS: tuple[str, ...] = (
 )
 
 _MIGRATIONS[5] = _V5_STATEMENTS
+
+_MIGRATIONS[6] = (
+    "ALTER TABLE messages ADD COLUMN stage_key TEXT",
+    "ALTER TABLE event_log ADD COLUMN stage_key TEXT",
+    "CREATE INDEX idx_messages_stage_blocking ON messages(room_id, task_id, stage_key, blocking)",
+    "CREATE INDEX idx_event_stage_type ON event_log(room_id, task_id, stage_key, type)",
+)
 
 
 def connect(path: str | Path) -> sqlite3.Connection:

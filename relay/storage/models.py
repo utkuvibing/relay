@@ -150,6 +150,7 @@ class Message(BaseModel):
     """
 
     id: str = Field(default_factory=new_id)
+    stage_key: str | None = None
     sender: str
     recipient: str | None = Field(
         default=None,
@@ -346,6 +347,7 @@ class EventLogEntry(BaseModel):
     """
 
     sequence: int | None = None
+    stage_key: str | None = None
     room_id: str | None = None
     task_id: str | None = None
     sender: str | None = None

@@ -38,6 +38,7 @@ __all__ = [
     "PolicyPrincipal",
     "PrincipalClass",
     "SqliteCommunicationPolicyGate",
+    "StageCommunicationPolicyGate",
     "TurnBudgetExhausted",
     "TypeNotPermitted",
     "evaluate_edge",
@@ -71,13 +72,23 @@ class BlockingNotPermitted(CommunicationPolicyRefusal):
 class BudgetExhausted(CommunicationPolicyRefusal):
     """A communication budget has no remaining capacity."""
 
+    dimension: str
+
+    def __init__(self, message: str = "", *, scope: str = "aggregate") -> None:
+        super().__init__(message)
+        self.scope = scope
+
 
 class TurnBudgetExhausted(BudgetExhausted):
     """The exact room/task scope has exhausted agent turns."""
 
+    dimension = "turn"
+
 
 class BlockingBudgetExhausted(BudgetExhausted):
     """The exact room/task scope has exhausted blocking messages."""
+
+    dimension = "blocking"
 
 
 class PrincipalClass(str, Enum):
@@ -309,6 +320,21 @@ class CommunicationPolicyGate(Protocol):
     def check_blocking_budget(self, room_id: str | None, task_id: str | None) -> None: ...
 
 
+@runtime_checkable
+class StageCommunicationPolicyGate(CommunicationPolicyGate, Protocol):
+    """Explicit additive seam; unscoped gate implementations remain compatible."""
+
+    def check_stage_turn_budget(
+        self, room_id: str | None, task_id: str | None,
+        stage_key: str, budgets: CommunicationBudgets,
+    ) -> None: ...
+
+    def check_stage_blocking_budget(
+        self, room_id: str | None, task_id: str | None,
+        stage_key: str, budgets: CommunicationBudgets,
+    ) -> None: ...
+
+
 class SqliteCommunicationPolicyGate:
     """Evaluate a frozen policy and count its limits from the canonical ledger."""
 
@@ -343,6 +369,31 @@ class SqliteCommunicationPolicyGate:
             raise BlockingBudgetExhausted(
                 f"blocking-message budget exhausted for scope "
                 f"(room_id={room_id!r}, task_id={task_id!r}): {used} of {limit} used"
+            )
+
+    def check_stage_turn_budget(
+        self, room_id: str | None, task_id: str | None,
+        stage_key: str, budgets: CommunicationBudgets,
+    ) -> None:
+        row = self._store.conn.execute(
+            "SELECT COUNT(*) FROM event_log WHERE room_id IS ? AND task_id IS ? "
+            "AND stage_key = ? AND type = ?",
+            [room_id, task_id, stage_key, EventType.MESSAGE_DELIVERED.value],
+        ).fetchone()
+        if int(row[0]) >= budgets.max_agent_turns:
+            raise TurnBudgetExhausted(f"stage {stage_key}: agent-turn budget exhausted", scope="stage")
+
+    def check_stage_blocking_budget(
+        self, room_id: str | None, task_id: str | None,
+        stage_key: str, budgets: CommunicationBudgets,
+    ) -> None:
+        rows = self._store.conn.execute(
+            "SELECT sender FROM messages WHERE room_id IS ? AND task_id IS ? "
+            "AND stage_key = ? AND blocking = 1", [room_id, task_id, stage_key],
+        ).fetchall()
+        if sum(not str(row[0]).startswith("human:") for row in rows) >= budgets.max_blocking_messages:
+            raise BlockingBudgetExhausted(
+                f"stage {stage_key}: blocking-message budget exhausted", scope="stage"
             )
 
 

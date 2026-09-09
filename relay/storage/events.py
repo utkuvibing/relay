@@ -36,7 +36,7 @@ class EventLogWriter:
         cursor = self._conn.execute(
             "INSERT INTO event_log "
             "(room_id, task_id, sender, recipient, type, content, "
-            "references_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "references_json, created_at, stage_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 entry.room_id,
                 entry.task_id,
@@ -46,6 +46,7 @@ class EventLogWriter:
                 entry.content,
                 json.dumps(entry.references),
                 _as_utc_string(entry.created_at),
+                entry.stage_key,
             ],
         )
         return entry.model_copy(update={"sequence": cursor.lastrowid})
@@ -66,6 +67,7 @@ class EventLogWriter:
 def _entry_from_row(row: sqlite3.Row) -> EventLogEntry:
     return EventLogEntry(
         sequence=int(row["sequence"]),
+        stage_key=row["stage_key"],
         room_id=row["room_id"],
         task_id=row["task_id"],
         sender=row["sender"],
