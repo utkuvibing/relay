@@ -331,6 +331,7 @@ class EventType(str, enum.Enum):
     #: the delivery run's pre-provider Tx1; retained for failed runs (the
     #: outcome lives on the Run row + AGENT_RUN_FINISHED).
     MESSAGE_DELIVERED = "message_delivered"
+    PROTOCOL_OUTCOME_RECORDED = "protocol_outcome_recorded"
 
 
 class EvidenceRecord(BaseModel):

@@ -40,9 +40,62 @@ The implemented P4 runtime provides:
 - bounded round trips and deterministic multi-hop driver execution;
 - API-to-harness and harness-to-harness handoffs through the same delivery path.
 
-The driver supports an `API -> harness -> different harness` chain with zero human copy-paste in the flow. This is a runtime capability today. The user-facing discussion protocol is not implemented yet.
+The driver supports an `API -> harness -> different harness` chain with zero human copy-paste in the flow.
 
-- Communication policy and budgets — Available (core; no CLI yet).
+### Bounded discussions
+
+`relay discuss "Compare these designs"` runs the bundled debate: independent analysis,
+three critique/rebuttal rounds, and synthesis. Each discussion gets a dedicated Room;
+it does not create or approve an implementation task. Participants use existing
+`roles:` bindings in `relay.yaml`. For example, with an agent named `gpt` configured:
+
+```yaml
+roles:
+  architect: gpt
+  critic: gpt
+  repository_expert: gpt
+  moderator: gpt
+communication:
+  budgets:
+    max_agent_turns: 22
+    max_blocking_messages: 3
+```
+
+Roles may bind to different configured API or harness agents. Harness discussion
+delivery uses a read-only grant. There is no automatic role selection.
+
+The full bundled debate needs **22 agent turns**. The unchanged default allowance
+is **16**: without an explicit configuration change, execution stops at that limit,
+preserves partial outputs, and records a human-action-needed notice. Relay never
+increases budgets automatically.
+
+```bash
+relay discuss "Compare these designs"
+relay discuss "Review this proposal" --protocol protocols/debate.yaml
+relay inspect-discussion <execution-id> --json
+relay discuss --resume <execution-id>
+relay status
+```
+
+Resume uses pinned protocol inputs and accepts no topic or protocol override. The
+source YAML is no longer needed. IDs may be exact or unique prefixes. Inspection
+and status only read progress; they never invoke agents or recover missing replies.
+Interrupted work remains visible even if no outcome was recorded before the crash.
+
+Escalations are stored observations with recovery guidance, not interactive prompts
+or approvals. Restore changed participant settings before resuming; failed requests
+are never retried, and changing pinned protocol/stage budgets requires a new
+discussion. You may explicitly adjust the aggregate communication allowance and
+resume existing work. Earlier notices remain in inspection history.
+
+`discuss` exits with `0` for protocol completion, `1` for refusal/failure/escalation,
+`2` for invalid usage, and `3` for pending delivery. `inspect-discussion` succeeds
+when it can render valid records, including stopped discussions. Both commands
+support a versioned `--json` envelope (`relay.discussion.v1`).
+
+Rounds and message budgets are enforced. Semantic detection of repeated arguments
+or lack of new evidence remains deferred; protocol completion does not establish
+consensus, task completion, or human approval.
 
 ### Adapters and authentication
 
@@ -52,7 +105,7 @@ The current adapter registry includes OpenAI-compatible API adapters and harness
 
 These are roadmap items, not current capabilities:
 
-- P5: `relay discuss`, bounded discussion protocols, communication policy, and message budgets (in progress; policy/budgets core available);
+- P5 remaining: semantic loop/convergence detection; discussion CLI, bounded protocols, policy, budgets, and stored escalation notices are available;
 - P6: automated implementation review and fix loops;
 - P7: persistent Rooms, seats, and long-lived participant context;
 - P8: decision provenance;
