@@ -26,7 +26,15 @@ from relay.agents.registry import transient_adapters
 from relay.cli.main import app
 from relay.context.config import HarnessAgentConfig
 from relay.core.evidence import EvidenceKind
-from relay.core.orchestrator import BuildRefusal, _open_approval_gate, advance_task, run_build
+from relay.core.orchestrator import (
+    BuildRefusal,
+    _capture_baseline,
+    _diff_against_baseline,
+    _open_approval_gate,
+    advance_task,
+    run_build,
+)
+from relay.core.permissions import PermissionGate
 from relay.core.state_machine import TaskState, TaskStateMachine
 from relay.harness.capabilities import HarnessCapability
 from relay.harness.errors import HarnessOutputError
@@ -1312,3 +1320,44 @@ class TestAtomicClosure:
         contents = [e.content for e in writer.all() if f"task:{task.id}" in e.references]
         assert "task state: reviewing -> done" not in contents
         conn.close()
+
+
+class TestBaselineIsolation:
+    """Regression: build provenance baselines are execution-local.
+
+    The pre-fix implementation handed baselines off through module-global
+    ``_workdir_state``, so a second build's capture overwrote the first
+    build's baseline and its diff attributed/removed the wrong files.
+    """
+
+    def test_independent_baselines_do_not_contaminate(self, tmp_path):
+        from relay.core import orchestrator
+
+        # The global handoff must not exist at all.
+        assert not hasattr(orchestrator, "_workdir_state")
+
+        gate = PermissionGate()
+        ws_a = tmp_path / "ws-a"
+        ws_b = tmp_path / "ws-b"
+        ws_a.mkdir()
+        ws_b.mkdir()
+        (ws_a / "keep.txt").write_text("a-original\n", encoding="utf-8")
+        (ws_b / "bfile.txt").write_text("b-original\n", encoding="utf-8")
+
+        # Interleaved captures: build B captures AFTER build A, before A diffs.
+        baseline_a = _capture_baseline(ws_a)
+        baseline_b = _capture_baseline(ws_b)
+
+        (ws_a / "keep.txt").write_text("a-changed\n", encoding="utf-8")
+        (ws_a / "new.txt").write_text("a-new\n", encoding="utf-8")
+
+        diff_a = _diff_against_baseline(gate, ws_a, "task-a", baseline_a)
+        diff_b = _diff_against_baseline(gate, ws_b, "task-b", baseline_b)
+
+        # A's diff reflects only A's own delta — under the global handoff,
+        # B's baseline would have made "keep.txt" look new and "bfile.txt"
+        # look deleted.
+        assert "modified: keep.txt" in diff_a
+        assert "new file: new.txt" in diff_a
+        assert "bfile.txt" not in diff_a
+        assert diff_b.strip() == ""

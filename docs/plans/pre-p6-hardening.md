@@ -123,11 +123,15 @@ references: §17–§19, Appendix C.2–C.5.
 11. **Exit codes map to typed semantics** via adapter `classify_exit`
     (`OK`/`USAGE`/`AUTH`/`TRANSPORT`/`UNKNOWN`); nonzero exits surface as
     hinted `AgentError`s, never raw escapes.
-12. **Everything persisted is sanitized.** `redact` masks credential-shaped
+12. **Persisted diagnostics are sanitized.** `redact` masks credential-shaped
     literals, `NAME=value` credential assignments, caller-supplied secrets,
-    and home-directory path prefixes before errors/probe output reach the
-    canonical ledger. Structured parse failures raise `HarnessOutputError`
-    without leaking stream content.
+    and home-directory path prefixes before errors, run-failure reasons, and
+    probe/discovery output reach the canonical ledger. Structured parse
+    failures raise `HarnessOutputError` without leaking stream content.
+    Canonical prompts, messages, and model outputs are intentionally
+    persisted as canonical content — they are *not* globally redacted, by
+    design: they are the record. Diagnostic surfaces are what `redact`
+    guards; conversation/working content is authored data, not leakage.
 13. **Output is capped** (`DEFAULT_OUTPUT_TEXT_CAP_CHARS`) before inline
     persistence.
 14. **Harness output never owns state.** Task transitions resolve
@@ -145,10 +149,12 @@ references: §17–§19, Appendix C.2–C.5.
   kinds onto harness-native flags (e.g. `--permission-mode`, sandbox tiers,
   `--mode plan`). Conformance proves the translation exists and is applied;
   it cannot prove a vendor binary honors it.
-- **No OS-level sandbox.** Workspace-write containment is compensating
-  controls (worktree isolation, pre/post snapshots, diff extraction), not a
-  seccomp/namespace boundary. A compromised or buggy adapter running with a
-  write grant can write outside the workspace.
+- **No OS-level sandbox, and no worktree isolation today.** What exists is
+  provenance, not containment: a pre-run filesystem baseline capture plus a
+  post-run diff that attributes changes to the run — there is no clone or
+  separate worktree the child is confined to. A compromised or buggy adapter
+  running with a write grant writes directly into the workspace and can
+  write outside it.
 - **No network egress control** below the grant tier.
 - **`redact` is pattern-based** — novel secret shapes it does not recognize
   can persist. The allowlist-boundary failure mode is under-masking, so
@@ -209,9 +215,10 @@ milestone, not absorbed into P6 — when any of these holds:
 - a harness **claims** a capability (C.3) but its behavior cannot be
   verified to match — conformance can prove mechanics, not intent, and a
   proven mismatch ends the trust assumption;
-- unmediated write/shell grants are needed at a volume where compensating
-  controls (worktree containment + diff extraction) can no longer be
-  honestly attested per run;
+- unmediated write/shell grants are needed at a volume where provenance-only
+  attribution (pre-run baseline capture + post-run diff extraction) can no
+  longer be honestly attested per run — there is no worktree containment to
+  fall back on;
 - a requirement lands for resource bounds harness flags cannot express
   (CPU/memory/disk quotas, syscall filtering) — the Job Object seam in
   `relay/harness/process.py` is the natural substrate;
@@ -220,6 +227,25 @@ milestone, not absorbed into P6 — when any of these holds:
 
 Each trigger must be recorded as a Decision with provenance, since relaxing
 into a native runner changes the trust boundary this document freezes.
+
+## Interruption semantics — an explicit P6 decision
+
+P6 planning must choose, deliberately, between two interruption models:
+
+- **A. Boundary-only interruption** — the current agent run finishes, but
+  Relay starts no further automated stages. This is the smaller semantic:
+  it reuses the existing evidence-gated loop exits and needs no new
+  process-control machinery.
+- **B. Mid-run interruption** — the currently running harness process is
+  cancelled immediately. This is *not* solved today: subprocess timeout
+  cleanup exists (`run_prompt` kills the tree on expiry), but there is no
+  cooperative cancellation path a caller can invoke mid-run, and no
+  guaranteed process-tree teardown on a non-timeout signal. If P6 chooses
+  B, a guaranteed tree-cleanup path on cancellation must be built first —
+  the Job Object / process-group substrate in `relay/harness/process.py` is
+  where it belongs.
+
+This document does not pretend B already works.
 
 ## Validation performed
 
