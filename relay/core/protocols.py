@@ -115,12 +115,19 @@ class StageDefinition:
 
 
 @dataclass(frozen=True, config=_CONFIG)
+class ProtocolRepeat:
+    stages: tuple[Name, ...]
+    rounds: Annotated[StrictInt, Field(ge=1, le=100)]
+
+
+@dataclass(frozen=True, config=_CONFIG)
 class ProtocolDefinition:
     name: Name
     version: Name
     participants: tuple[ParticipantRequirement, ...]
     stages: tuple[StageDefinition, ...]
     completion: ProtocolCompletion = ProtocolCompletion()
+    repeat: ProtocolRepeat | None = None
 
     def __post_init__(self) -> None:
         roles = [participant.role for participant in self.participants]
@@ -129,6 +136,13 @@ class ProtocolDefinition:
         ids = [stage.id for stage in self.stages]
         if not ids or len(set(ids)) != len(ids):
             raise ValueError("protocol stages must be nonempty with unique IDs")
+        if self.repeat is not None:
+            block = list(self.repeat.stages)
+            if not block or block[0] not in ids:
+                raise ValueError("repeat must name a nonempty contiguous stage block")
+            start = ids.index(block[0])
+            if ids[start : start + len(block)] != block:
+                raise ValueError("repeat stages must be unique, contiguous, and in order")
         if any(not set(stage.participants) <= set(roles) for stage in self.stages):
             raise ValueError("stage references an undeclared protocol participant")
         if self.completion.require_synthesis and not any(
@@ -322,18 +336,32 @@ def evaluate_stage(definition: ProtocolDefinition, facts: StageFacts) -> StageEv
     return StageEvaluation(facts.context, facts.stage_key, status, reason, support, synthesis)
 
 
+def protocol_schedule(definition: ProtocolDefinition) -> tuple[tuple[StageDefinition, int], ...]:
+    """Expand one finite block; occurrence indexes remain stage-local."""
+    repeat = definition.repeat
+    schedule = []
+    for stage in definition.stages:
+        if repeat is None or stage.id not in repeat.stages:
+            schedule.append((stage, 0))
+        elif stage.id == repeat.stages[0]:
+            block = [s for s in definition.stages if s.id in repeat.stages]
+            schedule.extend((s, index) for index in range(repeat.rounds) for s in block)
+    return tuple(schedule)
+
+
 def evaluate_protocol(
     definition: ProtocolDefinition, stage_results: tuple[StageEvaluation, ...]
 ) -> ProtocolEvaluation:
-    if len(stage_results) > len(definition.stages):
+    schedule = protocol_schedule(definition)
+    if len(stage_results) > len(schedule):
         raise ProtocolFactsError("too many stage results")
     execution = None
-    for stage, result in zip(definition.stages, stage_results):
+    for (stage, occurrence), result in zip(schedule, stage_results):
         resolved = stage_for_context(definition, result.context)
         if resolved.id != stage.id or result.stage_key != result.context.stage_key:
             raise ProtocolFactsError("stage results are out of order or have an invalid key")
-        if result.context.occurrence_index != 0:
-            raise ProtocolFactsError("protocol evaluation does not execute repeated stages")
+        if result.context.occurrence_index != occurrence:
+            raise ProtocolFactsError("stage occurrence is out of order")
         identity = (result.context.execution_key, result.context.room_id, result.context.task_id)
         if execution is not None and execution != identity:
             raise ProtocolFactsError("stage results belong to different executions/scopes")
@@ -348,7 +376,7 @@ def evaluate_protocol(
         return ProtocolEvaluation(
             EvaluationStatus.BLOCKED, EvaluationReason.STAGES_INCOMPLETE, support, synthesis
         )
-    if len(stage_results) != len(definition.stages) or any(
+    if len(stage_results) != len(schedule) or any(
         result.status is not EvaluationStatus.COMPLETE for result in stage_results
     ):
         return ProtocolEvaluation(

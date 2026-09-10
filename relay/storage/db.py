@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _APPEND_ONLY_TABLES = ("event_log", "evidence_records")
 
@@ -238,6 +238,43 @@ _MIGRATIONS[6] = (
     "ALTER TABLE event_log ADD COLUMN stage_key TEXT",
     "CREATE INDEX idx_messages_stage_blocking ON messages(room_id, task_id, stage_key, blocking)",
     "CREATE INDEX idx_event_stage_type ON event_log(room_id, task_id, stage_key, type)",
+)
+
+
+_MIGRATIONS[7] = (
+    """CREATE TABLE protocol_executions (
+        id TEXT PRIMARY KEY,
+        execution_key TEXT NOT NULL,
+        room_id TEXT,
+        task_id TEXT,
+        topic TEXT NOT NULL,
+        definition_snapshot TEXT NOT NULL,
+        definition_digest TEXT NOT NULL,
+        bindings_snapshot TEXT NOT NULL,
+        runner_version TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK (room_id IS NOT NULL OR task_id IS NOT NULL)
+    )""",
+    (
+        "CREATE UNIQUE INDEX idx_execution_both ON protocol_executions"
+        "(execution_key, room_id, task_id) WHERE room_id IS NOT NULL AND task_id IS NOT NULL"
+    ),
+    (
+        "CREATE UNIQUE INDEX idx_execution_room ON protocol_executions"
+        "(execution_key, room_id) WHERE room_id IS NOT NULL AND task_id IS NULL"
+    ),
+    (
+        "CREATE UNIQUE INDEX idx_execution_task ON protocol_executions"
+        "(execution_key, task_id) WHERE room_id IS NULL AND task_id IS NOT NULL"
+    ),
+    (
+        "CREATE TRIGGER protocol_executions_no_update BEFORE UPDATE ON protocol_executions "
+        "BEGIN SELECT RAISE(ABORT, 'protocol_executions is append-only'); END;"
+    ),
+    (
+        "CREATE TRIGGER protocol_executions_no_delete BEFORE DELETE ON protocol_executions "
+        "BEGIN SELECT RAISE(ABORT, 'protocol_executions is append-only'); END;"
+    ),
 )
 
 

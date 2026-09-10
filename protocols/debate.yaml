@@ -1,5 +1,8 @@
 name: debate
 version: "1"
+repeat:
+  stages: [critique, rebuttal]
+  rounds: 3
 participants:
   - role: architect
   - role: critic
