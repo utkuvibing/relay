@@ -309,8 +309,12 @@ def evaluate_stage(definition: ProtocolDefinition, facts: StageFacts) -> StageEv
         for r in facts.requests
         if r.state is RequestState.SUCCEEDED and r.reply_type is expected[r.role]
     )
-    synthesis = tuple(r.reply_id for r in qualifying if r.reply_type is MessageType.SYNTHESIS)
-    support = tuple(r.reply_id for r in qualifying)
+    synthesis = tuple(
+        r.reply_id
+        for r in qualifying
+        if r.reply_id is not None and r.reply_type is MessageType.SYNTHESIS
+    )
+    support = tuple(r.reply_id for r in qualifying if r.reply_id is not None)
     synthesis_ok = not stage.completion.require_synthesis or bool(synthesis)
     answered = (
         stage.completion.early_stop_on_answered
@@ -321,7 +325,9 @@ def evaluate_stage(definition: ProtocolDefinition, facts: StageFacts) -> StageEv
         status, reason = EvaluationStatus.COMPLETE, EvaluationReason.OUTPUTS_COMPLETE
     elif answered and synthesis_ok:
         status, reason = EvaluationStatus.COMPLETE, EvaluationReason.ANSWERED
-        support += tuple(a.answering_reply_id for a in facts.answers)
+        support += tuple(
+            a.answering_reply_id for a in facts.answers if a.answering_reply_id is not None
+        )
     elif any(r.state is RequestState.FAILED for r in facts.requests):
         status, reason = EvaluationStatus.BLOCKED, EvaluationReason.REQUEST_FAILED
     elif facts.budget_exhaustion is not None:
@@ -339,7 +345,7 @@ def evaluate_stage(definition: ProtocolDefinition, facts: StageFacts) -> StageEv
 def protocol_schedule(definition: ProtocolDefinition) -> tuple[tuple[StageDefinition, int], ...]:
     """Expand one finite block; occurrence indexes remain stage-local."""
     repeat = definition.repeat
-    schedule = []
+    schedule: list[tuple[StageDefinition, int]] = []
     for stage in definition.stages:
         if repeat is None or stage.id not in repeat.stages:
             schedule.append((stage, 0))

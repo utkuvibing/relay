@@ -1200,7 +1200,7 @@ class TestAdvanceTaskAtomic:
             e.type for e in writer.all() if f"task:{task.id}" in e.references
         ]
         # The transaction was released: the store accepts new work.
-        assert store._in_transaction is False
+        assert store.in_transaction is False
         conn.close()
 
 

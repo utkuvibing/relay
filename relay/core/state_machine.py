@@ -128,7 +128,7 @@ class MissingEvidenceError(StateMachineError):
         self,
         current: TaskState,
         target: TaskState,
-        missing: set[EvidenceKind],
+        missing: frozenset[EvidenceKind],
     ) -> None:
         self.current = current
         self.target = target

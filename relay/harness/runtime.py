@@ -62,7 +62,7 @@ from relay.harness.errors import (
     HarnessTimeoutError,
     MissingExecutionGrantError,
 )
-from relay.harness.process import LaunchSpec, execute
+from relay.harness.process import LaunchSpec, ProcessOutcome, execute
 from relay.harness.sanitization import redact
 from relay.harness.types import (
     DEFAULT_OUTPUT_TEXT_CAP_CHARS,
@@ -120,6 +120,21 @@ class HarnessAgent(Agent):
         self._resolved: ResolvedExecutable | None = None
         self._info: HarnessInfo | None = None
 
+    @property
+    def settings(self) -> AgentSettings:
+        """The resolved agent settings."""
+        return self._settings
+
+    @property
+    def profile(self) -> HarnessAgentConfig | None:
+        """The harness profile supplied at construction (None = adapter default)."""
+        return self._profile
+
+    @property
+    def workspace_root(self) -> Path:
+        """The workspace root this adapter confines child cwd to."""
+        return self._workspace_root
+
     # -- vocabulary helpers --------------------------------------------------
 
     def capabilities_set(self) -> set[HarnessCapability]:
@@ -163,7 +178,7 @@ class HarnessAgent(Agent):
         """Adapter-translated restriction flags for one grant kind."""
         return ()
 
-    def _check_grant_capabilities(self, grant: ExecutionGrant) -> None:
+    def check_grant_capabilities(self, grant: ExecutionGrant) -> None:
         """A grant must never exceed what the adapter declares (C.5 gate)."""
         if grant.kind is not ExecutionGrantKind.READ_ONLY_ACCESS:
             self.requires(HarnessCapability.WORKSPACE_WRITE)
@@ -312,9 +327,9 @@ class HarnessAgent(Agent):
         detail = f"; stderr tail: {tail}" if tail else ""
         return f"{self.name}: {prefix} ({semantics_hint}){detail}"
 
-    async def _execute_once(self, request: AgentRequest):
+    async def _execute_once(self, request: AgentRequest) -> ProcessOutcome:
         grant = self.resolve_grant()
-        self._check_grant_capabilities(grant)
+        self.check_grant_capabilities(grant)
         resolved = await self._discover_once()
 
         spec = LaunchSpec(

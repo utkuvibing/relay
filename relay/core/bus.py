@@ -135,6 +135,11 @@ class ConversationBus:
         self._policy = policy
         self._stage = stage_admission(stage_context, protocol, policy)
 
+    @property
+    def policy(self) -> CommunicationPolicyGate | None:
+        """The injected communication gate (None when ungoverned)."""
+        return self._policy
+
     # -- write path ----------------------------------------------------------
 
     def send(
@@ -179,7 +184,7 @@ class ConversationBus:
             raise MessageRejected("message must carry a room_id and/or a task_id")
 
         self._validate_sender(message.sender)
-        authorship_run = self._validate_authorship(message)
+        authorship_run = self.validate_authorship(message)
 
         if message.recipient_role is not None:
             if not _identity_is_valid(message.recipient_role):
@@ -239,7 +244,12 @@ class ConversationBus:
             )
 
         for reference in message.references:
-            if not isinstance(reference, str) or not reference.strip():
+            # Runtime guard: Message rows are caller-constructed, so the
+            # declared element type is not a guarantee.
+            if (
+                not isinstance(reference, str)  # pyright: ignore[reportUnnecessaryIsInstance]
+                or not reference.strip()
+            ):
                 raise MessageRejected("references must be non-empty strings")
 
         if message.reply_to_id is not None:
@@ -247,13 +257,13 @@ class ConversationBus:
 
         delivery_bound_reply = self._is_delivery_bound_reply(message)
         if self._stage is not None and not delivery_bound_reply:
-            self._stage.check_edge(self._policy_envelope(message, authorship_run))
+            self._stage.check_edge(self.policy_envelope(message, authorship_run))
         if (
             self._policy is not None
             and authorship_run is not None
             and not delivery_bound_reply
         ):
-            self._policy.check_edge(self._policy_envelope(message, authorship_run))
+            self._policy.check_edge(self.policy_envelope(message, authorship_run))
 
         return message
 
@@ -335,7 +345,7 @@ class ConversationBus:
         if self._resolver is not None and not self._resolver.knows_agent(sender):
             raise MessageRejected(f"unknown logical agent sender {sender!r}")
 
-    def _validate_authorship(self, message: Message) -> Run | None:
+    def validate_authorship(self, message: Message) -> Run | None:
         """P4.2 (frozen plan D1): strict authorship provenance.
 
         A bare logical-agent sender MUST carry ``run_id`` and the linked Run
@@ -367,7 +377,7 @@ class ConversationBus:
             )
         return run
 
-    def _policy_envelope(self, message: Message, authorship_run: Run | None) -> PolicyEnvelope:
+    def policy_envelope(self, message: Message, authorship_run: Run | None) -> PolicyEnvelope:
         """Build policy vocabulary from the validated persisted facts."""
         try:
             sender = principal_for_sender(
@@ -484,7 +494,7 @@ class ConversationBus:
         target = saved.recipient or "room"
         role_note = f" via role '{saved.recipient_role}'" if saved.recipient_role else ""
         blocking_note = " (blocking)" if saved.blocking else ""
-        scope_refs = []
+        scope_refs: list[str] = []
         if saved.room_id:
             scope_refs.append(f"room:{saved.room_id}")
         if saved.task_id:

@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from functools import cache
 from types import TracebackType, UnionType
-from typing import Any, Union, get_args, get_origin
+from typing import Any, TypeVar, Union, get_args, get_origin
 
 import pydantic
 import pydantic_core
@@ -75,6 +75,8 @@ MODEL_TABLES: dict[type[pydantic.BaseModel], str] = {
 _APPEND_ONLY_TABLES = frozenset({"event_log", "evidence_records", "messages", "protocol_executions"})
 
 _PRIMITIVES = (str, int, float, bool)
+
+_M = TypeVar("_M", bound=pydantic.BaseModel)
 
 
 def _pk_column(model_cls: type[pydantic.BaseModel]) -> str:
@@ -147,7 +149,7 @@ def _encode_field(annotation: Any, value: Any) -> Any:
 
 
 @cache
-def _type_adapter(annotation: Any) -> pydantic.TypeAdapter:
+def _type_adapter(annotation: Any) -> pydantic.TypeAdapter[Any]:
     return pydantic.TypeAdapter(annotation)
 
 
@@ -181,10 +183,10 @@ class _Transaction:
         self.store = store
 
     def __enter__(self) -> SqliteRelayStore:
-        if self.store._in_transaction:
+        if self.store.in_transaction:
             msg = "nested transactions are not supported"
             raise RuntimeError(msg)
-        self.store._in_transaction = True
+        self.store.in_transaction = True
         self.store.conn.execute("BEGIN IMMEDIATE")
         return self.store
 
@@ -194,7 +196,7 @@ class _Transaction:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self.store._in_transaction = False
+        self.store.in_transaction = False
         if exc_type is None:
             self.store.conn.execute("COMMIT")
         else:
@@ -213,14 +215,14 @@ class SqliteRelayStore:
 
     # -- transactions -------------------------------------------------------
 
-    _in_transaction = False
+    in_transaction = False
 
     def transaction(self) -> _Transaction:
         return _Transaction(self)
 
     # -- generic record operations ------------------------------------------
 
-    def save_model(self, record: Any) -> Any:
+    def save_model(self, record: _M) -> _M:
         codec = _codec(type(record))
         columns = [col for _, col, _ in codec]
         values = [_encode_field(ann, getattr(record, fname)) for fname, _, ann in codec]
@@ -236,7 +238,7 @@ class SqliteRelayStore:
             return record.model_copy(update={"sequence": cursor.lastrowid})
         return record
 
-    def update_model(self, record: Any) -> Any:
+    def update_model(self, record: _M) -> _M:
         table = MODEL_TABLES[type(record)]
         if table in _APPEND_ONLY_TABLES:
             raise ImmutableHistoryError(f"'{table}' is append-only")
@@ -248,7 +250,7 @@ class SqliteRelayStore:
             [*values, getattr(record, _pk_column(type(record)))],
         )
         if cursor.rowcount == 0:
-            msg = f"{type(record).__name__} '{record.id}' not found"
+            msg = f"{type(record).__name__} '{getattr(record, 'id', '?')}' not found"
             raise KeyError(msg)
         return record
 
@@ -257,7 +259,7 @@ class SqliteRelayStore:
         if table in _APPEND_ONLY_TABLES:
             raise ImmutableHistoryError(f"'{table}' is append-only")
 
-    def load_model(self, model_cls: type, record_id: str | int) -> Any | None:
+    def load_model(self, model_cls: type[_M], record_id: str | int) -> _M | None:
         return next(
             self._iter_rows(model_cls, f"WHERE {_pk_column(model_cls)} = ?", [record_id]),
             None,
@@ -265,22 +267,22 @@ class SqliteRelayStore:
 
     def all_models(
         self,
-        model_cls: type,
+        model_cls: type[_M],
         clause: str = "",
         params: list[Any] | None = None,
         order_by: str = "rowid ASC",
         limit: int | None = None,
-    ) -> Iterator[Any]:
+    ) -> Iterator[_M]:
         return self._iter_rows(model_cls, clause, params or [], order_by, limit)
 
     def _iter_rows(
         self,
-        model_cls: type,
+        model_cls: type[_M],
         clause: str,
         params: list[Any],
         order_by: str = "rowid ASC",
         limit: int | None = None,
-    ) -> Iterator[Any]:
+    ) -> Iterator[_M]:
         codec = _codec(model_cls)
         sql = (
             f"SELECT rowid AS _seq, {', '.join(col for _, col, _ in codec)} "
@@ -292,19 +294,24 @@ class SqliteRelayStore:
             sql += f" ORDER BY {order_by}"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
+        is_event_log = model_cls is EventLogEntry
         for row in self.conn.execute(sql, params):
             fields = {fname: _decode_field(ann, row[col]) for fname, col, ann in codec}
-            if model_cls is EventLogEntry:
+            if is_event_log:
                 # ``sequence`` is DB-assigned on insert (models.py contract);
                 # here it is read back from the AUTOINCREMENT primary key.
                 fields["sequence"] = row["_seq"]
             yield model_cls.model_validate(fields)
 
-    def delete_model(self, record: Any) -> None:
+    def delete_model(self, record: pydantic.BaseModel) -> None:
         table = MODEL_TABLES[type(record)]
         if table in _APPEND_ONLY_TABLES:
             raise ImmutableHistoryError(f"'{table}' is append-only")
-        self.conn.execute(f"DELETE FROM {table} WHERE id = ?", [record.id])
+        # Type-erased boundary: only id-bearing models reach this table.
+        self.conn.execute(
+            f"DELETE FROM {table} WHERE id = ?",
+            [getattr(record, "id")],  # noqa: B009 - BaseModel has no `.id`
+        )
 
     def counts(self) -> dict[str, int]:
         tables = sorted({*MODEL_TABLES.values()})

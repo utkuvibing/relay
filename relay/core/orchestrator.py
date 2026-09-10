@@ -39,9 +39,9 @@ import json
 import os
 import re
 import shutil
-import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 
 from relay.agents.base import (
     Agent,
@@ -257,25 +257,7 @@ def _record_observed_events(
     return tuple(ids)
 
 
-def _worktree_is_clean(root) -> bool:
-    """Refuse builds whose *tracked* content diverges from HEAD.
-
-    Untracked files are deliberately ignored here (they cannot corrupt a
-    HEAD-relative baseline check; ``relay init`` artifacts live untracked).
-    Provenance for them is handled by the baseline snapshot instead.
-    """
-    result = subprocess.run(
-        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise BuildRefusal(f"cannot verify git status in {root}: {result.stderr.strip()}")
-    return not result.stdout.strip()
-
-
-def _capture_baseline(root) -> dict[str, bytes]:
+def _capture_baseline(root: Path) -> dict[str, bytes]:
     """Snapshot every working-tree file Relay could later attribute to a run.
 
     Bounded: skips the Relay store dir and .git. Used as the provenance
@@ -300,7 +282,7 @@ def _capture_baseline(root) -> dict[str, bytes]:
     return baseline
 
 
-def _diff_against_baseline(gate: PermissionGate, root, task_id: str) -> str:
+def _diff_against_baseline(gate: PermissionGate, root: Path, task_id: str) -> str:
     """Relay-owned diff vs pre-run baseline through the single gate path (A.4).
 
     Non-mutating: no git index/HEAD changes at all. Only files that differ
@@ -322,7 +304,7 @@ def _diff_against_baseline(gate: PermissionGate, root, task_id: str) -> str:
         )
 
     baseline = _workdir_state.get("baseline") or {}
-    current_files = {}
+    current_files: dict[str, bytes] = {}
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -378,7 +360,7 @@ def _diff_against_baseline(gate: PermissionGate, root, task_id: str) -> str:
 
 
 # Baseline handoff between the pre-run capture and post-run comparison.
-_workdir_state: dict[str, object] = {}
+_workdir_state: dict[str, dict[str, bytes]] = {}
 
 _BASELINE_FILE_CAP_BYTES = 4 * 1024 * 1024
 _BINARY_SNIFF_BYTES = 8000
@@ -458,7 +440,7 @@ def _collect_context(
     writer: EventLogWriter,
     evidence: EvidenceStore,
     task: Task,
-    workspace_root,
+    workspace_root: Path,
 ) -> Task:
     """Relay-collected workspace context backing ``CREATED→CONTEXT_READY``.
 
@@ -567,12 +549,12 @@ def _planner_for(agent: Agent) -> Agent:
     if not isinstance(agent, HarnessAgent):
         return agent
     profile = None
-    if agent._profile is not None:
-        profile = agent._profile.model_copy(update={"grant": ExecutionGrantKind.READ_ONLY_ACCESS})
+    if agent.profile is not None:
+        profile = agent.profile.model_copy(update={"grant": ExecutionGrantKind.READ_ONLY_ACCESS})
     return type(agent)(
-        settings=agent._settings,
+        settings=agent.settings,
         profile=profile,
-        workspace_root=agent._workspace_root,
+        workspace_root=agent.workspace_root,
     )
 
 
@@ -591,7 +573,7 @@ async def _run_verification(
     machine: TaskStateMachine,
     task: Task,
     verification: VerificationConfig | None,
-    workspace_root,
+    workspace_root: Path,
 ) -> Task:
     """Relay grades the exam — the implementer never does (frozen plan Q-c).
 
@@ -678,6 +660,7 @@ async def _run_verification(
         return task  # blocked in VERIFYING — never a minted verdict
 
     try:
+        assert resolved is not None  # blocked above when None
         outcome = await execute_process(
             LaunchSpec(
                 argv=(resolved, *verification.args),
@@ -798,6 +781,7 @@ async def _run_review(
     on findings. A failed reviewer run leaves the task honestly blocked at
     ``REVIEWING`` (D8) — no verdict is ever invented.
     """
+    assert plan_outcome.response is not None  # caller refuses empty planning runs
     review_request = request.model_copy(
         update={
             "role": AgentRole.REVIEWER,
@@ -893,7 +877,7 @@ async def run_build(
     agent: Agent,
     request: AgentRequest,
     *,
-    workspace_root,
+    workspace_root: Path,
     gate: PermissionGate | None = None,
     model: str | None = None,
     agent_name: str | None = None,
@@ -931,7 +915,7 @@ async def run_build(
 
     if not isinstance(agent, HarnessAgent):
         raise BuildRefusal("build requires a harness-backed implementer")
-    profile_grant = agent._profile.grant if agent._profile is not None else None
+    profile_grant = agent.profile.grant if agent.profile is not None else None
     effective = profile_grant or agent.default_grant
     if effective is None:
         raise BuildRefusal("build requires an ExecutionGrant; none resolvable")

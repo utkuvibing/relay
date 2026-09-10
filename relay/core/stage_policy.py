@@ -45,7 +45,9 @@ class StageAdmission:
             frozenset(edge.policy_edge() for edge in self.stage.edges),
         )
 
-    def check_record(self, record: Message | EventLogEntry, *, allow_unstamped=False) -> None:
+    def check_record(
+        self, record: Message | EventLogEntry, *, allow_unstamped: bool = False
+    ) -> None:
         if (record.room_id, record.task_id) != (self.context.room_id, self.context.task_id):
             raise StageContextRefusal("record scope differs from active stage scope")
         if record.stage_key != self.context.stage_key and not (

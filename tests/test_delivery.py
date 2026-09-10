@@ -760,6 +760,31 @@ class TestDeliverAndReply:
         assert outcome.reply is not None
         assert outcome.reply.type == MessageType.OPINION
 
+    async def test_deliver_and_reply_corrupt_marker_raises_typed_refusal(
+        self, delivery, store, writer
+    ):
+        """A binding marker missing its run: reference is a typed refusal.
+
+        Regression cover for the latent ``marker.id`` bug: EventLogEntry has
+        ``sequence``, never ``id`` — this path must raise DeliveryRefusal,
+        not AttributeError.
+        """
+        parent = store.save_model(_message(recipient="fixer", type=MessageType.PROPOSAL))
+        with store.transaction():
+            writer.record(
+                EventLogEntry(
+                    type=EventType.MESSAGE_DELIVERED,
+                    content="forged binding missing its run reference",
+                    sender=DELIVERY_SENDER,
+                    recipient="fixer",
+                    room_id="room-1",
+                    references=[f"message:{parent.id}"],
+                )
+            )
+
+        with pytest.raises(DeliveryRefusal, match="corrupt delivery marker"):
+            await delivery.deliver_and_reply(parent.id, reply_type=MessageType.OPINION)
+
     async def test_deliver_and_reply_preflight_invalid_reply_type_zero_invocation(
         self, delivery, store, api_agent
     ):

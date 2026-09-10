@@ -19,6 +19,8 @@ relay = "relay.cli.main:app"
 
 [project.optional-dependencies]
 dev = [
+    "hypothesis>=6.168.0",
+    "pyright>=1.1.414",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
@@ -42,3 +44,16 @@ target-version = "py311"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "invariants: hypothesis property/invariant tests (pre-P6 hardening)",
+    "live_claude: live adapter smoke tests (never run in CI)",
+]
+
+# Static typing ratchet: strict mode is enforced on the orchestration spine
+# (core), the canonical persistence layer (storage), and the harness boundary.
+# AllPlatforms keeps platform-gated stdlib symbols resolvable on every CI OS.
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.11"
+pythonPlatform = "AllPlatforms"
+include = ["relay/core", "relay/storage", "relay/harness"]

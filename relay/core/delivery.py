@@ -46,7 +46,7 @@ state, evidence, approvals, or decisions. Proven structurally
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from relay.agents.base import Agent, AgentRequest, AgentResponse, AgentRole
@@ -69,6 +69,7 @@ from relay.core.protocols import ProtocolDefinition, StageContext
 from relay.core.stage_policy import StageContextRefusal, stage_admission
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
+    Artifact,
     ArtifactKind,
     EventLogEntry,
     EventType,
@@ -174,14 +175,14 @@ class MessageDelivery:
         self._bus = bus if bus is not None else ConversationBus(
             store, writer, policy=policy, stage_context=stage_context, protocol=protocol
         )
-        self._policy = policy if policy is not None else getattr(self._bus, "_policy", None)
+        self._policy = policy if policy is not None else self._bus.policy
         self._stage = stage_admission(stage_context, protocol, self._policy)
         bus_stage = getattr(self._bus, "_stage", None)
         if (self._stage is not None or bus_stage is not None) and (
             self._stage is None or bus_stage is None
             or self._stage.context != bus_stage.context
             or self._stage.definition != bus_stage.definition
-            or self._policy is not self._bus._policy
+            or self._policy is not self._bus.policy
         ):
             raise StageContextRefusal("delivery and bus must share stage context, definition, gate")
 
@@ -210,8 +211,9 @@ class MessageDelivery:
 
         self._check_stage_record(message)
         if self._stage is not None:
-            envelope = self._bus._policy_envelope(message, self._bus._validate_authorship(message))
+            envelope = self._bus.policy_envelope(message, self._bus.validate_authorship(message))
             self._stage.check_edge(envelope)
+            assert self._policy is not None  # stage admission implies a stage gate
             self._policy.check_edge(envelope)
 
         recipient = message.recipient
@@ -308,7 +310,7 @@ class MessageDelivery:
                     break
             if run_id is None:
                 raise DeliveryRefusal(
-                    f"corrupt delivery marker '{marker.id}': missing run reference"
+                    f"corrupt delivery marker seq={marker.sequence!r}: missing run reference"
                 )
 
             run = self._store.load_model(Run, run_id)
@@ -351,7 +353,7 @@ class MessageDelivery:
                 )
 
             output_artifacts = self._store.artifacts_for_run(run.id, kind=ArtifactKind.RUN_OUTPUT)
-            output_content = output_artifacts[0].content if output_artifacts else ""
+            output_content = (output_artifacts[0].content or "") if output_artifacts else ""
             recovered_response = AgentResponse(
                 output=output_content,
                 agent=run.agent,
@@ -474,6 +476,8 @@ class MessageDelivery:
         )
         if self._stage is not None:
             self._stage.check_edge(envelope)
+        # Both callers invoke this only when self._policy is not None.
+        assert self._policy is not None
         self._policy.check_edge(envelope)
 
     def _check_stage_record(self, message: Message) -> None:
@@ -648,8 +652,8 @@ class MessageDelivery:
 
         if not isinstance(agent, HarnessAgent):
             return agent
-        if agent._profile is not None:
-            profile = agent._profile.model_copy(
+        if agent.profile is not None:
+            profile = agent.profile.model_copy(
                 update={"grant": ExecutionGrantKind.READ_ONLY_ACCESS}
             )
         else:
@@ -657,16 +661,16 @@ class MessageDelivery:
 
             profile = HarnessAgentConfig(grant=ExecutionGrantKind.READ_ONLY_ACCESS)
         return type(agent)(
-            settings=agent._settings,
+            settings=agent.settings,
             profile=profile,
-            workspace_root=agent._workspace_root,
+            workspace_root=agent.workspace_root,
         )
 
     def _binding_hook(
         self,
         message: Message,
         admitted_reply_type: MessageType | None,
-    ) -> object:
+    ) -> Callable[[Run, Artifact], Iterable[EventLogEntry]]:
         """D10/D13/D14 Tx1 hook: bind atomically, veto duplicates.
 
         Runs INSIDE the delivery run's pre-provider Tx1 (single

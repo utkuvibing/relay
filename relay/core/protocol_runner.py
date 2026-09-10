@@ -7,6 +7,7 @@ import sqlite3
 from dataclasses import dataclass
 from enum import Enum
 
+from relay.agents.base import AgentRole
 from relay.core.agent_factory import AgentFactory
 from relay.core.bus import ConversationBus, MessageRejected
 from relay.core.delivery import (
@@ -100,7 +101,7 @@ class ProtocolRunner:
         self._factory, self._bindings, self._policy = factory, bindings, policy
 
     def _binding_snapshot(self, definition: ProtocolDefinition) -> str:
-        rows = []
+        rows: list[list[str]] = []
         for requirement in definition.participants:
             try:
                 participant = self._bindings.protocol_participant(requirement.role)
@@ -120,9 +121,10 @@ class ProtocolRunner:
         return canonical_bytes(["relay.protocol.bindings.v1", rows]).decode()
 
     def _preflight(self, spec: ProtocolSpec) -> None:
-        if not isinstance(self._policy, StageCommunicationPolicyGate):
+        # Runtime check: callers may construct this runner with a plain gate.
+        if not isinstance(self._policy, StageCommunicationPolicyGate):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ProtocolInputRefusal("a stage-aware policy gate is required")
-        if not isinstance(spec.topic, str) or not spec.topic.strip():
+        if not isinstance(spec.topic, str) or not spec.topic.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ProtocolInputRefusal("topic must be nonempty")
         for stage, occurrence in protocol_schedule(spec.definition):
             context = StageContext(
@@ -218,7 +220,7 @@ class ProtocolRunner:
                 raise ProtocolInputRefusal(
                     "pinned participant configuration changed", code="configuration_drift"
                 )
-            if not isinstance(self._policy, StageCommunicationPolicyGate):
+            if not isinstance(self._policy, StageCommunicationPolicyGate):  # pyright: ignore[reportUnnecessaryIsInstance]
                 raise ProtocolInputRefusal("a stage-aware policy gate is required")
             # Do not preflight fresh admission here: already bound replies retain
             # their recovery rights even if workspace policy has changed.
@@ -230,7 +232,7 @@ class ProtocolRunner:
         self, execution: ProtocolExecution, definition: ProtocolDefinition
     ) -> ProtocolResult:
         _, bindings = json.loads(execution.bindings_snapshot)
-        role_map = {role: agent for role, agent, _ in bindings}
+        role_map: dict[str, str] = {role: agent for role, agent, _ in bindings}
         resolver = ConfigRoleResolver(role_map, role_map.values())
         results: list[StageEvaluation] = []
         prior: list[Message] = []
@@ -262,8 +264,8 @@ class ProtocolRunner:
                 protocol=definition,
             )
             expected = {o.role: o.type for o in stage.expected_outputs}
-            requests = {}
-            messages = {}
+            requests: dict[AgentRole, str] = {}
+            messages: dict[AgentRole, Message] = {}
             # Reconstruct and validate the entire occurrence before invoking anyone.
             for role in stage.participants:
                 message = Message(
@@ -301,7 +303,10 @@ class ProtocolRunner:
                     self._verify_request(existing, message, role_map[role.value])
                     requests[role] = message.id
 
-            def evaluate(context=context, requests=requests):
+            def evaluate(
+                context: StageContext = context,
+                requests: dict[AgentRole, str] = requests,
+            ) -> StageEvaluation:
                 return evaluate_stage(
                     definition,
                     collect_stage_facts(
@@ -313,7 +318,9 @@ class ProtocolRunner:
                     ),
                 )
 
-            def outcome(reason, refusal=None):
+            def outcome(
+                reason: ProtocolStopReason, refusal: Exception | None = None
+            ) -> ProtocolResult:
                 stage_result = evaluate()
                 evaluations = (*results, stage_result)
                 return ProtocolResult(

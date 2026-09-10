@@ -1,15 +1,19 @@
 """Provider-free reconstruction of discussion progress from canonical records."""
 
+from typing import Any
+
+from relay.agents.base import AgentRole
 from relay.core.protocol_encoding import decode_definition, request_id
 from relay.core.protocol_outcomes import ProtocolOutcome, ledger_revision, outcome_events
 from relay.core.protocols import (
     EvaluationStatus,
     StageContext,
+    StageEvaluation,
     evaluate_protocol,
     evaluate_stage,
     protocol_schedule,
 )
-from relay.core.stage_facts import _snapshot, collect_stage_facts
+from relay.core.stage_facts import collect_stage_facts, snapshot
 from relay.storage.models import Message, ProtocolExecution
 from relay.storage.store import SqliteRelayStore
 
@@ -18,7 +22,7 @@ class DiscussionLookupError(ValueError):
     """Safe user-facing lookup diagnostic."""
 
 
-def discussion_envelope(execution_id: str | None = None) -> dict:
+def discussion_envelope(execution_id: str | None = None) -> dict[str, Any]:
     return {
         "version": "relay.discussion.v1",
         "execution_id": execution_id,
@@ -62,16 +66,16 @@ def resolve_execution(store: SqliteRelayStore, value: str) -> ProtocolExecution:
     return matches[0]
 
 
-def build_discussion_view(store: SqliteRelayStore, execution: ProtocolExecution) -> dict:
-    with _snapshot(store):
+def build_discussion_view(store: SqliteRelayStore, execution: ProtocolExecution) -> dict[str, Any]:
+    with snapshot(store):
         return _build_view(store, execution)
 
 
-def _build_view(store: SqliteRelayStore, execution: ProtocolExecution) -> dict:
+def _build_view(store: SqliteRelayStore, execution: ProtocolExecution) -> dict[str, Any]:
     view = discussion_envelope(execution.id)
     view.update(room_id=execution.room_id, task_id=execution.task_id, topic=execution.topic)
     try:
-        observations = []
+        observations: list[dict[str, Any]] = []
         for event in outcome_events(store, execution.id):
             observation = ProtocolOutcome.model_validate_json(event.content)
             if (
@@ -105,7 +109,8 @@ def _build_view(store: SqliteRelayStore, execution: ProtocolExecution) -> dict:
             raise ValueError("unsupported runner version")
         definition = decode_definition(execution.definition_snapshot, execution.definition_digest)
         view["protocol"] = {"name": definition.name, "version": definition.version}
-        results, stages = [], []
+        results: list[StageEvaluation] = []
+        stages: list[dict[str, Any]] = []
         schedule = protocol_schedule(definition)
         for stage, occurrence in schedule:
             context = StageContext(
@@ -117,7 +122,7 @@ def _build_view(store: SqliteRelayStore, execution: ProtocolExecution) -> dict:
                 execution.room_id,
                 execution.task_id,
             )
-            requests = {}
+            requests: dict[AgentRole, str] = {}
             for role in stage.participants:
                 mid = request_id(execution.id, context.stage_key, role)
                 if store.load_model(Message, mid) is not None:
@@ -145,6 +150,8 @@ def _build_view(store: SqliteRelayStore, execution: ProtocolExecution) -> dict:
             )
             for mid in evaluation.supporting_message_ids:
                 message = store.load_model(Message, mid)
+                if message is None:
+                    raise ValueError("missing canonical output")
                 view["outputs"].append(
                     {
                         "message_id": mid,
