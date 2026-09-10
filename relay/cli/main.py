@@ -471,6 +471,7 @@ def status() -> None:
     workspace = None
     tasks: list[Task] = []
     active_view = None
+    discussions = []
     try:
         conn = _open_db(root)
         try:
@@ -478,6 +479,15 @@ def status() -> None:
             evidence = SqliteEvidenceStore(store)
             writer = EventLogWriter(conn)
             workspace = store.workspace_for_identity(identity_key(root))
+            from relay.core.discussion_view import build_discussion_view
+            from relay.storage.models import ProtocolExecution
+
+            discussions = [
+                build_discussion_view(store, execution)
+                for execution in store.all_models(
+                    ProtocolExecution, order_by="created_at DESC, rowid DESC", limit=5
+                )
+            ]
             tasks = list(
                 store.all_models(Task, order_by="created_at DESC, rowid DESC", limit=_STATUS_TASKS)
             )
@@ -498,6 +508,10 @@ def status() -> None:
     except ConfigError:
         pass  # renderer prints the not-initialized hint
     render_status(workspace, config, _key_states(config), tasks=tasks, active_view=active_view)
+    from relay.cli.discussions import render_discussion
+
+    for discussion in discussions:
+        render_discussion(discussion, summary=True)
 
 
 @app.command()
@@ -535,6 +549,10 @@ def history(
         _out().print(f"[red]ERROR[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
+
+from relay.cli.discussions import register as _register_discussions
+
+_register_discussions(app)
 
 if __name__ == "__main__":
     app()

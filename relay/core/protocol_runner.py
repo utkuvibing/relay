@@ -30,6 +30,7 @@ from relay.core.protocol_encoding import (
     definition_digest,
     request_id,
 )
+from relay.core.protocol_outcomes import record_outcome
 from relay.core.protocols import (
     EvaluationStatus,
     ProtocolDefinition,
@@ -52,6 +53,10 @@ from relay.storage.store import SqliteRelayStore
 
 class ProtocolInputRefusal(ValueError):
     """Invalid, changed, or corrupt execution inputs; never expose config blobs."""
+
+    def __init__(self, message: str, *, code: str = "invalid_input") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class ProtocolStopReason(str, Enum):
@@ -158,18 +163,22 @@ class ProtocolRunner:
                 exc = ProtocolInputRefusal("invalid protocol execution inputs or ledger records")
         return ProtocolResult(execution_id, reason, refusal=exc)
 
+    def prepare(self, spec: ProtocolSpec) -> ProtocolExecution:
+        """Validate and pin inputs without writing or invoking a provider."""
+        self._preflight(spec)
+        return ProtocolExecution(
+            execution_key=spec.execution_key,
+            room_id=spec.room_id,
+            task_id=spec.task_id,
+            topic=spec.topic,
+            definition_snapshot=definition_bytes(spec.definition).decode(),
+            definition_digest=definition_digest(spec.definition),
+            bindings_snapshot=self._binding_snapshot(spec.definition),
+        )
+
     async def start(self, spec: ProtocolSpec) -> ProtocolResult:
         try:
-            self._preflight(spec)
-            candidate = ProtocolExecution(
-                execution_key=spec.execution_key,
-                room_id=spec.room_id,
-                task_id=spec.task_id,
-                topic=spec.topic,
-                definition_snapshot=definition_bytes(spec.definition).decode(),
-                definition_digest=definition_digest(spec.definition),
-                bindings_snapshot=self._binding_snapshot(spec.definition),
-            )
+            candidate = self.prepare(spec)
             with self._store.transaction():
                 existing = next(
                     self._store.all_models(
@@ -193,6 +202,11 @@ class ProtocolRunner:
         return await self.resume(execution.id)
 
     async def resume(self, execution_id: str) -> ProtocolResult:
+        result = await self._resume(execution_id)
+        record_outcome(self._store, self._writer, result)
+        return result
+
+    async def _resume(self, execution_id: str) -> ProtocolResult:
         try:
             execution = self._store.load_model(ProtocolExecution, execution_id)
             if execution is None or execution.runner_version != "relay.protocol.runner.v1":
@@ -201,7 +215,9 @@ class ProtocolRunner:
                 execution.definition_snapshot, execution.definition_digest
             )
             if self._binding_snapshot(definition) != execution.bindings_snapshot:
-                raise ProtocolInputRefusal("pinned participant configuration changed")
+                raise ProtocolInputRefusal(
+                    "pinned participant configuration changed", code="configuration_drift"
+                )
             if not isinstance(self._policy, StageCommunicationPolicyGate):
                 raise ProtocolInputRefusal("a stage-aware policy gate is required")
             # Do not preflight fresh admission here: already bound replies retain
@@ -319,7 +335,9 @@ class ProtocolRunner:
                 if self._binding_snapshot(definition) != execution.bindings_snapshot:
                     return outcome(
                         ProtocolStopReason.INPUT_REFUSED,
-                        ProtocolInputRefusal("pinned participant configuration changed"),
+                        ProtocolInputRefusal(
+                            "pinned participant configuration changed", code="configuration_drift"
+                        ),
                     )
                 message = messages[role]
                 try:

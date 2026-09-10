@@ -130,7 +130,7 @@ async def test_debate_context_resume_and_authority(store, repeated, turns):
     assert len(factory.agent.requests) == turns
 
 
-async def test_conflicting_inputs_and_drift_leave_no_delta(store):
+async def test_conflicting_inputs_and_drift_only_record_outcome(store):
     factory = Factory()
     service = runner(store, factory)
     original = spec()
@@ -155,11 +155,12 @@ async def test_conflicting_inputs_and_drift_leave_no_delta(store):
     ):
         refused = await service.start(changed)
         assert refused.stop_reason is ProtocolStopReason.INPUT_REFUSED
+    assert store.counts() == counts  # pre-execution refusals do not create observations
     factory.model = "changed"
     assert (
         await service.resume(result.execution_id)
     ).stop_reason is ProtocolStopReason.INPUT_REFUSED
-    assert store.counts() == counts
+    assert store.counts() == {**counts, "event_log": counts["event_log"] + 1}
     assert len(factory.agent.requests) == 10
 
 
@@ -176,7 +177,8 @@ async def test_failed_and_cancelled_requests_are_never_retried(store):
         assert (
             await service.resume(result.execution_id)
         ).stop_reason is ProtocolStopReason.REQUEST_FAILED
-        assert store.counts() == counts
+        delta = 1 if status is RunStatus.CANCELLED else 0
+        assert store.counts() == {**counts, "event_log": counts["event_log"] + delta}
     assert len(factory.agent.requests) == 1
 
 
@@ -200,6 +202,9 @@ async def test_pending_returns_without_polling_then_recovers(store):
 
 @pytest.mark.parametrize("fail_at", [1, 10])
 async def test_reply_materialization_crash_recovers_without_spending(store, monkeypatch, fail_at):
+    from relay.core.discussion_view import build_discussion_view
+    from relay.core.protocol_outcomes import outcome_events
+
     factory = Factory()
     service = runner(store, factory, turns=10)
     build_reply = MessageDelivery._build_reply
@@ -214,10 +219,17 @@ async def test_reply_materialization_crash_recovers_without_spending(store, monk
         await service.start(spec())
     assert len(factory.agent.requests) == fail_at
     execution = next(store.all_models(ProtocolExecution))
+    changes = store.conn.total_changes
+    view = build_discussion_view(store, execution)
+    assert view["last_observation"] is None
+    assert len(view["outputs"]) == fail_at - 1
+    assert len(factory.agent.requests) == fail_at
+    assert store.conn.total_changes == changes
     monkeypatch.setattr(MessageDelivery, "_build_reply", staticmethod(build_reply))
     result = await service.resume(execution.id)
     assert result.stop_reason is ProtocolStopReason.COMPLETE
     assert len(factory.agent.requests) == store.counts()["runs"] == 10
+    assert len(outcome_events(store, execution.id)) == 1
 
 
 async def test_refusals_and_budgets(store):
@@ -370,7 +382,7 @@ async def test_corrupt_snapshot_and_request_semantics_refuse_without_spending(st
     refused = await service.resume(result.execution_id)
     assert refused.stop_reason is ProtocolStopReason.INPUT_REFUSED
     assert "conflicting canonical content" in str(refused.refusal)
-    assert store.counts() == counts
+    assert store.counts() == {**counts, "event_log": counts["event_log"] + 2}
     assert len(factory.agent.requests) == 10
 
 

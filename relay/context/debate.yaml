@@ -1,0 +1,47 @@
+name: debate
+version: "1"
+repeat:
+  stages: [critique, rebuttal]
+  rounds: 3
+participants:
+  - role: architect
+  - role: critic
+  - role: repository_expert
+  - role: moderator
+stages:
+  - id: independent_analysis
+    participants: [architect, critic, repository_expert]
+    edges: []
+    allowed_message_types: [note, opinion]
+    budgets: {max_agent_turns: 3, max_blocking_messages: 0}
+    expected_outputs:
+      - {role: architect, type: opinion}
+      - {role: critic, type: opinion}
+      - {role: repository_expert, type: opinion}
+  - id: critique
+    participants: [architect, critic, repository_expert]
+    edges: []
+    allowed_message_types: [note, challenge]
+    budgets: {max_agent_turns: 3, max_blocking_messages: 0}
+    expected_outputs:
+      - {role: architect, type: challenge}
+      - {role: critic, type: challenge}
+      - {role: repository_expert, type: challenge}
+  - id: rebuttal
+    participants: [architect, critic, repository_expert]
+    edges: []
+    allowed_message_types: [note, rebuttal]
+    budgets: {max_agent_turns: 3, max_blocking_messages: 0}
+    expected_outputs:
+      - {role: architect, type: rebuttal}
+      - {role: critic, type: rebuttal}
+      - {role: repository_expert, type: rebuttal}
+  - id: synthesis
+    participants: [moderator]
+    edges: []
+    allowed_message_types: [note, synthesis]
+    budgets: {max_agent_turns: 1, max_blocking_messages: 0}
+    expected_outputs:
+      - {role: moderator, type: synthesis}
+    completion: {require_synthesis: true}
+completion: {require_synthesis: true}
