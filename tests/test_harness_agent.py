@@ -122,7 +122,7 @@ class TestCapabilityGating:
         agent = _agent(tmp_path, ReadOnlyAdapter)
         grant = agent.resolve_grant(ExecutionGrantKind.WORKSPACE_WRITE)
         with pytest.raises(UnsupportedCapability):
-            agent._check_grant_capabilities(grant)
+            agent.check_grant_capabilities(grant)
 
     def test_network_grant_requires_network_capability(self, tmp_path):
         class NoNet(EchoHarness):
@@ -134,7 +134,7 @@ class TestCapabilityGating:
         agent = _agent(tmp_path, NoNet)
         grant = agent.resolve_grant(ExecutionGrantKind.WORKSPACE_WRITE_NETWORK)
         with pytest.raises(UnsupportedCapability):
-            agent._check_grant_capabilities(grant)
+            agent.check_grant_capabilities(grant)
 
     def test_read_only_needs_read_only_declaration(self, tmp_path):
         class Blind(EchoHarness):
@@ -143,7 +143,7 @@ class TestCapabilityGating:
 
         agent = _agent(tmp_path, Blind)
         with pytest.raises(UnsupportedCapability):
-            agent._check_grant_capabilities(agent.resolve_grant())
+            agent.check_grant_capabilities(agent.resolve_grant())
 
 
 class TestArgvOrdering:

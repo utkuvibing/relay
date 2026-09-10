@@ -26,12 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import os
 import signal
 import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,7 +70,7 @@ class LaunchSpec:
 @dataclass
 class _StreamSink:
     limit_bytes: int
-    chunks: list[str] = field(default_factory=list)
+    chunks: list[str] = field(default_factory=lambda: list[str]())
     kept: int = 0
     truncated: bool = False
     lines_seen: int = 0
@@ -109,9 +111,6 @@ async def _pump(stream: asyncio.StreamReader | None, sink: _StreamSink) -> None:
 _IS_WINDOWS = sys.platform == "win32"
 
 if _IS_WINDOWS:
-    import ctypes
-    from ctypes import wintypes
-
     _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
@@ -291,19 +290,29 @@ async def execute(spec: LaunchSpec) -> ProcessOutcome:
     """Run one child to completion under the G2 guarantees."""
     started = time.monotonic()
 
-    kwargs: dict[str, object] = {
-        "cwd": str(spec.cwd),
-        "env": dict(spec.env),
-        "stdout": asyncio.subprocess.PIPE,
-        "stderr": asyncio.subprocess.PIPE,
-        "stdin": asyncio.subprocess.PIPE if spec.stdin_data is not None else subprocess.DEVNULL,
-    }
+    stdin: int | None = (
+        asyncio.subprocess.PIPE if spec.stdin_data is not None else subprocess.DEVNULL
+    )
     if _IS_WINDOWS:
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        proc = await asyncio.create_subprocess_exec(
+            *spec.argv,
+            cwd=str(spec.cwd),
+            env=dict(spec.env),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=stdin,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
     else:
-        kwargs["start_new_session"] = True  # own session ⇒ own killable group
-
-    proc = await asyncio.create_subprocess_exec(*spec.argv, **kwargs)
+        proc = await asyncio.create_subprocess_exec(
+            *spec.argv,
+            cwd=str(spec.cwd),
+            env=dict(spec.env),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=stdin,
+            start_new_session=True,  # own session ⇒ own killable group
+        )
 
     job = _create_kill_on_close_job()
     _job_assigned = _assign_process_to_job(job, proc.pid)

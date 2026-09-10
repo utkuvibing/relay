@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -15,6 +15,14 @@ if TYPE_CHECKING:
     from relay.core.protocol_runner import ProtocolResult
     from relay.storage.events import EventLogWriter
     from relay.storage.store import SqliteRelayStore
+
+RefusalCode = Literal[
+    "invalid_input",
+    "configuration_drift",
+    "policy_refused",
+    "budget_exhausted",
+    "request_failed",
+]
 
 
 class ProtocolOutcome(BaseModel):
@@ -34,16 +42,7 @@ class ProtocolOutcome(BaseModel):
     stage: str | None = None
     occurrence: int | None = None
     output_ids: tuple[str, ...] = ()
-    refusal_code: (
-        Literal[
-            "invalid_input",
-            "configuration_drift",
-            "policy_refused",
-            "budget_exhausted",
-            "request_failed",
-        ]
-        | None
-    ) = None
+    refusal_code: RefusalCode | None = None
     budget_scope: Literal["aggregate", "stage"] | None = None
     budget_dimension: Literal["turn", "blocking"] | None = None
     ledger_revision: str
@@ -142,13 +141,16 @@ def record_outcome(
             return
         stage = result.stage_evaluations[-1] if result.stage_evaluations else None
         reason = result.stop_reason.value
-        code = None if reason in ("complete", "delivery_pending") else reason
+        code: RefusalCode | None = None
         if reason == "input_refused":
             code = (
                 "configuration_drift"
                 if getattr(result.refusal, "code", None) == "configuration_drift"
                 else "invalid_input"
             )
+        elif reason not in ("complete", "delivery_pending"):
+            # ProtocolStopReason's refusal members are exactly RefusalCode's.
+            code = cast(RefusalCode, reason)
         budget = result.refusal if isinstance(result.refusal, BudgetExhausted) else None
         observation = ProtocolOutcome(
             execution_id=execution.id,

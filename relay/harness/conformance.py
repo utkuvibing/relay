@@ -25,14 +25,16 @@ import asyncio
 import json
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, TypeVar
 
 from relay.agents.base import AgentRequest, AgentRole
 from relay.agents.config import AgentSettings
 from relay.agents.errors import AgentError
 from relay.harness.capabilities import HarnessCapability
+from relay.harness.discovery import ResolvedExecutable
 from relay.harness.env_policy import DEFAULT_CONFLICT_VARIABLES
 from relay.harness.errors import (
     HarnessDiscoveryError,
@@ -42,9 +44,14 @@ from relay.harness.errors import (
     UnsupportedCapability,
 )
 from relay.harness.runtime import HarnessAgent
-from relay.harness.types import ExecutionGrantKind, ExitSemantics
+from relay.harness.types import ExecutionGrant, ExecutionGrantKind, ExitSemantics
 
 PY = sys.executable
+
+_AdapterFactory = Callable[[Path], HarnessAgent]
+
+_T = TypeVar("_T")
+_E = TypeVar("_E", bound=BaseException)
 
 #: Heartbeat writer used by the G2 tree scenario (materialized to disk).
 HEARTBEAT_SRC = """\
@@ -77,7 +84,7 @@ class CheckResult:
 
 @dataclass
 class ConformanceReport:
-    checks: list[CheckResult] = field(default_factory=list)
+    checks: list[CheckResult] = field(default_factory=lambda: list[CheckResult]())
 
     @property
     def passed(self) -> bool:
@@ -97,13 +104,24 @@ class ConformanceReport:
         return "\n".join([*lines, verdict])
 
 
-def _record(report, name, clause, condition, detail=""):
+_CaseFn = Callable[[ConformanceReport, _AdapterFactory, Path], None]
+
+
+def _record(
+    report: ConformanceReport,
+    name: str,
+    clause: str,
+    condition: object,
+    detail: str = "",
+) -> None:
     report.checks.append(
         CheckResult(name=name, clause=clause, passed=bool(condition), detail=detail)
     )
 
 
-async def _capture_error(awaitable, *expected):
+async def _capture_error(
+    awaitable: Coroutine[Any, Any, object], *expected: type[BaseException]
+) -> BaseException | None:
     try:
         await awaitable
     except expected as exc:
@@ -111,11 +129,19 @@ async def _capture_error(awaitable, *expected):
     return None
 
 
-def _run_async(coro):
+def _run_async(coro: Coroutine[Any, Any, _T]) -> _T:
     return asyncio.run(coro)
 
 
-def default_factory_for(cls: type[HarnessAgent], *, timeout_s: float = 25.0):
+def _capture_type(callable_: Callable[[], object], exception_type: type[_E]) -> _E | None:
+    try:
+        callable_()
+    except exception_type as exc:
+        return exc
+    return None
+
+
+def default_factory_for(cls: type[HarnessAgent], *, timeout_s: float = 25.0) -> _AdapterFactory:
     """Standard ``factory(root) -> agent`` binding a fake to a fresh ws dir."""
 
     def _make(root: Path) -> HarnessAgent:
@@ -222,7 +248,7 @@ class StructuredFakeHarness(HarnessAgent):
         {HarnessCapability.READ_ONLY_ACCESS, HarnessCapability.STRUCTURED_OUTPUT}
     )
 
-    def invocation_argv(self, resolved):
+    def invocation_argv(self, resolved: ResolvedExecutable) -> tuple[str, ...]:
         return (resolved.command, "-c", _STRUCT_SRC)
 
     #: Structured fake's failure vocabulary for conformance B05.
@@ -231,11 +257,14 @@ class StructuredFakeHarness(HarnessAgent):
         ("auth", "authentication"),  # exit 4 → AUTH semantics
     )
 
-    def classify_exit(self, exit_code):
-        table = {3: ExitSemantics.USAGE, 4: ExitSemantics.AUTH}
+    def classify_exit(self, exit_code: int | None) -> ExitSemantics:
+        table: dict[int | None, ExitSemantics] = {
+            3: ExitSemantics.USAGE,
+            4: ExitSemantics.AUTH,
+        }
         return table.get(exit_code, super().classify_exit(exit_code))
 
-    def parse_output(self, stdout_text, stderr_text):
+    def parse_output(self, stdout_text: str, stderr_text: str) -> str:
         results: list[str] = []
         for line in stdout_text.splitlines():
             line = line.strip()
@@ -275,11 +304,11 @@ class ProseFakeHarness(HarnessAgent):
         ("transport", "transport problem"),  # exit 9 → TRANSPORT semantics
     )
 
-    def invocation_argv(self, resolved):
+    def invocation_argv(self, resolved: ResolvedExecutable) -> tuple[str, ...]:
         return (resolved.command, "-c", _PROSE_SRC)
 
-    def classify_exit(self, exit_code):
-        table = {
+    def classify_exit(self, exit_code: int | None) -> ExitSemantics:
+        table: dict[int | None, ExitSemantics] = {
             7: ExitSemantics.USAGE,
             9: ExitSemantics.TRANSPORT,
             125: ExitSemantics.UNKNOWN,
@@ -293,7 +322,7 @@ class ProseFakeHarness(HarnessAgent):
 
 
 def run_battery(
-    agent_factory: Callable[[Path], HarnessAgent],
+    agent_factory: _AdapterFactory,
     workdir: Path,
 ) -> ConformanceReport:
     """Run every conformance check against one adapter factory."""
@@ -301,7 +330,7 @@ def run_battery(
     root = Path(workdir) / "ws"
     root.mkdir(parents=True, exist_ok=True)
 
-    cases: list[tuple[str, str, Callable]] = [
+    cases: list[tuple[str, str, _CaseFn]] = [
         ("B01 discovery resolves executable + version", "C.2", _case_b01_discovery),
         ("B02 discovery failure stays redacted", "C.2/C.4", _case_b02_discovery_redacted),
         ("B03 happy-path run returns prompt-derived output", "C.2", _case_b03_happy_path),
@@ -330,26 +359,28 @@ def _prompt(text: str) -> AgentRequest:
     return AgentRequest(prompt=text, role=AgentRole.RESEARCHER)
 
 
-def _case_b01_discovery(report, factory, root):
+def _case_b01_discovery(report: ConformanceReport, factory: _AdapterFactory, root: Path) -> None:
     agent = factory(root)
     info = _run_async(agent.discover())
     ok = bool(info.executable) and info.version is not None and info.version_raw is not None
     _record(report, "B01 discovery resolves executable + version", "C.2", ok, f"info={info!r}")
 
 
-def _case_b02_discovery_redacted(report, factory, root):
+def _case_b02_discovery_redacted(
+    report: ConformanceReport, factory: _AdapterFactory, root: Path
+) -> None:
     origin = factory(root)
     artifact_dir = root / ".conform-b02"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     ghost = artifact_dir / "vanished.exe"
 
     class Missing(origin.__class__):  # type: ignore[misc]
-        def _profile_executable_path(self):
+        def _profile_executable_path(self) -> str | None:
             return str(ghost)
 
     error = _run_async(
         _capture_error(
-            Missing(origin._settings, profile=origin._profile, workspace_root=root).discover(),
+            Missing(origin.settings, profile=origin.profile, workspace_root=root).discover(),
             HarnessDiscoveryError,
         )
     )
@@ -357,7 +388,7 @@ def _case_b02_discovery_redacted(report, factory, root):
     _record(report, "B02 discovery failure stays redacted", "C.2/C.4", ok, repr(error))
 
 
-def _case_b03_happy_path(report, factory, root):
+def _case_b03_happy_path(report: ConformanceReport, factory: _AdapterFactory, root: Path) -> None:
     agent = factory(root)
     marker = "conf-hello-B03"
     try:
@@ -369,9 +400,9 @@ def _case_b03_happy_path(report, factory, root):
     _record(report, "B03 happy-path run returns prompt-derived output", "C.2", ok, detail)
 
 
-def _case_b04_cwd(report, factory, root):
+def _case_b04_cwd(report: ConformanceReport, factory: _AdapterFactory, root: Path) -> None:
     agent = factory(root)
-    expected = str(agent._workspace_root.resolve())
+    expected = str(agent.workspace_root.resolve())
     try:
         response = _run_async(agent.run(_prompt("cwd-probe")))
         ok = (
@@ -384,7 +415,9 @@ def _case_b04_cwd(report, factory, root):
     _record(report, "B04 working directory pinned to workspace root", "C.2", ok, detail)
 
 
-def _case_b05_exit_semantics(report, factory, root):
+def _case_b05_exit_semantics(
+    report: ConformanceReport, factory: _AdapterFactory, root: Path
+) -> None:
     """Advertised failure modes must surface as typed, hinted AgentErrors.
 
     Modes come from the adapter itself (``failure_modes``), so differing
@@ -392,7 +425,7 @@ def _case_b05_exit_semantics(report, factory, root):
     vocabulary memorization (R3). Empty advertisement = documented pass.
     """
     agent = factory(root)
-    modes: tuple[tuple[str, str], ...] = tuple(getattr(agent, "failure_modes", ()))
+    modes = agent.failure_modes
     if not modes:
         _record(
             report,
@@ -403,10 +436,12 @@ def _case_b05_exit_semantics(report, factory, root):
         )
         return
 
-    failures = []
+    failures: list[str] = []
     for mode, needle in modes:
         probe_agent = factory(root)
-        probe_agent._profile.extra_args = ["--mode", mode]
+        probe_profile = probe_agent.profile
+        assert probe_profile is not None
+        probe_profile.extra_args = ["--mode", mode]
         try:
             error = _run_async(_capture_error(probe_agent.run(_prompt("bad-exit")), AgentError))
         except Exception as exc:  # noqa: BLE001 - raw escape IS a failure
@@ -428,7 +463,9 @@ def _case_b05_exit_semantics(report, factory, root):
     )
 
 
-def _case_b06_tree_termination(report, factory, root):
+def _case_b06_tree_termination(
+    report: ConformanceReport, factory: _AdapterFactory, root: Path
+) -> None:
     # G2 belongs to the tree-spawning implementation by design (R3); both
     # fakes still pass every other check of the shared contract.
     del factory
@@ -498,22 +535,24 @@ def _case_b06_tree_termination(report, factory, root):
 
 
 class _EnvRestore:
-    def __init__(self):
-        self._snapshot = dict(os.environ)
+    def __init__(self) -> None:
+        self._snapshot: dict[str, str] = dict(os.environ)
 
-    def pollute(self, mapping):
+    def pollute(self, mapping: Mapping[str, str]) -> None:
         os.environ.update(mapping)
 
-    def restore(self):
+    def restore(self) -> None:
         os.environ.clear()
         os.environ.update(self._snapshot)
 
 
-def _envcheck_prompt(names):
+def _envcheck_prompt(names: Iterable[str]) -> str:
     return "#ENVCHECK#" + "".join(f"\nNAME={name}" for name in names)
 
 
-def _case_b07_conflict_strip(report, factory, root):
+def _case_b07_conflict_strip(
+    report: ConformanceReport, factory: _AdapterFactory, root: Path
+) -> None:
     sentinels = {
         name: f"must-not-leak-{name.lower()}"
         for name in sorted(DEFAULT_CONFLICT_VARIABLES | {"PROSE_FAKE_LOCAL_TOKEN"})
@@ -534,7 +573,9 @@ def _case_b07_conflict_strip(report, factory, root):
     _record(report, "B07 parent conflict variables never reach children", "C.4", ok, detail)
 
 
-def _case_b08_self_allowlist(report, factory, root):
+def _case_b08_self_allowlist(
+    report: ConformanceReport, factory: _AdapterFactory, root: Path
+) -> None:
     target = "OPENAI_API_KEY"
     others = sorted(set(DEFAULT_CONFLICT_VARIABLES) - {target})
     sentinels = {name: f"solo-{name.lower()}" for name in [target, *others]}
@@ -546,7 +587,7 @@ def _case_b08_self_allowlist(report, factory, root):
         class SelfAllowing(origin.__class__):  # type: ignore[misc]
             self_allowed_env = frozenset({target})
 
-        agent = SelfAllowing(origin._settings, profile=origin._profile, workspace_root=root)
+        agent = SelfAllowing(origin.settings, profile=origin.profile, workspace_root=root)
         response = _run_async(agent.run(_prompt(_envcheck_prompt([target, *others]))))
         kept = sentinels[target] in response.output
         others_blocked = all(f"{name}=__MISSING__" in response.output for name in others)
@@ -564,7 +605,7 @@ def _case_b08_self_allowlist(report, factory, root):
     _record(report, "B08 adapter self-whitelist applies only to itself", "C.4", ok, detail)
 
 
-def _case_b09_redaction(report, factory, root):
+def _case_b09_redaction(report: ConformanceReport, factory: _AdapterFactory, root: Path) -> None:
     agent = factory(root)  # prose fake sprays fodder even on success paths
     try:
         response = _run_async(agent.run(_prompt("redaction-probe")))
@@ -575,7 +616,7 @@ def _case_b09_redaction(report, factory, root):
     _record(report, "B09 credential-shaped stderr is redacted", "C.4", ok, detail)
 
 
-def _case_b10_malformed(report, factory, root):
+def _case_b10_malformed(report: ConformanceReport, factory: _AdapterFactory, root: Path) -> None:
     """Structured-declaring adapters must fail typed on malformed streams."""
     agent = factory(root)
     if HarnessCapability.STRUCTURED_OUTPUT not in agent.capabilities_set():
@@ -588,13 +629,15 @@ def _case_b10_malformed(report, factory, root):
         )
         return
     probe = factory(root)
-    probe._profile.extra_args = ["--mode", "malfault"]
+    probe_profile = probe.profile
+    assert probe_profile is not None
+    probe_profile.extra_args = ["--mode", "malfault"]
     error = _run_async(_capture_error(probe.run(_prompt("malformed")), AgentError))
     ok = isinstance(error, HarnessOutputError) and "BROKEN" not in str(error)
     _record(report, "B10 malformed structured streams fail typed", "C.2/C.3", ok, repr(error))
 
 
-def _case_b11_unsupported(report, factory, root):
+def _case_b11_unsupported(report: ConformanceReport, factory: _AdapterFactory, root: Path) -> None:
     """Any single undeclared capability must raise explicitly (twice over)."""
     agent = factory(root)
     all_caps = set(HarnessCapability)
@@ -626,7 +669,7 @@ def _case_b11_unsupported(report, factory, root):
     for kind, needed in gating.items():
         if needed not in agent.capabilities_set():
             try:
-                agent._check_grant_capabilities(agent.resolve_grant(kind))
+                agent.check_grant_capabilities(agent.resolve_grant(kind))
                 grant_ok = False
             except UnsupportedCapability:
                 grant_ok = True
@@ -646,14 +689,13 @@ def _case_b11_unsupported(report, factory, root):
     )
 
 
-def _case_b12_argv_order(report, factory, root):
-    from relay.harness.discovery import ResolvedExecutable
-    from relay.harness.types import ExecutionGrant
-
+def _case_b12_argv_order(report: ConformanceReport, factory: _AdapterFactory, root: Path) -> None:
     agent = factory(root)
     resolved = ResolvedExecutable(command=str(PY), source="explicit_path")
     grant = ExecutionGrant(kind=ExecutionGrantKind.READ_ONLY_ACCESS, additional_args=())
-    agent._profile.grant = ExecutionGrantKind.READ_ONLY_ACCESS
+    profile = agent.profile
+    assert profile is not None
+    profile.grant = ExecutionGrantKind.READ_ONLY_ACCESS
     argv = agent.compose_argv(resolved, grant)
     invocation = agent.invocation_argv(resolved)
     checks = [
@@ -670,13 +712,15 @@ def _case_b12_argv_order(report, factory, root):
     )
 
 
-def _case_b13_missing_grant(report, factory, root):
+def _case_b13_missing_grant(
+    report: ConformanceReport, factory: _AdapterFactory, root: Path
+) -> None:
     origin = factory(root)
 
     class NoGrant(origin.__class__):  # type: ignore[misc]
         default_grant = None
 
-    agent = NoGrant(origin._settings, profile=origin._profile, workspace_root=root)
+    agent = NoGrant(origin.settings, profile=origin.profile, workspace_root=root)
     grant_error = _capture_type(agent.resolve_grant, MissingExecutionGrantError)
     run_error = _run_async(
         _capture_error(agent.run(_prompt("needs-grant")), MissingExecutionGrantError, AgentError)
@@ -689,11 +733,3 @@ def _case_b13_missing_grant(report, factory, root):
         ok,
         f"resolve={grant_error!r} run={run_error!r}",
     )
-
-
-def _capture_type(callable_, exception_type):
-    try:
-        callable_()
-    except exception_type as exc:
-        return exc
-    return None

@@ -77,6 +77,32 @@ jobs:
       - name: Ruff
         run: uv run --python 3.13 ruff check .
 
+  types:
+    name: types / pyright strict
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      # Strict mode is pinned to relay/core, relay/storage, relay/harness in
+      # pyproject.toml [tool.pyright]; this check is blocking.
+      - name: Sync dependencies
+        run: uv sync --locked --extra dev --python 3.13
+
+      - name: Pyright
+        run: uv run --python 3.13 pyright
+
   package:
     name: package / build-and-smoke
     runs-on: ubuntu-latest
@@ -134,16 +160,19 @@ jobs:
   required:
     name: required
     if: always()
-    needs: [test, lint, package]
+    needs: [test, lint, types, package]
     runs-on: ubuntu-latest
     steps:
       - name: Verify authoritative gates
         env:
           TEST_RESULT: ${{ needs.test.result }}
           LINT_RESULT: ${{ needs.lint.result }}
+          TYPES_RESULT: ${{ needs.types.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
         run: |
-          printf 'test=%s\nlint=%s\npackage=%s\n' "$TEST_RESULT" "$LINT_RESULT" "$PACKAGE_RESULT"
+          printf 'test=%s\nlint=%s\ntypes=%s\npackage=%s\n' \
+            "$TEST_RESULT" "$LINT_RESULT" "$TYPES_RESULT" "$PACKAGE_RESULT"
           test "$TEST_RESULT" = success
           test "$LINT_RESULT" = success
+          test "$TYPES_RESULT" = success
           test "$PACKAGE_RESULT" = success

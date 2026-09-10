@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, runtime_checkable
 
 from relay.agents.base import AgentRole
 from relay.storage.models import EventType, MessageType
@@ -72,9 +72,12 @@ class BlockingNotPermitted(CommunicationPolicyRefusal):
 class BudgetExhausted(CommunicationPolicyRefusal):
     """A communication budget has no remaining capacity."""
 
-    dimension: str
+    dimension: Literal["turn", "blocking"]
+    scope: Literal["aggregate", "stage"]
 
-    def __init__(self, message: str = "", *, scope: str = "aggregate") -> None:
+    def __init__(
+        self, message: str = "", *, scope: Literal["aggregate", "stage"] = "aggregate"
+    ) -> None:
         super().__init__(message)
         self.scope = scope
 
@@ -127,7 +130,8 @@ def reply_admission_reference(reply_type: MessageType) -> str:
 def _coerce_principal(value: PolicyPrincipal | str) -> PolicyPrincipal:
     if isinstance(value, (AgentRole, PrincipalClass)):
         return value
-    if isinstance(value, str):
+    # Runtime guard: callers can construct these dataclasses with untyped data.
+    if isinstance(value, str):  # pyright: ignore[reportUnnecessaryIsInstance]
         try:
             return AgentRole(value)
         except ValueError:
@@ -174,7 +178,7 @@ class PolicyEdge:
         if MessageType.SYSTEM in types:
             raise ValueError("policy edges may not permit system messages")
         object.__setattr__(self, "types", types)
-        if not isinstance(self.blocking_allowed, bool):
+        if not isinstance(self.blocking_allowed, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError("blocking_allowed must be a bool")
 
 
@@ -190,7 +194,10 @@ class CommunicationBudgets:
             ("max_agent_turns", self.max_agent_turns, 1),
             ("max_blocking_messages", self.max_blocking_messages, 0),
         ):
-            if isinstance(value, bool) or not isinstance(value, int):
+            if (
+                isinstance(value, bool)  # pyright: ignore[reportUnnecessaryIsInstance]
+                or not isinstance(value, int)  # pyright: ignore[reportUnnecessaryIsInstance]
+            ):
                 raise TypeError(f"{name} must be an int")
             if value < lower or value > _MAX_BUDGET:
                 raise ValueError(f"{name} must be between {lower} and {_MAX_BUDGET}")
@@ -204,13 +211,16 @@ class CommunicationPolicy:
     edges: frozenset[PolicyEdge] | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.budgets, CommunicationBudgets):
+        if not isinstance(self.budgets, CommunicationBudgets):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError("budgets must be a CommunicationBudgets instance")
         if self.edges is not None:
             edges = frozenset(self.edges)
-            if not all(isinstance(edge, PolicyEdge) for edge in edges):
+            if not all(
+                isinstance(edge, PolicyEdge)  # pyright: ignore[reportUnnecessaryIsInstance]
+                for edge in edges
+            ):
                 raise TypeError("edges must contain PolicyEdge instances")
-            pairs: set[tuple[AgentRole, AgentRole]] = set()
+            pairs: set[tuple[PolicyPrincipal, PolicyPrincipal]] = set()
             for edge in edges:
                 pair = (edge.sender, edge.recipient)
                 if pair in pairs:
@@ -243,7 +253,7 @@ class PolicyEnvelope:
         object.__setattr__(self, "sender", _coerce_principal(self.sender))
         object.__setattr__(self, "recipient", _coerce_principal(self.recipient))
         object.__setattr__(self, "type", _coerce_message_type(self.type))
-        if not isinstance(self.blocking, bool):
+        if not isinstance(self.blocking, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError("blocking must be a bool")
 
 

@@ -1,12 +1,14 @@
 """Read-only ledger-to-facts boundary for pure protocol evaluation."""
 
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 
 from relay.agents.base import AgentRole
 from relay.core.policy import BudgetExhausted, StageCommunicationPolicyGate
 from relay.core.protocols import (
+    BudgetDimension,
     BudgetExhaustionFact,
+    BudgetScope,
     ProtocolDefinition,
     ProtocolFactsError,
     RequestState,
@@ -29,7 +31,7 @@ from relay.storage.store import SqliteRelayStore
 
 
 @contextmanager
-def _snapshot(store: SqliteRelayStore):
+def snapshot(store: SqliteRelayStore) -> Generator[None, None, None]:
     # Reuse a caller-owned transaction without committing or rolling it back.
     owned = not store.conn.in_transaction
     if owned:
@@ -158,16 +160,22 @@ def collect_stage_facts(
     if not set(expected_request_ids) <= set(stage.participants):
         raise ProtocolFactsError("request map contains undeclared roles")
     ids = tuple(expected_request_ids.values())
-    if any(not isinstance(mid, str) or not mid for mid in (*ids, *clarification_seed_ids)):
+    # Runtime guard: request maps are caller-supplied mappings.
+    if any(
+        not isinstance(mid, str) or not mid  # pyright: ignore[reportUnnecessaryIsInstance]
+        for mid in (*ids, *clarification_seed_ids)
+    ):
         raise ProtocolFactsError("request and clarification IDs must be nonempty strings")
     if len(set(ids)) != len(ids) or len(set(clarification_seed_ids)) != len(clarification_seed_ids):
         raise ProtocolFactsError("duplicate request or clarification seed IDs")
-    if policy is not None and not isinstance(policy, StageCommunicationPolicyGate):
+    # Runtime check: ``policy`` is a Protocol — a structural isinstance is the
+    # enforcement, not decoration.
+    if policy is not None and not isinstance(policy, StageCommunicationPolicyGate):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise ProtocolFactsError("facts budget inspection requires a stage-aware gate")
-    requests = []
-    answers = []
-    exhaustion = None
-    with _snapshot(store):
+    requests: list[StageRequestFact] = []
+    answers: list[StageAnswerFact] = []
+    exhaustion: BudgetExhaustionFact | None = None
+    with snapshot(store):
         for role in stage.participants:
             request_id = expected_request_ids.get(role)
             if request_id is None:
@@ -212,5 +220,7 @@ def collect_stage_facts(
                         stage.budgets.policy_budgets(),
                     )
             except BudgetExhausted as exc:
-                exhaustion = BudgetExhaustionFact(exc.scope, exc.dimension)
+                exhaustion = BudgetExhaustionFact(
+                    BudgetScope(exc.scope), BudgetDimension(exc.dimension)
+                )
     return StageFacts(context, context.stage_key, tuple(requests), tuple(answers), exhaustion)

@@ -58,7 +58,7 @@ class Room(BaseModel):
     id: str = Field(default_factory=new_id)
     name: str
     workspace_id: str | None = None
-    members: list[RoomMember] = Field(default_factory=list)
+    members: list[RoomMember] = Field(default_factory=lambda: list[RoomMember]())
     active_task_id: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
 

@@ -232,7 +232,7 @@ def foreign_conversation_key(seed_id: str) -> str:
 def canonical_identity(
     *,
     conversation_key: str,
-    room_id: str,
+    room_id: str | None,
     task_id: str | None,
     hop_index: int,
     attempt_index: int,
@@ -266,7 +266,7 @@ def canonical_identity(
 def derive_message_id(
     *,
     conversation_key: str,
-    room_id: str,
+    room_id: str | None,
     task_id: str | None,
     hop_index: int,
     attempt_index: int,
@@ -319,7 +319,9 @@ class ConversationDriver:
 
     def _validate_spec(self, spec: ConversationSpec, *, for_start: bool) -> None:
         key = spec.conversation_key
-        if not isinstance(key, str) or not key.strip():
+        # Runtime guard: ConversationSpec is a plain dataclass — callers can
+        # construct it with untyped data.
+        if not isinstance(key, str) or not key.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             raise SpecRefusal("conversation_key is required and must be a non-empty string")
         if len(key) > MAX_CONVERSATION_KEY_CHARS:
             raise SpecRefusal(f"conversation_key exceeds {MAX_CONVERSATION_KEY_CHARS} characters")
@@ -328,7 +330,7 @@ class ConversationDriver:
                 f"conversation_key must not begin with the reserved '{FOREIGN_KEY_PREFIX}' "
                 "prefix — it names foreign-seed conversations (frozen plan D14)"
             )
-        if not isinstance(spec.room_id, str) or not spec.room_id.strip():
+        if not isinstance(spec.room_id, str) or not spec.room_id.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             raise SpecRefusal("room_id is required — driver traffic is scope-pinned")
         if not spec.participants:
             raise SpecRefusal("at least one participant is required")
