@@ -55,5 +55,5 @@ markers = [
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.11"
-pythonPlatform = "AllPlatforms"
+pythonPlatform = "All"
 include = ["relay/core", "relay/storage", "relay/harness"]

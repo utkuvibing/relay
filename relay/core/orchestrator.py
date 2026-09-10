@@ -282,13 +282,19 @@ def _capture_baseline(root: Path) -> dict[str, bytes]:
     return baseline
 
 
-def _diff_against_baseline(gate: PermissionGate, root: Path, task_id: str) -> str:
+def _diff_against_baseline(
+    gate: PermissionGate, root: Path, task_id: str, baseline: dict[str, bytes]
+) -> str:
     """Relay-owned diff vs pre-run baseline through the single gate path (A.4).
 
     Non-mutating: no git index/HEAD changes at all. Only files that differ
     from the captured baseline are attributed to this run. Binary-safe via
     literal ``diff --git``-style textual patch construction over UTF-8 text
     with lossy fallback markers for binary content.
+
+    The baseline is execution-local — passed in by the caller, never shared
+    module state — so concurrent builds cannot contaminate each other's
+    provenance.
     """
     decision = gate.check(
         ToolRequest(
@@ -302,8 +308,6 @@ def _diff_against_baseline(gate: PermissionGate, root: Path, task_id: str) -> st
         raise BuildRefusal(
             f"diff extraction refused by policy: {decision.action.value} -> {decision.outcome}"
         )
-
-    baseline = _workdir_state.get("baseline") or {}
     current_files: dict[str, bytes] = {}
     for path in sorted(root.rglob("*")):
         if not path.is_file():
@@ -358,9 +362,6 @@ def _diff_against_baseline(gate: PermissionGate, root: Path, task_id: str) -> st
             lines.append(diff_line.rstrip("\n"))
     return "\n".join(lines)
 
-
-# Baseline handoff between the pre-run capture and post-run comparison.
-_workdir_state: dict[str, dict[str, bytes]] = {}
 
 _BASELINE_FILE_CAP_BYTES = 4 * 1024 * 1024
 _BINARY_SNIFF_BYTES = 8000
@@ -975,7 +976,8 @@ async def run_build(
     # Blocker 2 provenance baseline: snapshot BEFORE implement-run I/O so
     # pre-existing files are never attributed to the run. (The plan run is
     # READ_ONLY; anything it left behind is pre-existing by definition.)
-    _workdir_state["baseline"] = _capture_baseline(workspace_root)
+    # Execution-local: concurrent builds can never share this map.
+    baseline = _capture_baseline(workspace_root)
 
     outcome = await run_ask(
         store, writer, agent, implement_request, model=model, agent_name=agent_name
@@ -989,7 +991,7 @@ async def run_build(
     tool_run_ids = _record_observed_events(store, writer, response, outcome.run.id)
 
     # Relay-owned non-mutating diff extraction as DIFF artifact.
-    diff_text = _diff_against_baseline(gate, workspace_root, task.id)
+    diff_text = _diff_against_baseline(gate, workspace_root, task.id, baseline)
     diff_artifact_id: str | None = None
     if diff_text.strip():
         with store.transaction():
