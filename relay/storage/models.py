@@ -15,7 +15,7 @@ import enum
 import uuid
 from datetime import UTC, datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from relay.core.evidence import EvidenceKind
 from relay.core.permissions import Action
@@ -80,6 +80,28 @@ class RunStatus(str, enum.Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class ProtocolExecution(BaseModel):
+    """Append-only execution inputs; progress belongs to the conversation ledger."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    id: str = Field(default_factory=new_id)
+    execution_key: str = Field(min_length=1)
+    room_id: str | None = Field(default=None, min_length=1)
+    task_id: str | None = Field(default=None, min_length=1)
+    topic: str = Field(min_length=1)
+    definition_snapshot: str
+    definition_digest: str
+    bindings_snapshot: str
+    runner_version: str = "relay.protocol.runner.v1"
+    created_at: datetime = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def _scope(self) -> ProtocolExecution:
+        if self.room_id is None and self.task_id is None:
+            raise ValueError("execution requires room or task scope")
+        return self
 
 
 class Run(BaseModel):

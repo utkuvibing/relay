@@ -40,7 +40,7 @@ from relay.core.protocols import (
 )
 from relay.core.stage_facts import collect_stage_facts
 from relay.core.stage_policy import StageContextRefusal, StageScheduleRefusal
-from relay.storage.db import _MIGRATIONS, connect, migrate
+from relay.storage.db import _MIGRATIONS, SCHEMA_VERSION, connect, migrate
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     EventLogEntry,
@@ -166,6 +166,7 @@ def store(tmp_path):
 @pytest.mark.asyncio
 async def test_debate_exit_gate_through_existing_bus_and_delivery(store):
     definition = load_protocol(Path(__file__).resolve().parents[1] / "protocols/debate.yaml")
+    definition = replace(definition, repeat=None)  # Preserve the P5.2 single-pass exit gate.
     agent = OfflineAgent()
     gate = SqliteCommunicationPolicyGate(store, CommunicationPolicy(CommunicationBudgets(16, 3)))
     authority_tables = ("tasks", "decisions", "approvals", "evidence_records")
@@ -601,8 +602,8 @@ def test_populated_v5_migration_preserves_history_and_stage_roundtrip(tmp_path):
         "VALUES ('message_sent','legacy','2026-01-01T00:00:00+00:00')"
     )
     old_message = dict(conn.execute("SELECT * FROM messages").fetchone())
-    assert migrate(conn) == 6
-    assert migrate(conn) == 6
+    assert migrate(conn) == SCHEMA_VERSION
+    assert migrate(conn) == SCHEMA_VERSION
     migrated = dict(conn.execute("SELECT * FROM messages").fetchone())
     assert migrated == {**old_message, "stage_key": None}
     store = SqliteRelayStore(conn)

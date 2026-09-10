@@ -31,7 +31,7 @@ EXAMPLE = Path(__file__).resolve().parents[1] / "protocols" / "debate.yaml"
 
 
 def debate():
-    return load_protocol(EXAMPLE)
+    return replace(load_protocol(EXAMPLE), repeat=None)
 
 
 def context(stage_id="independent_analysis", **kwargs):

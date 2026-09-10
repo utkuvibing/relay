@@ -38,6 +38,7 @@ from relay.storage.models import (
     EventLogEntry,
     EvidenceRecord,
     Message,
+    ProtocolExecution,
     Room,
     Run,
     Task,
@@ -62,6 +63,7 @@ MODEL_TABLES: dict[type[pydantic.BaseModel], str] = {
     Task: "tasks",
     Run: "runs",
     Message: "messages",
+    ProtocolExecution: "protocol_executions",
     Artifact: "artifacts",
     Decision: "decisions",
     Approval: "approvals",
@@ -70,7 +72,7 @@ MODEL_TABLES: dict[type[pydantic.BaseModel], str] = {
     EventLogEntry: "event_log",
 }
 
-_APPEND_ONLY_TABLES = frozenset({"event_log", "evidence_records", "messages"})
+_APPEND_ONLY_TABLES = frozenset({"event_log", "evidence_records", "messages", "protocol_executions"})
 
 _PRIMITIVES = (str, int, float, bool)
 
