@@ -34,6 +34,7 @@ from relay.core.orchestrator import (
     _diff_and_state_against_baseline,
     _open_approval_gate,
     _reviewer_for,
+    _workspace_state_digest,
     advance_task,
     run_build,
 )
@@ -1617,6 +1618,90 @@ class TestBaselineIsolation:
         assert "new file: new.txt" in diff_a
         assert "bfile.txt" not in diff_a
         assert diff_b.strip() == ""
+
+    def test_tracked_file_growing_past_cap_is_not_a_phantom_deletion(
+        self, tmp_path, monkeypatch
+    ):
+        """Case A: a baseline-tracked file crossing the cap stays tracked.
+
+        Under the per-scan cap the grown file would drop out of the current
+        snapshot while remaining in the baseline — a phantom ``deleted
+        file:`` line. Frozen membership keeps it tracked; the rendered diff
+        uses a bounded marker and the raw-byte digest still sees the change.
+        """
+        from relay.core import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        gate = PermissionGate()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "big.dat").write_bytes(b"a" * 60)  # under cap → tracked member
+
+        baseline = _capture_baseline(ws)
+        (ws / "big.dat").write_bytes(b"b" * 100)  # grown past cap
+
+        diff, digest = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert "deleted file" not in diff
+        assert "big.dat" in diff  # honest bounded representation
+        assert digest != _workspace_state_digest(baseline.files)
+
+        # The grown file is read into the tracked set deterministically —
+        # an identical rescan produces the identical digest.
+        diff2, digest2 = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert digest2 == digest
+        assert diff2 == diff
+
+    def test_baseline_oversized_file_shrinking_is_not_a_phantom_creation(
+        self, tmp_path, monkeypatch
+    ):
+        """Case B: a baseline-oversized file stays untracked after shrinking.
+
+        Under the per-scan cap the shrunken file would enter the current
+        snapshot while absent from the baseline — a phantom ``new file:``
+        line. Frozen membership keeps it deliberately untracked, and the
+        digest is unchanged by invisible bytes.
+        """
+        from relay.core import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        gate = PermissionGate()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "big.dat").write_bytes(b"a" * 100)  # over cap → untracked member
+
+        baseline = _capture_baseline(ws)
+        (ws / "big.dat").write_bytes(b"b" * 10)  # shrunk under cap
+
+        diff, digest = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert "new file" not in diff
+        assert "big.dat" not in diff
+        assert diff.strip() == ""
+        # An untracked file contributes nothing — digest equals empty state.
+        assert digest == _workspace_state_digest({})
+
+    def test_new_file_created_past_cap_stays_bounded_deterministically(
+        self, tmp_path, monkeypatch
+    ):
+        """Post-baseline files keep the size bound — deliberately untracked.
+
+        A new oversized file never enters the tracked set (bounded scanning),
+        and the rule is deterministic: every scan reaches the same verdict.
+        """
+        from relay.core import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        gate = PermissionGate()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+
+        baseline = _capture_baseline(ws)
+        (ws / "huge.dat").write_bytes(b"x" * 200)  # new file, over cap
+
+        diff, digest = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert diff.strip() == ""
+        assert digest == _workspace_state_digest({})
+        _, digest2 = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert digest2 == digest
 
 
 # ---------------------------------------------------------------------------

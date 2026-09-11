@@ -350,8 +350,61 @@ def _workspace_path_is_excluded(rel: Path) -> bool:
     return any(part in _WORKSPACE_EXCLUDED_PARTS for part in rel.parts)
 
 
-def _tracked_workspace_files(root: Path) -> dict[str, bytes]:
-    """Read Relay's tracked workspace file set (shared exclusion policy)."""
+@dataclass(frozen=True)
+class _WorkspaceBaseline:
+    """Frozen tracked-set contract for one build (P6.2).
+
+    ``files`` holds pre-existing tracked contents; ``oversized_paths`` the
+    pre-existing paths deliberately left untracked by the size bound. The
+    split freezes membership across every attempt: a tracked file growing
+    past the cap stays tracked, an oversized file shrinking under the cap
+    stays untracked — threshold crossings can never manufacture a phantom
+    deletion or creation.
+    """
+
+    files: dict[str, bytes]
+    oversized_paths: frozenset[str]
+
+
+def _capture_baseline(root: Path) -> _WorkspaceBaseline:
+    """Snapshot the working tree Relay could later attribute to a run.
+
+    Bounded: skips the shared exclusion set (``.git``, ``.relay``,
+    ``node_modules``, ``__pycache__``) and records — rather than silently
+    drops — paths over the size bound, so the post-run scans inherit a
+    stable membership contract and pre-existing files are never
+    re-adjudicated.
+    """
+    files: dict[str, bytes] = {}
+    oversized: set[str] = set()
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if _workspace_path_is_excluded(rel):
+            continue
+        name = str(rel).replace("\\", "/")
+        try:
+            if path.stat().st_size > _BASELINE_FILE_CAP_BYTES:
+                oversized.add(name)
+                continue
+            files[name] = path.read_bytes()
+        except OSError:
+            continue
+    return _WorkspaceBaseline(files=files, oversized_paths=frozenset(oversized))
+
+
+def _tracked_workspace_files(
+    root: Path, baseline: _WorkspaceBaseline
+) -> dict[str, bytes]:
+    """Read the current tracked workspace under the baseline's contract.
+
+    Membership is frozen at baseline for pre-existing files: a contract
+    member is always read (growth past the cap can never fake a deletion);
+    a baseline-oversized path stays untracked (shrinkage can never fake a
+    creation). Files first created after the baseline keep the bounded-size
+    policy — deterministic per scan.
+    """
     files: dict[str, bytes] = {}
     for path in sorted(root.rglob("*")):
         if not path.is_file():
@@ -359,10 +412,16 @@ def _tracked_workspace_files(root: Path) -> dict[str, bytes]:
         rel = path.relative_to(root)
         if _workspace_path_is_excluded(rel):
             continue
+        name = str(rel).replace("\\", "/")
+        if name in baseline.oversized_paths:
+            continue
         try:
-            if path.stat().st_size > _BASELINE_FILE_CAP_BYTES:
+            if (
+                name not in baseline.files
+                and path.stat().st_size > _BASELINE_FILE_CAP_BYTES
+            ):
                 continue
-            files[str(rel).replace("\\", "/")] = path.read_bytes()
+            files[name] = path.read_bytes()
         except OSError:
             continue
     return files
@@ -385,16 +444,6 @@ def _workspace_state_digest(files: dict[str, bytes]) -> str:
         state.update(hashlib.sha256(files[name]).digest())
         state.update(b"\x00")
     return state.hexdigest()
-
-
-def _capture_baseline(root: Path) -> dict[str, bytes]:
-    """Snapshot every working-tree file Relay could later attribute to a run.
-
-    Bounded: skips the shared exclusion set (``.git``, ``.relay``,
-    ``node_modules``, ``__pycache__``). Used as the provenance baseline so
-    pre-existing files are never attributed to the harness.
-    """
-    return _tracked_workspace_files(root)
 
 
 def _render_workspace_diff(baseline: dict[str, bytes], current_files: dict[str, bytes]) -> str:
@@ -420,6 +469,12 @@ def _render_workspace_diff(baseline: dict[str, bytes], current_files: dict[str, 
         if is_binary_before or is_binary_after:
             lines.append(f"Binary files {name} differ")
             continue
+        if after is not None and len(after) > _BASELINE_FILE_CAP_BYTES:
+            # Contract member grown past the display bound — report the
+            # change honestly without a multi-MB unified diff; raw bytes
+            # still feed the state digest, so no-progress stays exact.
+            lines.append(f"oversized file {name} differs")
+            continue
 
         before_text = _text(before).splitlines(keepends=True)
         after_text = _text(after).splitlines(keepends=True)
@@ -440,7 +495,7 @@ def _render_workspace_diff(baseline: dict[str, bytes], current_files: dict[str, 
 
 
 def _diff_and_state_against_baseline(
-    gate: PermissionGate, root: Path, task_id: str, baseline: dict[str, bytes]
+    gate: PermissionGate, root: Path, task_id: str, baseline: _WorkspaceBaseline
 ) -> tuple[str, str]:
     """One gate-checked scan → (rendered cumulative diff, raw state digest).
 
@@ -460,9 +515,9 @@ def _diff_and_state_against_baseline(
         raise BuildRefusal(
             f"diff extraction refused by policy: {decision.action.value} -> {decision.outcome}"
         )
-    current_files = _tracked_workspace_files(root)
+    current_files = _tracked_workspace_files(root, baseline)
     return (
-        _render_workspace_diff(baseline, current_files),
+        _render_workspace_diff(baseline.files, current_files),
         _workspace_state_digest(current_files),
     )
 
@@ -1267,7 +1322,7 @@ async def _run_implementation_attempt(
     model: str | None,
     agent_name: str | None,
     workspace_root: Path,
-    baseline: dict[str, bytes],
+    baseline: _WorkspaceBaseline,
     previous_state_digest: str | None,
 ) -> _AttemptOutcome:
     """Dispatch one implementation/fix run through the crash-safe spine.
@@ -1570,7 +1625,10 @@ async def run_build(
     # READ_ONLY; anything it left behind is pre-existing by definition.)
     # Execution-local: concurrent builds can never share this map — and the
     # SAME baseline serves every attempt, so each review certifies the whole
-    # cumulative change, never just the last delta.
+    # cumulative change, never just the last delta. The baseline also freezes
+    # the tracked-set contract: which pre-existing files count (and which
+    # oversized ones deliberately don't) is decided once, so a file crossing
+    # the size bound mid-build can never fake a deletion or creation.
     baseline = _capture_baseline(workspace_root)
 
     attempts = 0
