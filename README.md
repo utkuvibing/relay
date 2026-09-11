@@ -25,6 +25,7 @@ Conversation is coordination input, not workflow authority. Messages cannot sile
 
 - `relay ask <agent> "<prompt>"` runs one configured API or harness agent and persists its input, output, and sanitized failures.
 - `relay build "<task>"` drives a task through context, planning, implementation, configured verification, review, and completion gates.
+- Reviewers return a strict `relay.review.v1` JSON report. Findings persist as a canonical review plus a deterministic `fix_packet` artifact and park the task at `implementing`; Relay does not execute the fix yet. A clean PASS commits with the resulting approval or completion transition atomically.
 - `relay approve <task-id> --by <name>` records explicit human approval. The default path is `approval_required`; `approval: {mode: direct}` is an explicit opt-out that still requires verification and review evidence.
 - `relay status`, `relay history`, and `relay inspect` expose the local ledger.
 
@@ -106,7 +107,7 @@ The current adapter registry includes OpenAI-compatible API adapters and harness
 These are roadmap items, not current capabilities:
 
 - P5 remaining: semantic loop/convergence detection; discussion CLI, bounded protocols, policy, budgets, and stored escalation notices are available;
-- P6: automated implementation review and fix loops;
+- P6 remaining: fix execution, retry loops, attempt scoping, resume, and final post-fix verification; structured findings and deterministic fix packets are available;
 - P7: persistent Rooms, seats, and long-lived participant context;
 - P8: decision provenance;
 - P9: Relay server;
@@ -133,7 +134,7 @@ codex login
 uv run relay ask codex "Reply with exactly: RELAY_OK"
 ```
 
-Before `relay build`, configure a harness agent with at least the `workspace_write` grant. Configure a Relay-owned verification command in `relay.yaml` so the task can be checked independently of the implementer.
+Before `relay build`, configure a harness agent with at least the `workspace_write` grant. Configure a Relay-owned verification command in `relay.yaml` so the task can be checked independently of the implementer. Harness-backed reviewers are rebound to `read_only` for the review run, even if configured with a stronger grant.
 
 Keep API keys in the environment or an ignored local `.env` file. Never put secrets in `relay.yaml`.
 

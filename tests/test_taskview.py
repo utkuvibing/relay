@@ -260,6 +260,9 @@ class TestLedger:
         task = store.save_model(Task(title="json"))
         _record(evidence, EvidenceKind.CONTEXT_COLLECTED, task.id)
         store.save_model(Artifact(kind=ArtifactKind.REPORT, task_id=task.id, content="brief"))
+        store.save_model(
+            Artifact(kind=ArtifactKind.FIX_PACKET, task_id=task.id, content='{"packet":1}')
+        )
         task = _advance(store, writer, evidence, task, TaskState.CONTEXT_READY)
 
         ledger = build_task_ledger(
@@ -272,6 +275,7 @@ class TestLedger:
         assert payload["last_transition"]["to"] == "context_ready"
         assert payload["evidence"][0]["kind"] == "context_collected"
         assert payload["artifacts"][0]["content"] == "brief"
+        assert {a["kind"] for a in payload["artifacts"]} == {"report", "fix_packet"}
         assert encoded
 
 

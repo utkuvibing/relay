@@ -164,6 +164,19 @@ class TestCodecRoundtrips:
             return
         assert loaded == saved
 
+    def test_fix_packet_artifact_kind_roundtrips_without_migration(self, store):
+        task = store.save_model(Task(title="reviewed"))
+        artifact = Artifact(
+            kind=ArtifactKind.FIX_PACKET,
+            task_id=task.id,
+            content='{"schema_version":"relay.fix_packet.v1"}',
+        )
+        saved = store.save_model(artifact)
+        loaded = store.load_model(Artifact, saved.id)
+        assert loaded is not None
+        assert loaded.kind is ArtifactKind.FIX_PACKET
+        assert loaded.content == artifact.content
+
     def test_duplicate_id_insert_is_rejected(self, store):
         record = Run(agent="gpt", role="researcher")
         store.save_model(record)

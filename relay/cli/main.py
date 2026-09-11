@@ -227,11 +227,15 @@ def build(
 
             request = AgentRequest(prompt=prompt, role=AgentRole.IMPLEMENTER, task_id=task.id)
             reviewer = None
+            reviewer_settings = None
             if config.reviewer is not None:
                 reviewer_cfg = agent_config(config, config.reviewer)
+                reviewer_settings = resolve_settings(
+                    cli=CliOverrides(), yaml_agent=reviewer_cfg
+                )
                 reviewer = build_agent(
                     config.reviewer,
-                    resolve_settings(cli=CliOverrides(), yaml_agent=reviewer_cfg),
+                    reviewer_settings,
                     reviewer_cfg,
                     workspace_root=root,
                 )
@@ -249,6 +253,7 @@ def build(
                     verification=config.verification,
                     reviewer=reviewer,
                     reviewer_name=config.reviewer,
+                    reviewer_model=None if reviewer_settings is None else reviewer_settings.model,
                     approval=config.approval,
                 )
             )

@@ -31,6 +31,7 @@ from relay.core.orchestrator import (
     _capture_baseline,
     _diff_against_baseline,
     _open_approval_gate,
+    _reviewer_for,
     advance_task,
     run_build,
 )
@@ -83,12 +84,33 @@ if "You are the planner" in data:
     print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 3}}))
     sys.exit(0)
 if "You are the reviewer" in data:
-    # P3.3: the review leg - assess, then emit the fail-closed verdict line.
+    # P6.1: the review leg emits one strict provider-neutral JSON object.
     if "--review-crash" in argv:
         sys.exit(9)
-    review_text = "## Review\n\nThe changes match the plan; correctness and risks assessed."
-    if verdict != "NONE":
-        review_text += "\nVERDICT: %s" % verdict
+    if verdict == "NONE":
+        review_text = "looks fine but no structured report"
+    elif verdict == "FINDINGS":
+        review_text = json.dumps({
+            "schema_version": "relay.review.v1",
+            "verdict": "findings",
+            "summary": "One issue blocks completion.",
+            "findings": [{
+                "id": "F1",
+                "severity": "medium",
+                "title": "Missing regression coverage",
+                "description": "The implementation lacks a focused assertion.",
+                "requested_change": "Add the focused assertion described by the plan.",
+                "validation_expectation": "The configured verification command passes.",
+                "location": {"path": "implemented.txt"}
+            }]
+        })
+    else:
+        review_text = json.dumps({
+            "schema_version": "relay.review.v1",
+            "verdict": "pass",
+            "summary": "The changes match the plan.",
+            "findings": []
+        })
     print(json.dumps({"type": "thread.started", "thread_id": "t-review"}))
     print(json.dumps({"type": "item.completed",
                       "item": {"id": "m", "type": "agent_message", "text": review_text}}))
@@ -780,7 +802,15 @@ class TestReviewApproval:
         review_artifacts = [
             a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
         ]
+        packets = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.FIX_PACKET
+        ]
         assert len(review_artifacts) == 1
+        assert len(packets) == 1
+        packet = json.loads(packets[0].content or "{}")
+        assert packet["schema_version"] == "relay.fix_packet.v1"
+        assert packet["review_artifact_id"] == review_artifacts[0].id
+        assert len(packet["findings"]) == 1
         conn.close()
 
     def test_missing_verdict_fails_closed(self, build_workspace):
@@ -802,9 +832,13 @@ class TestReviewApproval:
         store = SqliteRelayStore(conn)
         evidence = SqliteEvidenceStore(store)
         task = next(iter(store.all_models(Task)))
-        assert task.state is TaskState.IMPLEMENTING  # never a guessed pass
+        assert task.state is TaskState.REVIEWING  # prose can never mint a verdict
         kinds = {r.kind for r in evidence.records_for_task(task.id)}
         assert EvidenceKind.REVIEW_PASSED not in kinds
+        reports = [a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REPORT]
+        assert reports and "relay.review.invalid.v1" in (reports[-1].content or "")
+        assert [a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING] == []
+        assert [a for a in store.all_models(Artifact) if a.kind is ArtifactKind.FIX_PACKET] == []
         conn.close()
 
     def test_direct_mode_reaches_done_without_human(self, build_workspace):
@@ -854,7 +888,8 @@ class TestReviewApproval:
             "  fake_reviewer:\n"
             "    backend: harness\n"
             "    adapter: fake_implementer_build\n"
-            f"    harness: {{executable_path: {exe}, grant: read_only}}\n",
+            "    model: reviewer-model-1\n"
+            f"    harness: {{executable_path: {exe}, grant: workspace_write}}\n",
         )
         relay_yaml.write_text(text + "reviewer: fake_reviewer\n", encoding="utf-8")
         _with_verification(
@@ -873,11 +908,36 @@ class TestReviewApproval:
         assert task.state is TaskState.APPROVAL_REQUIRED
         review_run = next(r for r in store.all_models(Run) if r.role == "reviewer")
         assert review_run.agent == "fake_reviewer"  # Q-d: dedicated reviewer used
+        assert review_run.model == "reviewer-model-1"
         review_record = next(
             r for r in evidence.records_for_task(task.id) if r.kind is EvidenceKind.REVIEW_PASSED
         )
         assert review_record.produced_by == "agent:fake_reviewer"
         conn.close()
+
+    def test_harness_reviewer_is_always_bound_read_only(self, build_workspace):
+        settings = AgentSettings(adapter="fake_implementer_build")
+        configured = _FakeImplementer(
+            settings=settings,
+            profile=HarnessAgentConfig(
+                executable_path=sys.executable,
+                grant=ExecutionGrantKind.WORKSPACE_WRITE,
+            ),
+            workspace_root=build_workspace,
+        )
+        review_agent = _reviewer_for(configured)
+        assert isinstance(review_agent, HarnessAgent)
+        assert review_agent.profile is not None
+        assert review_agent.profile.grant is ExecutionGrantKind.READ_ONLY_ACCESS
+
+        no_profile = _FakeImplementer(
+            settings=settings,
+            profile=None,
+            workspace_root=build_workspace,
+        )
+        review_agent = _reviewer_for(no_profile)
+        assert review_agent.profile is not None
+        assert review_agent.profile.grant is ExecutionGrantKind.READ_ONLY_ACCESS
 
     def test_review_run_failure_blocks_at_reviewing(self, build_workspace):
         _with_verification(
@@ -1213,13 +1273,201 @@ class TestAdvanceTaskAtomic:
 
 
 class TestAtomicClosure:
-    """All three completion boundaries are all-or-nothing (P3 hardening).
+    """Completion/promotion boundaries are all-or-nothing (P3 + P6.1).
 
-    The fault is injected at the LAST write of each boundary transaction —
-    the ``STATE_TRANSITIONED`` event — after every earlier write in that
-    transaction. Writes from EARLIER transactions legitimately survive; the
-    boundary's own writes must not.
+    Faults can land on the canonical review artifact, PASS evidence, pending
+    approval or direct attestation, or the final transition event. Earlier
+    transactions may survive; the promotion's own writes never do.
     """
+
+    @staticmethod
+    def _promotion_counts(store, task_id: str):
+        kinds = {r.kind for r in SqliteEvidenceStore(store).records_for_task(task_id)}
+        reviews = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        ]
+        approvals = [a for a in store.all_models(Approval) if a.task_id == task_id]
+        return kinds, reviews, approvals
+
+    def test_review_artifact_fault_rolls_back_pass_promotion(self, build_workspace, monkeypatch):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        original = SqliteRelayStore.save_model
+
+        def fail_review_artifact(store, record):
+            if isinstance(record, Artifact) and record.kind is ArtifactKind.REVIEW_FINDING:
+                raise _FaultInjected("review artifact")
+            return original(store, record)
+
+        monkeypatch.setattr(SqliteRelayStore, "save_model", fail_review_artifact)
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        task = next(iter(store.all_models(Task)))
+        kinds, reviews, approvals = self._promotion_counts(store, task.id)
+        assert task.state is TaskState.REVIEWING
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        assert reviews == []
+        assert approvals == []
+        conn.close()
+
+    def test_review_evidence_fault_rolls_back_pass_promotion(self, build_workspace, monkeypatch):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        original = SqliteEvidenceStore.record
+
+        def fail_review_evidence(store, record):
+            if record.kind is EvidenceKind.REVIEW_PASSED:
+                raise _FaultInjected("review evidence")
+            return original(store, record)
+
+        monkeypatch.setattr(SqliteEvidenceStore, "record", fail_review_evidence)
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        task = next(iter(store.all_models(Task)))
+        kinds, reviews, approvals = self._promotion_counts(store, task.id)
+        assert task.state is TaskState.REVIEWING
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        assert reviews == []
+        assert approvals == []
+        conn.close()
+
+    def test_approval_fault_rolls_back_pass_promotion(self, build_workspace, monkeypatch):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        original = SqliteRelayStore.save_model
+
+        def fail_approval(store, record):
+            if isinstance(record, Approval):
+                raise _FaultInjected("approval")
+            return original(store, record)
+
+        monkeypatch.setattr(SqliteRelayStore, "save_model", fail_approval)
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        task = next(iter(store.all_models(Task)))
+        kinds, reviews, approvals = self._promotion_counts(store, task.id)
+        assert task.state is TaskState.REVIEWING
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        assert reviews == []
+        assert approvals == []
+        conn.close()
+
+    def test_direct_attestation_fault_rolls_back_pass_promotion(
+        self, build_workspace, monkeypatch
+    ):
+        relay_yaml = build_workspace / "relay.yaml"
+        relay_yaml.write_text(
+            relay_yaml.read_text(encoding="utf-8") + "approval:\n  mode: direct\n",
+            encoding="utf-8",
+        )
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        original = SqliteEvidenceStore.record
+
+        def fail_attestation(store, record):
+            if record.kind is EvidenceKind.NO_PENDING_APPROVALS:
+                raise _FaultInjected("direct attestation")
+            return original(store, record)
+
+        monkeypatch.setattr(SqliteEvidenceStore, "record", fail_attestation)
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        task = next(iter(store.all_models(Task)))
+        kinds, reviews, approvals = self._promotion_counts(store, task.id)
+        assert task.state is TaskState.REVIEWING
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        assert EvidenceKind.NO_PENDING_APPROVALS not in kinds
+        assert reviews == []
+        assert approvals == []
+        conn.close()
+
+    def test_fix_packet_fault_rolls_back_findings_promotion(self, build_workspace, monkeypatch):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+
+        class FindingsImplementer(_FakeImplementer):
+            def invocation_argv(self, resolved):
+                return (resolved.command, "-c", _BUILD_SRC, "--review-verdict", "findings")
+
+        original = SqliteRelayStore.save_model
+
+        def fail_packet(store, record):
+            if isinstance(record, Artifact) and record.kind is ArtifactKind.FIX_PACKET:
+                raise _FaultInjected("fix packet")
+            return original(store, record)
+
+        monkeypatch.setattr(SqliteRelayStore, "save_model", fail_packet)
+        with transient_adapters({"fake_implementer_build": FindingsImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING
+        kinds = {a.kind for a in store.all_models(Artifact)}
+        assert ArtifactKind.REVIEW_FINDING not in kinds
+        assert ArtifactKind.FIX_PACKET not in kinds
+        conn.close()
+
+    def test_findings_transition_rolls_back_review_and_packet(self, build_workspace, monkeypatch):
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+
+        class FindingsImplementer(_FakeImplementer):
+            def invocation_argv(self, resolved):
+                return (resolved.command, "-c", _BUILD_SRC, "--review-verdict", "findings")
+
+        monkeypatch.setattr(
+            "relay.cli.main.EventLogWriter",
+            _writer_failing_on("reviewing -> implementing"),
+        )
+        with transient_adapters({"fake_implementer_build": FindingsImplementer}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn = __import__("relay.storage", fromlist=["connect"]).connect(
+            build_workspace / ".relay" / "relay.sqlite3"
+        )
+        store = SqliteRelayStore(conn)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING
+        kinds = {a.kind for a in store.all_models(Artifact)}
+        assert ArtifactKind.REVIEW_FINDING not in kinds
+        assert ArtifactKind.FIX_PACKET not in kinds
+        conn.close()
 
     def test_gate_transition_rolls_back_approval_request(self, build_workspace, monkeypatch):
         """Crash in REVIEWING -> APPROVAL_REQUIRED: no gate, no approval row."""
@@ -1245,8 +1493,10 @@ class TestAtomicClosure:
         assert [a for a in store.all_models(Approval) if a.task_id == task.id] == []
         types = [e.type for e in writer.all() if f"task:{task.id}" in e.references]
         assert EventType.APPROVAL_REQUESTED not in types
-        # Earlier transactions legitimately committed:
-        assert EvidenceKind.REVIEW_PASSED in {r.kind for r in evidence.records_for_task(task.id)}
+        # The whole PASS promotion rolled back — including its canonical review.
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        assert [a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING] == []
         conn.close()
 
     def test_approve_rolls_back_decision_evidence_and_transition(
@@ -1316,7 +1566,8 @@ class TestAtomicClosure:
         assert task.state is TaskState.REVIEWING
         kinds = {r.kind for r in evidence.records_for_task(task.id)}
         assert EvidenceKind.NO_PENDING_APPROVALS not in kinds  # rolled back
-        assert EvidenceKind.REVIEW_PASSED in kinds  # earlier Tx committed
+        assert EvidenceKind.REVIEW_PASSED not in kinds  # same promotion transaction
+        assert [a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING] == []
         contents = [e.content for e in writer.all() if f"task:{task.id}" in e.references]
         assert "task state: reviewing -> done" not in contents
         conn.close()

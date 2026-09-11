@@ -35,9 +35,9 @@ Core never sees provider event vocabulary: adapters expose normalized
 
 from __future__ import annotations
 
+import enum
 import json
 import os
-import re
 import shutil
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -55,6 +55,18 @@ from relay.agents.errors import AgentError
 from relay.context.config import ApprovalPolicyConfig, VerificationConfig
 from relay.core.evidence import EvidenceKind, EvidenceStore
 from relay.core.permissions import Action, PermissionGate, ToolRequest
+from relay.core.reviews import (
+    ReviewContractError,
+    ReviewInputs,
+    build_fix_packet,
+    build_review_record,
+    build_review_sources,
+    build_review_subject,
+    encode_fix_packet,
+    encode_invalid_review_diagnostic,
+    encode_review_record,
+    parse_review,
+)
 from relay.core.state_machine import TaskState, TaskStateMachine
 from relay.harness.sanitization import redact
 from relay.storage.events import EventLogWriter
@@ -66,6 +78,8 @@ from relay.storage.models import (
     EventLogEntry,
     EventType,
     EvidenceRecord,
+    InvalidReviewDiagnosticPayload,
+    ReviewVerdict,
     Run,
     RunStatus,
     Task,
@@ -210,12 +224,42 @@ async def run_ask(
 # ---------------------------------------------------------------------------
 
 
+class ReviewDisposition(str, enum.Enum):
+    """Observable outcome of one structured review stage."""
+
+    PASSED = "passed"
+    FINDINGS = "findings"
+    INVALID_OUTPUT = "invalid_output"
+    INVALID_CONTEXT = "invalid_context"
+    RUN_FAILED = "run_failed"
+
+
+@dataclass(frozen=True)
+class ReviewResult:
+    """Committed review-stage facts for CLI and downstream orchestration."""
+
+    disposition: ReviewDisposition
+    run_id: str | None = None
+    review_artifact_id: str | None = None
+    fix_packet_artifact_id: str | None = None
+    diagnostic_artifact_id: str | None = None
+    reason_code: str | None = None
+    finding_count: int = 0
+
+
+@dataclass(frozen=True)
+class ReviewStageOutcome:
+    task: Task
+    result: ReviewResult
+
+
 @dataclass(frozen=True)
 class BuildOutcome:
     task: Task
     ask: AskOutcome
     diff_artifact_id: str | None = None
     tool_run_ids: tuple[str, ...] = ()
+    review: ReviewResult | None = None
 
 
 class BuildRefusal(Exception):
@@ -394,14 +438,15 @@ def advance_task(
     created_approval: Approval | None = None,
     updated_approval: Approval | None = None,
     evidence_records: tuple[EvidenceRecord, ...] = (),
+    artifacts: tuple[Artifact, ...] = (),
     events: tuple[EventLogEntry, ...] = (),
 ) -> Task:
     """One persisted lifecycle transition — validate, then persist ATOMICALLY.
 
     The machine validates the edge against the ``EvidenceStore``; only a
     granted transition writes. Companion records a completion boundary
-    demands (a created/updated approval row, boundary evidence, their
-    events) commit in the SAME ``BEGIN IMMEDIATE`` transaction as the
+    demands (a created/updated approval row, boundary artifacts/evidence,
+    their events) commit in the SAME ``BEGIN IMMEDIATE`` transaction as the
     ``Task.state`` update and the ``STATE_TRANSITIONED`` event: a crash or
     exception can never leave committed approval/evidence on the old side
     of a transition (P3 hardening). Companion evidence is written BEFORE
@@ -417,6 +462,8 @@ def advance_task(
             store.save_model(created_approval)
         if updated_approval is not None:
             store.update_model(updated_approval)
+        for artifact in artifacts:
+            store.save_model(artifact)
         if evidence_store is not None and evidence_records:
             for record in evidence_records:
                 evidence_store.record(record)
@@ -489,7 +536,7 @@ def _freeze_plan(
     evidence: EvidenceStore,
     task: Task,
     plan_outcome: AskOutcome,
-) -> Task:
+) -> Artifact:
     """Mint the canonical ``ArtifactKind.PLAN`` + ``PLAN_PRODUCED`` evidence.
 
     Provenance is honest by construction: the plan artifact and the evidence
@@ -532,7 +579,7 @@ def _freeze_plan(
                 references=[f"task:{task.id}", f"run:{plan_outcome.run.id}"],
             )
         )
-    return task
+    return artifact
 
 
 def _planner_for(agent: Agent) -> Agent:
@@ -559,11 +606,48 @@ def _planner_for(agent: Agent) -> Agent:
     )
 
 
+def _reviewer_for(agent: Agent) -> Agent:
+    """Bind any harness reviewer to an explicit READ_ONLY profile.
+
+    Unlike the frozen planner fallback, review must never inherit an
+    adapter-default write grant: a missing profile becomes an explicit
+    READ_ONLY profile, and an unsupported grant fails before spawn.
+    """
+
+    from relay.context.config import HarnessAgentConfig
+    from relay.harness.runtime import HarnessAgent
+    from relay.harness.types import ExecutionGrantKind
+
+    if not isinstance(agent, HarnessAgent):
+        return agent
+    if agent.profile is not None:
+        profile = agent.profile.model_copy(
+            update={"grant": ExecutionGrantKind.READ_ONLY_ACCESS}
+        )
+    else:
+        profile = HarnessAgentConfig(grant=ExecutionGrantKind.READ_ONLY_ACCESS)
+    return type(agent)(
+        settings=agent.settings,
+        profile=profile,
+        workspace_root=agent.workspace_root,
+    )
+
+
 # ---------------------------------------------------------------------------
 # P3.2 — Relay-scoped verification (SPEC §27 Phase 3 exit gate, App. A.1)
 # ---------------------------------------------------------------------------
 
 _VERIFICATION_OUTPUT_CAP_CHARS = 20_000
+
+
+@dataclass(frozen=True)
+class _VerificationResult:
+    """Records produced by this verification invocation, when it ran."""
+
+    task: Task
+    tool_run: ToolRun | None = None
+    test_result_artifact: Artifact | None = None
+    evidence_record: EvidenceRecord | None = None
 
 
 async def _run_verification(
@@ -575,7 +659,7 @@ async def _run_verification(
     task: Task,
     verification: VerificationConfig | None,
     workspace_root: Path,
-) -> Task:
+) -> _VerificationResult:
     """Relay grades the exam — the implementer never does (frozen plan Q-c).
 
     The configured command executes as a Relay-owned ToolRun (no agent
@@ -594,7 +678,7 @@ async def _run_verification(
     for humans, never parsed.
     """
     if verification is None:
-        return task
+        return _VerificationResult(task=task)
 
     from relay.harness.env_policy import DEFAULT_CONFLICT_VARIABLES, build_child_env
     from relay.harness.process import LaunchSpec
@@ -634,7 +718,9 @@ async def _run_verification(
             )
         )
 
-    def _finalize(row_status: RunStatus, error: str | None, result_ref: str | None) -> None:
+    def _finalize(
+        row_status: RunStatus, error: str | None, result_ref: str | None
+    ) -> ToolRun:
         finished = tool_run.model_copy(
             update={
                 "status": row_status,
@@ -654,11 +740,13 @@ async def _run_verification(
                 references=[f"task:{task.id}", f"tool_run:{tool_run.id}"],
             )
         )
+        return finished
 
     if blocked_reason is not None:
         with store.transaction():
-            _finalize(RunStatus.FAILED, blocked_reason, None)
-        return task  # blocked in VERIFYING — never a minted verdict
+            finished = _finalize(RunStatus.FAILED, blocked_reason, None)
+        # blocked in VERIFYING — never a minted verdict
+        return _VerificationResult(task=task, tool_run=finished)
 
     try:
         assert resolved is not None  # blocked above when None
@@ -675,12 +763,12 @@ async def _run_verification(
         )
     except OSError as exc:
         with store.transaction():
-            _finalize(
+            finished = _finalize(
                 RunStatus.FAILED,
                 f"verification could not execute: {type(exc).__name__}",
                 None,
             )
-        return task
+        return _VerificationResult(task=task, tool_run=finished)
 
     output = redact(
         f"exit={outcome.exit_code} duration={outcome.duration_s:.2f}s\n"
@@ -689,12 +777,12 @@ async def _run_verification(
 
     if outcome.timed_out or outcome.exit_code is None:
         with store.transaction():
-            _finalize(
+            finished = _finalize(
                 RunStatus.FAILED,
                 "verification exceeded its bounded deadline — tree terminated",
                 None,
             )
-        return task
+        return _VerificationResult(task=task, tool_run=finished)
 
     with store.transaction():
         artifact = store.save_model(
@@ -710,8 +798,8 @@ async def _run_verification(
 
     if outcome.exit_code == 0:
         with store.transaction():
-            _finalize(RunStatus.SUCCEEDED, None, artifact.id)
-            evidence.record(
+            finished = _finalize(RunStatus.SUCCEEDED, None, artifact.id)
+            evidence_record = evidence.record(
                 EvidenceRecord(
                     kind=EvidenceKind.TESTS_PASSED,
                     task_id=task.id,
@@ -727,11 +815,22 @@ async def _run_verification(
                     references=[f"task:{task.id}", f"tool_run:{tool_run.id}"],
                 )
             )
-        return advance_task(machine, store, writer, task, TaskState.REVIEWING)
+        updated = advance_task(machine, store, writer, task, TaskState.REVIEWING)
+        return _VerificationResult(
+            task=updated,
+            tool_run=finished,
+            test_result_artifact=artifact,
+            evidence_record=evidence_record,
+        )
 
     with store.transaction():
-        _finalize(RunStatus.FAILED, None, artifact.id)
-    return advance_task(machine, store, writer, task, TaskState.IMPLEMENTING)
+        finished = _finalize(RunStatus.FAILED, None, artifact.id)
+    updated = advance_task(machine, store, writer, task, TaskState.IMPLEMENTING)
+    return _VerificationResult(
+        task=updated,
+        tool_run=finished,
+        test_result_artifact=artifact,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -739,26 +838,94 @@ async def _run_verification(
 # ---------------------------------------------------------------------------
 
 _REVIEW_DIRECTIVE = (
-    "You are the reviewer. Review the implemented changes against the "
-    "accepted plan below. Assess correctness, completeness, and risks.\n"
-    "End your output with EXACTLY one final line:\n"
-    "VERDICT: PASS\n"
+    "You are the reviewer. Review the implemented changes against the pinned "
+    "canonical inputs below. Assess correctness, completeness, and risks.\n"
+    "Return exactly one JSON object and no markdown, prose, or code fences.\n"
+    "Schema:\n"
+    "{{\"schema_version\":\"relay.review.v1\",\"verdict\":\"pass\",\"summary\":\"...\","
+    "\"findings\":[]}}\n"
     "or\n"
-    "VERDICT: FINDINGS\n"
-    "(a garbled or missing verdict is treated as FINDINGS).\n\n"
-    "ACCEPTED PLAN:\n{plan}\n\nIMPLEMENTED DIFF:\n{diff}\n\n"
+    "{{\"schema_version\":\"relay.review.v1\",\"verdict\":\"findings\",\"summary\":\"...\","
+    "\"findings\":[{{\"id\":\"F1\",\"severity\":\"high\",\"title\":\"...\","
+    "\"description\":\"...\",\"requested_change\":\"...\","
+    "\"validation_expectation\":\"...\",\"location\":{{\"path\":\"relative/path.py\","
+    "\"start_line\":1,\"end_line\":3}}}}]}}\n"
+    "Rules: pass requires zero findings; findings requires at least one; severity is "
+    "metadata only and never changes blocking; finding ids are unique; locations are "
+    "optional workspace-relative '/' paths; do not supply task, run, or artifact IDs.\n\n"
+    "PINNED REVIEW INPUTS:\n"
+    "task: {task_id}\n"
+    "plan artifact: {plan_artifact_id}\n"
+    "diff artifact: {diff_artifact_id}\n"
+    "verification evidence: {evidence_id}\n"
+    "verification tool run: {tool_run_id}\n"
+    "test result artifact: {test_result_artifact_id}\n\n"
+    "ACCEPTED PLAN:\n{plan}\n\n"
+    "IMPLEMENTED DIFF:\n{diff}\n\n"
+    "RELAY VERIFICATION RESULT:\n{verification}\n\n"
     "ORIGINAL REQUEST:\n{prompt}"
 )
 
-_VERDICT_PATTERN = re.compile(r"verdict:\s*(pass|findings)", re.IGNORECASE)
+
+def _review_artifact_event(task: Task, run_id: str, artifact: Artifact) -> EventLogEntry:
+    return EventLogEntry(
+        type=EventType.ARTIFACT_CREATED,
+        content="structured review persisted as REVIEW_FINDING",
+        references=[f"task:{task.id}", f"run:{run_id}", f"artifact:{artifact.id}"],
+    )
 
 
-def _parse_verdict(text: str) -> str:
-    """Fail-closed verdict extraction (frozen-plan D2): the last verdict
-    marker wins; missing or garbled markers are FINDINGS — the machine never
-    guesses a pass from an agent's prose."""
-    matches = _VERDICT_PATTERN.findall(text)
-    return matches[-1].lower() if matches else "findings"
+def _review_evidence_event(task: Task, run_id: str, artifact_id: str) -> EventLogEntry:
+    return EventLogEntry(
+        type=EventType.EVIDENCE_RECORDED,
+        content=f"{EvidenceKind.REVIEW_PASSED.value} recorded for task",
+        references=[f"task:{task.id}", f"run:{run_id}", f"artifact:{artifact_id}"],
+    )
+
+
+def _persist_review_diagnostic(
+    store: SqliteRelayStore,
+    writer: EventLogWriter,
+    task: Task,
+    code: str,
+    *,
+    run_id: str | None = None,
+    output_artifact_id: str | None = None,
+) -> Artifact:
+    """Persist a safe diagnostic; never a review, packet, or PASS evidence."""
+
+    payload = InvalidReviewDiagnosticPayload(
+        schema_version="relay.review.invalid.v1",
+        task_id=task.id,
+        code=code,
+        review_run_id=run_id,
+        review_output_artifact_id=output_artifact_id,
+    )
+    artifact = Artifact(
+        kind=ArtifactKind.REPORT,
+        task_id=task.id,
+        run_id=run_id,
+        content=encode_invalid_review_diagnostic(payload),
+    )
+    with store.transaction():
+        store.save_model(artifact)
+        writer.record(
+            EventLogEntry(
+                type=EventType.ARTIFACT_CREATED,
+                content=f"structured review rejected: {code}",
+                references=[
+                    ref
+                    for ref in (
+                        f"task:{task.id}",
+                        f"artifact:{artifact.id}",
+                        f"run:{run_id}" if run_id else None,
+                        f"artifact:{output_artifact_id}" if output_artifact_id else None,
+                    )
+                    if ref is not None
+                ],
+            )
+        )
+    return artifact
 
 
 async def _run_review(
@@ -769,80 +936,211 @@ async def _run_review(
     task: Task,
     reviewer: Agent,
     request: AgentRequest,
-    plan_outcome: AskOutcome,
-    diff_text: str,
+    inputs: ReviewInputs,
     *,
+    approval: ApprovalPolicyConfig | None,
     model: str | None = None,
     agent_name: str | None = None,
-) -> Task:
-    """One review run against the frozen plan + the Relay-extracted diff.
+) -> ReviewStageOutcome:
+    """Run and promote one strict structured review.
 
-    Returns the task at ``REVIEWING`` with ``REVIEW_PASSED`` recorded (the
-    caller decides gated vs direct closure), or advanced to ``IMPLEMENTING``
-    on findings. A failed reviewer run leaves the task honestly blocked at
-    ``REVIEWING`` (D8) — no verdict is ever invented.
+    Every PASS promotion is atomic with its resulting state transition. A
+    findings report atomically writes its canonical review, fix packet, and
+    REVIEWING -> IMPLEMENTING rework edge. Invalid output stays REVIEWING.
     """
-    assert plan_outcome.response is not None  # caller refuses empty planning runs
+
+    subject = build_review_subject(inputs)
     review_request = request.model_copy(
         update={
             "role": AgentRole.REVIEWER,
             "prompt": _REVIEW_DIRECTIVE.format(
-                plan=plan_outcome.response.output,
-                diff=diff_text,
+                task_id=task.id,
+                plan_artifact_id=inputs.plan_artifact.id,
+                diff_artifact_id=inputs.diff_artifact.id,
+                evidence_id=inputs.verification_evidence.id,
+                tool_run_id=inputs.verification_tool_run.id,
+                test_result_artifact_id=inputs.test_result_artifact.id,
+                plan=inputs.plan_artifact.content,
+                diff=inputs.diff_artifact.content,
+                verification=inputs.test_result_artifact.content,
                 prompt=request.prompt,
             ),
+            "context_refs": [
+                f"task:{task.id}",
+                f"run:{inputs.plan_run.id}",
+                f"artifact:{inputs.plan_artifact.id}",
+                f"run:{inputs.implementation_run.id}",
+                f"artifact:{inputs.diff_artifact.id}",
+                f"evidence:{inputs.verification_evidence.id}",
+                f"tool_run:{inputs.verification_tool_run.id}",
+                f"artifact:{inputs.test_result_artifact.id}",
+            ],
         }
     )
-    review_outcome = await run_ask(
-        store, writer, reviewer, review_request, model=model, agent_name=agent_name
+    review_run_outcome = await run_ask(
+        store,
+        writer,
+        reviewer,
+        review_request,
+        model=model,
+        agent_name=agent_name,
     )
-    if review_outcome.response is None:
-        return task
-
-    review_text = review_outcome.response.output
-    verdict = _parse_verdict(review_text)
-    with store.transaction():
-        artifact = store.save_model(
-            Artifact(
-                kind=ArtifactKind.REVIEW_FINDING,
-                run_id=review_outcome.run.id,
-                task_id=task.id,
-                content=review_text,
-            )
-        )
-        writer.record(
-            EventLogEntry(
-                type=EventType.ARTIFACT_CREATED,
-                content="review output persisted as REVIEW_FINDING",
-                references=[
-                    f"run:{review_outcome.run.id}",
-                    f"artifact:{artifact.id}",
-                    f"task:{task.id}",
-                ],
-            )
+    if review_run_outcome.response is None or review_run_outcome.response.status != "ok":
+        return ReviewStageOutcome(
+            task=task,
+            result=ReviewResult(
+                disposition=ReviewDisposition.RUN_FAILED,
+                run_id=review_run_outcome.run.id,
+            ),
         )
 
-    if verdict != "pass":
-        return advance_task(machine, store, writer, task, TaskState.IMPLEMENTING)
+    outputs = store.artifacts_for_run(review_run_outcome.run.id, kind=ArtifactKind.RUN_OUTPUT)
+    output_artifact = outputs[0] if len(outputs) == 1 else None
+    try:
+        if output_artifact is None:
+            raise ReviewContractError("invalid_context")
+        report = parse_review(review_run_outcome.response.output)
+        sources = build_review_sources(
+            subject,
+            inputs,
+            review_run_outcome.run,
+            output_artifact,
+        )
+        record = build_review_record(task, report, sources)
+    except ReviewContractError as exc:
+        diagnostic = _persist_review_diagnostic(
+            store,
+            writer,
+            task,
+            exc.code,
+            run_id=review_run_outcome.run.id,
+            output_artifact_id=None if output_artifact is None else output_artifact.id,
+        )
+        context_codes = {
+            "foreign_task",
+            "invalid_context",
+            "missing_content",
+            "source_mismatch",
+            "digest_mismatch",
+        }
+        return ReviewStageOutcome(
+            task=task,
+            result=ReviewResult(
+                disposition=(
+                    ReviewDisposition.INVALID_CONTEXT
+                    if exc.code in context_codes
+                    else ReviewDisposition.INVALID_OUTPUT
+                ),
+                run_id=review_run_outcome.run.id,
+                diagnostic_artifact_id=diagnostic.id,
+                reason_code=exc.code,
+            ),
+        )
 
-    with store.transaction():
-        evidence.record(
-            EvidenceRecord(
-                kind=EvidenceKind.REVIEW_PASSED,
-                task_id=task.id,
-                run_id=review_outcome.run.id,
-                artifact_id=artifact.id,
-                produced_by=f"agent:{review_outcome.run.agent}",
-            )
+    review_artifact = Artifact(
+        kind=ArtifactKind.REVIEW_FINDING,
+        run_id=review_run_outcome.run.id,
+        task_id=task.id,
+        content=encode_review_record(record),
+    )
+    review_event = _review_artifact_event(task, review_run_outcome.run.id, review_artifact)
+
+    if report.verdict is ReviewVerdict.FINDINGS:
+        packet = build_fix_packet(
+            review_artifact,
+            inputs,
+            review_run_outcome.run,
+            output_artifact,
         )
-        writer.record(
-            EventLogEntry(
-                type=EventType.EVIDENCE_RECORDED,
-                content=f"{EvidenceKind.REVIEW_PASSED.value} recorded for task",
-                references=[f"task:{task.id}", f"run:{review_outcome.run.id}"],
-            )
+        packet_artifact = Artifact(
+            kind=ArtifactKind.FIX_PACKET,
+            task_id=task.id,
+            content=encode_fix_packet(packet),
         )
-    return task
+        packet_event = EventLogEntry(
+            type=EventType.ARTIFACT_CREATED,
+            content="fix packet generated from structured review",
+            references=[
+                f"task:{task.id}",
+                f"run:{review_run_outcome.run.id}",
+                f"artifact:{review_artifact.id}",
+                f"artifact:{packet_artifact.id}",
+            ],
+        )
+        updated = advance_task(
+            machine,
+            store,
+            writer,
+            task,
+            TaskState.IMPLEMENTING,
+            artifacts=(review_artifact, packet_artifact),
+            events=(review_event, packet_event),
+        )
+        return ReviewStageOutcome(
+            task=updated,
+            result=ReviewResult(
+                disposition=ReviewDisposition.FINDINGS,
+                run_id=review_run_outcome.run.id,
+                review_artifact_id=review_artifact.id,
+                fix_packet_artifact_id=packet_artifact.id,
+                finding_count=len(report.findings),
+            ),
+        )
+
+    review_passed = EvidenceRecord(
+        kind=EvidenceKind.REVIEW_PASSED,
+        task_id=task.id,
+        run_id=review_run_outcome.run.id,
+        artifact_id=review_artifact.id,
+        produced_by=f"agent:{review_run_outcome.run.agent}",
+    )
+    review_passed_event = _review_evidence_event(
+        task, review_run_outcome.run.id, review_artifact.id
+    )
+    if approval is not None and approval.mode == "direct":
+        no_pending = EvidenceRecord(
+            kind=EvidenceKind.NO_PENDING_APPROVALS,
+            task_id=task.id,
+            produced_by="relay:review",
+        )
+        no_pending_event = EventLogEntry(
+            type=EventType.EVIDENCE_RECORDED,
+            content=f"{EvidenceKind.NO_PENDING_APPROVALS.value} recorded for task",
+            references=[f"task:{task.id}"],
+        )
+        updated = advance_task(
+            machine,
+            store,
+            writer,
+            task,
+            TaskState.DONE,
+            evidence_store=evidence,
+            evidence_records=(review_passed, no_pending),
+            artifacts=(review_artifact,),
+            events=(review_event, review_passed_event, no_pending_event),
+        )
+    else:
+        approval_row, approval_event = _open_approval_gate(task)
+        updated = advance_task(
+            machine,
+            store,
+            writer,
+            task,
+            TaskState.APPROVAL_REQUIRED,
+            created_approval=approval_row,
+            evidence_store=evidence,
+            evidence_records=(review_passed,),
+            artifacts=(review_artifact,),
+            events=(review_event, review_passed_event, approval_event),
+        )
+    return ReviewStageOutcome(
+        task=updated,
+        result=ReviewResult(
+            disposition=ReviewDisposition.PASSED,
+            run_id=review_run_outcome.run.id,
+            review_artifact_id=review_artifact.id,
+        ),
+    )
 
 
 def _open_approval_gate(task: Task) -> tuple[Approval, EventLogEntry]:
@@ -885,6 +1183,7 @@ async def run_build(
     verification: VerificationConfig | None = None,
     reviewer: Agent | None = None,
     reviewer_name: str | None = None,
+    reviewer_model: str | None = None,
     approval: ApprovalPolicyConfig | None = None,
 ) -> BuildOutcome:
     """Drive one task through the deterministic lifecycle to closure.
@@ -955,7 +1254,7 @@ async def run_build(
         # Planning failed or produced nothing usable: the task stays honestly
         # blocked at CONTEXT_READY (no plan evidence, no implementation).
         return BuildOutcome(task=task, ask=plan_outcome)
-    task = _freeze_plan(store, writer, evidence, task, plan_outcome)
+    plan_artifact = _freeze_plan(store, writer, evidence, task, plan_outcome)
     task = advance_task(machine, store, writer, task, TaskState.PLAN_READY)
 
     # 3. Implicit freeze (App. D.3): a standalone `relay build` IS the
@@ -968,7 +1267,7 @@ async def run_build(
     implement_request = request.model_copy(
         update={
             "prompt": _IMPLEMENT_DIRECTIVE.format(
-                plan=plan_outcome.response.output, prompt=request.prompt
+                plan=plan_artifact.content, prompt=request.prompt
             )
         }
     )
@@ -993,9 +1292,10 @@ async def run_build(
     # Relay-owned non-mutating diff extraction as DIFF artifact.
     diff_text = _diff_against_baseline(gate, workspace_root, task.id, baseline)
     diff_artifact_id: str | None = None
+    diff_artifact: Artifact | None = None
     if diff_text.strip():
         with store.transaction():
-            artifact = store.save_model(
+            diff_artifact = store.save_model(
                 Artifact(
                     kind=ArtifactKind.DIFF,
                     run_id=outcome.run.id,
@@ -1009,12 +1309,15 @@ async def run_build(
                     content="diff extracted from workspace after build",
                     references=[
                         f"run:{outcome.run.id}",
-                        f"artifact:{artifact.id}",
+                        f"artifact:{diff_artifact.id}",
                         f"task:{task.id}",
                     ],
                 )
             )
-        diff_artifact_id = artifact.id
+        assert diff_artifact is not None
+        diff_artifact_id = diff_artifact.id
+
+    review_result: ReviewResult | None = None
 
     # IMPLEMENTATION_PRODUCED only when the run actually produced changes
     # (Blocker 4): a no-op build mints nothing — and the machine therefore
@@ -1041,77 +1344,59 @@ async def run_build(
         # endings: REVIEWING (pass), IMPLEMENTING (test-failure rework), or
         # blocked in VERIFYING (no config / could-not-execute / timeout).
         task = advance_task(machine, store, writer, task, TaskState.VERIFYING)
-        task = await _run_verification(
+        verification_result = await _run_verification(
             store, writer, evidence, gate, machine, task, verification, workspace_root
         )
+        task = verification_result.task
 
-        # P3.3: review + closure (frozen plan Q-d/Q-e) — only reachable when
-        # verification passed (task at REVIEWING with TESTS_PASSED on record).
+        # P6.1: review uses pinned persisted inputs and promotes PASS atomically
+        # with the resulting closure edge. Invalid output never becomes evidence.
         if task.state is TaskState.REVIEWING:
-            task = await _run_review(
-                store,
-                writer,
-                evidence,
-                machine,
-                task,
-                reviewer or _planner_for(agent),
-                request,
-                plan_outcome,
-                diff_text,
-                model=model,
-                agent_name=reviewer_name or agent_name,
+            assert diff_artifact is not None
+            assert verification_result.tool_run is not None
+            assert verification_result.test_result_artifact is not None
+            assert verification_result.evidence_record is not None
+            review_inputs = ReviewInputs(
+                task=task,
+                plan_run=plan_outcome.run,
+                plan_artifact=plan_artifact,
+                implementation_run=outcome.run,
+                diff_artifact=diff_artifact,
+                verification_evidence=verification_result.evidence_record,
+                verification_tool_run=verification_result.tool_run,
+                test_result_artifact=verification_result.test_result_artifact,
             )
-            # D8: a failed reviewer run leaves the task at REVIEWING with no
-            # verdict evidence — store truth decides, never the state alone.
-            review_passed = any(
-                record.kind is EvidenceKind.REVIEW_PASSED
-                for record in evidence.records_for_task(task.id, kind=EvidenceKind.REVIEW_PASSED)
-            )
-            if review_passed:
-                if approval is not None and approval.mode == "direct":
-                    # A.3 opt-out: Relay attests the empty-by-construction
-                    # queue (no approval row is ever created in direct mode).
-                    # Hardening: evidence + event + the DONE transition commit
-                    # atomically — no stranded attestation on a REVIEWING task.
-                    task = advance_task(
-                        machine,
-                        store,
-                        writer,
-                        task,
-                        TaskState.DONE,
-                        evidence_store=evidence,
-                        evidence_records=(
-                            EvidenceRecord(
-                                kind=EvidenceKind.NO_PENDING_APPROVALS,
-                                task_id=task.id,
-                                produced_by="relay:review",
-                            ),
-                        ),
-                        events=(
-                            EventLogEntry(
-                                type=EventType.EVIDENCE_RECORDED,
-                                content=(
-                                    f"{EvidenceKind.NO_PENDING_APPROVALS.value} recorded for task"
-                                ),
-                                references=[f"task:{task.id}"],
-                            ),
-                        ),
-                    )
-                else:
-                    # Hardening: the PENDING approval row and its request event
-                    # commit in the SAME transaction as the gate transition —
-                    # a crash cannot open a gate the task never reached.
-                    approval_row, approval_event = _open_approval_gate(task)
-                    task = advance_task(
-                        machine,
-                        store,
-                        writer,
-                        task,
-                        TaskState.APPROVAL_REQUIRED,
-                        created_approval=approval_row,
-                        events=(approval_event,),
-                    )
+            try:
+                build_review_subject(review_inputs)
+            except ReviewContractError as exc:
+                diagnostic = _persist_review_diagnostic(store, writer, task, exc.code)
+                review_result = ReviewResult(
+                    disposition=ReviewDisposition.INVALID_CONTEXT,
+                    diagnostic_artifact_id=diagnostic.id,
+                    reason_code=exc.code,
+                )
+            else:
+                selected_reviewer = _reviewer_for(reviewer or agent)
+                review_stage = await _run_review(
+                    store,
+                    writer,
+                    evidence,
+                    machine,
+                    task,
+                    selected_reviewer,
+                    request,
+                    review_inputs,
+                    approval=approval,
+                    model=reviewer_model if reviewer is not None else model,
+                    agent_name=reviewer_name if reviewer is not None else agent_name,
+                )
+                task = review_stage.task
+                review_result = review_stage.result
 
     return BuildOutcome(
-        task=task, ask=outcome, diff_artifact_id=diff_artifact_id, tool_run_ids=tool_run_ids
+        task=task,
+        ask=outcome,
+        diff_artifact_id=diff_artifact_id,
+        tool_run_ids=tool_run_ids,
+        review=review_result,
     )
