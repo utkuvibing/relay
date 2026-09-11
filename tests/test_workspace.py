@@ -136,6 +136,47 @@ class TestRelayYamlConfig:
         with pytest.raises(ConfigError):
             load_config(tmp_path)
 
+    def test_budget_block_parses_max_fix_loops(self, tmp_path):
+        """P6.2 (§23): the bounded fix-loop budget is the only recognized key."""
+        (tmp_path / "relay.yaml").write_text(
+            "agents:\n  gpt: {backend: api, adapter: openai}\n"
+            "budget:\n  max_fix_loops: 1\n",
+            encoding="utf-8",
+        )
+        config = load_config(tmp_path)
+        assert config.budget is not None
+        assert config.budget.max_fix_loops == 1
+
+    def test_budget_defaults_and_absence(self, tmp_path):
+        assert load_config(tmp_path).budget is None
+        (tmp_path / "relay.yaml").write_text(
+            "agents:\n  gpt: {backend: api, adapter: openai}\nbudget: {}\n",
+            encoding="utf-8",
+        )
+        budget = load_config(tmp_path).budget
+        assert budget is not None
+        assert budget.max_fix_loops == 3
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            "budget:\n  max_fix_loops: -1\n",  # bound must be non-negative
+            "budget:\n  max_fix_loops: 1.5\n",  # strict int — no coercion
+            "budget:\n  max_fix_loops: true\n",  # bool is not an int
+            "budget:\n  max_agents_per_task: 2\n",  # future §23 vocabulary
+            "budget:\n  max_discussion_rounds: 3\n",
+            "budget:\n  stop_on_consensus: true\n",
+        ],
+    )
+    def test_invalid_budget_block_is_a_config_error(self, tmp_path, block):
+        """Unsupported §23 keys fail loudly — never silently accepted."""
+        (tmp_path / "relay.yaml").write_text(
+            "agents:\n  gpt: {backend: api, adapter: openai}\n" + block,
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError):
+            load_config(tmp_path)
+
     def test_parses_api_and_harness_entries(self, tmp_path):
         (tmp_path / "relay.yaml").write_text(
             "agents:\n"

@@ -102,6 +102,21 @@ class ApprovalPolicyConfig(BaseModel):
     mode: Literal["gated", "direct"] = "gated"
 
 
+class BudgetConfig(BaseModel):
+    """SPEC §23 cost controls — bounded automated rework (P6.2).
+
+    ``max_fix_loops`` caps how many fix runs a build may dispatch after the
+    initial implementation run (0 = the P6.1 one-pass behavior). Other §23
+    vocabulary (``max_agents_per_task``, ``max_discussion_rounds``,
+    ``stop_on_consensus``) is not implemented yet: unknown keys here are a
+    config error, never silently accepted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_fix_loops: StrictInt = Field(default=3, ge=0, le=100)
+
+
 class CommunicationBudgetsConfig(BaseModel):
     """Ledger-derived communication limits for one room/task scope."""
 
@@ -192,6 +207,9 @@ class RelayConfig(BaseModel):
     #: P5.1 — optional policy and budget vocabulary; absent is additive and
     #: resolves to frozen defaults when converted by ``policy_from_config``.
     communication: CommunicationConfig | None = None
+    #: P6.2 — §23 cost controls for the bounded build fix loop. Absent
+    #: resolves to defaults (``max_fix_loops: 3``).
+    budget: BudgetConfig | None = None
 
     @model_validator(mode="after")
     def _reviewer_must_be_configured(self) -> RelayConfig:

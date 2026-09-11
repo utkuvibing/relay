@@ -263,35 +263,43 @@ def run_detail(run: Run, artifacts: list[Any], events: list[Any]) -> None:
 
 
 def build_result(*, task, outcome, view=None) -> None:
-    """Render one `relay build` outcome (P2.2b; P3.4 final-state line).
+    """Render one `relay build` outcome (P2.2b; P3.4 final-state line; P6.2 loop).
 
     D6: the ending is always explicit — the task's machine state plus the
     unblocking action when one exists. A gated build ending at
     APPROVAL_REQUIRED names the ``relay approve`` command; a blocked ending
     names the missing evidence; a terminal ending says so. No invented
     actions: states with no driver (rework parking) render the bare state.
+
+    The rendered run is the LATEST implementation/fix attempt (frozen P6.2
+    semantics); when no impl/fix run was ever dispatched the planning run's
+    outcome carries the failure instead.
     """
-    ask = outcome.ask
-    if ask.error is not None:
+    ask = outcome.ask if outcome.ask is not None else outcome.planner
+    if ask is not None and ask.error is not None:
         _out().print(f"[red]ERROR {ask.run.agent} failed:[/red] {ask.error}")
         _final_state_line(task, view)
         return
-    _out().print(
-        Panel(
-            (ask.response.output if ask.response else "") or "(empty response)",
-            title=f"{task.title[:60]}",
+    if ask is not None:
+        _out().print(
+            Panel(
+                (ask.response.output if ask.response else "") or "(empty response)",
+                title=f"{task.title[:60]}",
+            )
         )
-    )
-    observations = len(outcome.tool_run_ids)
-    diff_note = (
-        f"diff artifact {outcome.diff_artifact_id[:8]}..."
-        if outcome.diff_artifact_id
-        else "no workspace changes"
-    )
-    _out().print(
-        f"[dim]task {task.id[:8]}... | run {ask.run.id[:8]}... | {ask.run.status.value} | "
-        f"{observations} observed harness events | {diff_note} | evidence recorded[/dim]"
-    )
+        observations = len(outcome.tool_run_ids)
+        diff_note = (
+            f"diff artifact {outcome.diff_artifact_id[:8]}..."
+            if outcome.diff_artifact_id
+            else "no workspace changes"
+        )
+        detail = (
+            f"task {task.id[:8]}... | run {ask.run.id[:8]}... | {ask.run.status.value} | "
+            f"{observations} observed harness events | {diff_note} | evidence recorded"
+        )
+        if outcome.attempts:
+            detail += f" | attempts {outcome.attempts}"
+        _out().print(f"[dim]{detail}[/dim]")
     review = outcome.review
     if review is not None:
         detail = f"review {review.disposition.value}"
@@ -304,6 +312,8 @@ def build_result(*, task, outcome, view=None) -> None:
         if review.reason_code is not None:
             detail += f" | reason {review.reason_code}"
         _out().print(f"[dim]{detail}[/dim]")
+    if outcome.stop is not None:
+        _out().print(f"[dim]fix loop stopped: {outcome.stop.value}[/dim]")
     _final_state_line(task, view)
 
 

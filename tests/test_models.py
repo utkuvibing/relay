@@ -12,6 +12,7 @@ from relay.storage.models import (
     ApprovalStatus,
     Artifact,
     ArtifactKind,
+    BuildLoopRecordPayload,
     Decision,
     DecisionStatus,
     EventLogEntry,
@@ -206,6 +207,60 @@ class TestStructuredReviewPayloads:
 
     def test_fix_packet_kind_is_additive(self):
         assert ArtifactKind.FIX_PACKET.value == "fix_packet"
+
+
+class TestBuildLoopRecordPayload:
+    """P6.2: the loop-stop observation is strict, frozen, and canonical."""
+
+    def test_payload_is_strict_and_frozen(self):
+        payload = BuildLoopRecordPayload(
+            schema_version="relay.build.loop.v1",
+            task_id="task-1",
+            reason="budget_exhausted",
+            fix_runs_used=3,
+        )
+        assert payload.last_diff_artifact_id is None
+        with pytest.raises(ValidationError):
+            payload.reason = "mutate"  # type: ignore[misc]
+
+    def test_rejects_extra_fields_negative_counts_and_wrong_version(self):
+        with pytest.raises(ValidationError):
+            BuildLoopRecordPayload.model_validate(
+                {
+                    "schema_version": "relay.build.loop.v1",
+                    "task_id": "task-1",
+                    "reason": "budget_exhausted",
+                    "fix_runs_used": 1,
+                    "provider_note": "vendor-specific",
+                }
+            )
+        with pytest.raises(ValidationError):
+            BuildLoopRecordPayload.model_validate(
+                {
+                    "schema_version": "relay.build.loop.v2",
+                    "task_id": "task-1",
+                    "reason": "budget_exhausted",
+                    "fix_runs_used": 1,
+                }
+            )
+        with pytest.raises(ValidationError):
+            BuildLoopRecordPayload.model_validate(
+                {
+                    "schema_version": "relay.build.loop.v1",
+                    "task_id": "task-1",
+                    "reason": "budget_exhausted",
+                    "fix_runs_used": -1,
+                }
+            )
+        with pytest.raises(ValidationError):
+            BuildLoopRecordPayload.model_validate(
+                {
+                    "schema_version": "relay.build.loop.v1",
+                    "task_id": "task-1",
+                    "reason": "budget_exhausted",
+                    "fix_runs_used": "1",
+                }
+            )
 
 
 class TestSystemEventsAreDistinctFromConversation:

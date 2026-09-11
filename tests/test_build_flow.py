@@ -36,6 +36,7 @@ from relay.core.orchestrator import (
     run_build,
 )
 from relay.core.permissions import PermissionGate
+from relay.core.reviews import decode_review_record
 from relay.core.state_machine import TaskState, TaskStateMachine
 from relay.harness.capabilities import HarnessCapability
 from relay.harness.errors import HarnessOutputError
@@ -48,9 +49,11 @@ from relay.storage.models import (
     ApprovalStatus,
     Artifact,
     ArtifactKind,
+    BuildLoopRecordPayload,
     EventType,
     EvidenceRecord,
     Run,
+    RunStatus,
     Task,
     ToolRun,
 )
@@ -1612,3 +1615,537 @@ class TestBaselineIsolation:
         assert "new file: new.txt" in diff_a
         assert "bfile.txt" not in diff_a
         assert diff_b.strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# P6.2 — bounded fix loop (SPEC §27 Phase 6)
+# ---------------------------------------------------------------------------
+
+_LOOP_SRC = r"""
+import json, sys
+data = sys.stdin.read()
+argv = sys.argv
+if "--version" in argv:
+    print("build-fake 1.0.0"); sys.exit(0)
+review_counter = __REVIEW_COUNTER__
+fix_counter = __FIX_COUNTER__
+
+def _bump(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            n = int(fh.read().strip() or "0")
+    except OSError:
+        n = 0
+    n += 1
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(str(n))
+    return n
+
+if "You are the planner" in data:
+    if "--plan-crash" in argv:
+        sys.exit(9)
+    print(json.dumps({"type": "thread.started", "thread_id": "t-plan"}))
+    print(json.dumps({"type": "item.completed",
+                      "item": {"id": "m", "type": "agent_message",
+                               "text": "# Plan\n\nGoal: implement the task\n"
+                                       "Steps: write implemented.txt\n"
+                                       "Files: implemented.txt\n"
+                                       "Verification: file exists"}}))
+    print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 3}}))
+    sys.exit(0)
+if "You are the reviewer" in data:
+    n = _bump(review_counter)
+    crash_at = 0
+    if "--review-crash-at" in argv:
+        crash_at = int(argv[argv.index("--review-crash-at") + 1])
+    if crash_at and n == crash_at:
+        sys.exit(9)
+    seq = ["pass"]
+    if "--review-verdicts" in argv:
+        seq = [v.strip().upper() for v in argv[argv.index("--review-verdicts") + 1].split(",")]
+    verdict = seq[n - 1] if n - 1 < len(seq) else "PASS"
+    if verdict == "NONE":
+        review_text = "looks fine but no structured report"
+    elif verdict == "FINDINGS":
+        review_text = json.dumps({
+            "schema_version": "relay.review.v1",
+            "verdict": "findings",
+            "summary": "One issue blocks completion.",
+            "findings": [{
+                "id": "F1",
+                "severity": "medium",
+                "title": "Missing regression coverage",
+                "description": "The implementation lacks a focused assertion.",
+                "requested_change": "Add the focused assertion described by the plan.",
+                "validation_expectation": "The configured verification command passes.",
+                "location": {"path": "implemented.txt"}
+            }]
+        })
+    else:
+        review_text = json.dumps({
+            "schema_version": "relay.review.v1",
+            "verdict": "pass",
+            "summary": "The changes match the plan.",
+            "findings": []
+        })
+    print(json.dumps({"type": "thread.started", "thread_id": "t-review"}))
+    print(json.dumps({"type": "item.completed",
+                      "item": {"id": "m", "type": "agent_message", "text": review_text}}))
+    print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 6, "output_tokens": 2}}))
+    sys.exit(0)
+# implementation / fix leg — fix runs write distinct content per dispatch
+# unless --identical-fix forces a byte-identical (no-progress) workspace.
+if "fix attempt" in data and "--identical-fix" not in argv:
+    n = _bump(fix_counter)
+    body = "implemented by fake harness - fix pass %d\n" % n
+else:
+    body = "implemented by fake harness\n"
+with open("implemented.txt", "w", encoding="utf-8") as handle:
+    handle.write(body)
+print(json.dumps({"type": "thread.started", "thread_id": "t-build"}))
+print(json.dumps({"type": "item.completed",
+                  "item": {"id": "m", "type": "agent_message", "text": "done: wrote implemented.txt"}}))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 42, "output_tokens": 7}}))
+"""
+
+
+def _loop_implementer(tmp_path, *argv_flags):
+    """A sequenced fake harness for the fix loop.
+
+    ``--review-verdicts a,b,c`` sequences per-review verdicts (missing →
+    pass); ``--review-crash-at N`` exits nonzero on the Nth review;
+    ``--identical-fix`` makes fix runs rewrite identical content
+    (no-progress); ``--plan-crash`` fails the planning leg. Sequencing
+    state lives in counter files under ``.relay/`` — excluded from both
+    the baseline and diff extraction, so they never pollute a DIFF.
+    """
+    src = _LOOP_SRC.replace(
+        "__REVIEW_COUNTER__", json.dumps(str(tmp_path / ".relay" / "review-count.txt"))
+    ).replace(
+        "__FIX_COUNTER__", json.dumps(str(tmp_path / ".relay" / "fix-count.txt"))
+    )
+
+    class _Loop(_FakeImplementer):
+        def invocation_argv(self, resolved):
+            return (resolved.command, "-c", src, *argv_flags)
+
+    return _Loop
+
+
+def _loop_records(store, task_id: str) -> list:
+    """Persisted relay.build.loop.v1 REPORT artifacts for one task."""
+    return [
+        a
+        for a in store.all_models(Artifact)
+        if a.kind is ArtifactKind.REPORT
+        and a.task_id == task_id
+        and "relay.build.loop.v1" in (a.content or "")
+    ]
+
+
+def _decode_loop_record(artifact) -> BuildLoopRecordPayload:
+    return BuildLoopRecordPayload.model_validate(json.loads(artifact.content or "{}"))
+
+
+def _open_store(root):
+    conn = __import__("relay.storage", fromlist=["connect"]).connect(
+        root / ".relay" / "relay.sqlite3"
+    )
+    return conn, SqliteRelayStore(conn)
+
+
+class TestFixLoop:
+    """P6.2: findings / failed-verification rework through a bounded loop."""
+
+    def test_findings_then_pass_promotes_with_attempt_scoped_pinning(self, build_workspace):
+        """Flagship: review 1 findings → fix run → review 2 pass → gated."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,pass"
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "pass_promoted" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.APPROVAL_REQUIRED
+
+        # Post-plan run sequence: impl → reviewer(findings) → fix → reviewer(pass).
+        runs = list(store.all_models(Run))
+        assert [r.role for r in runs] == [
+            "planner",
+            "implementer",
+            "reviewer",
+            "implementer",
+            "reviewer",
+        ]
+        fix_run = runs[3]
+
+        # The fix run consumed the persisted packet bytes verbatim.
+        packets = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.FIX_PACKET
+        ]
+        assert len(packets) == 1
+        fix_input = store.artifacts_for_run(fix_run.id, kind=ArtifactKind.RUN_INPUT)[0]
+        fix_prompt = fix_input.content or ""
+        assert "fix attempt 2" in fix_prompt
+        assert "FIX PACKET (relay.fix_packet.v1)" in fix_prompt
+        assert (packets[0].content or "") in fix_prompt
+
+        # The second review binds the FIX attempt's run/diff/verification.
+        reviews = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        ]
+        assert len(reviews) == 2
+        pass_record = decode_review_record(reviews[-1].content or "")
+        subject = pass_record.sources.subject
+        fix_diff = store.artifacts_for_run(fix_run.id, kind=ArtifactKind.DIFF)[0]
+        verify_rows = [t for t in store.all_models(ToolRun) if t.tool == "verification"]
+        assert len(verify_rows) == 2
+        assert subject.implementation_run_id == fix_run.id
+        assert subject.diff_artifact_id == fix_diff.id
+        assert subject.verification_tool_run_id == verify_rows[1].id
+
+        writer = EventLogWriter(conn)
+        contents = [e.content for e in writer.all() if e.type is EventType.STATE_TRANSITIONED]
+        assert "task state: reviewing -> implementing" in contents
+        assert contents.count("task state: implementing -> implemented") == 2
+        conn.close()
+
+    def test_budget_exhaustion_parks_and_records_loop_stop(self, build_workspace):
+        relay_yaml = build_workspace / "relay.yaml"
+        relay_yaml.write_text(
+            relay_yaml.read_text(encoding="utf-8") + "budget:\n  max_fix_loops: 1\n",
+            encoding="utf-8",
+        )
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,findings"
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "budget_exhausted" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING
+        runs = list(store.all_models(Run))
+        assert [r.role for r in runs] == [
+            "planner",
+            "implementer",
+            "reviewer",
+            "implementer",
+            "reviewer",
+        ]
+        records = _loop_records(store, task.id)
+        assert len(records) == 1
+        payload = _decode_loop_record(records[0])
+        assert payload.reason == "budget_exhausted"
+        assert payload.fix_runs_used == 1
+        assert payload.last_review_artifact_id is not None
+        assert payload.last_fix_packet_artifact_id is not None
+        assert payload.last_diff_artifact_id is not None
+        assert store.load_model(Artifact, payload.last_fix_packet_artifact_id).kind is (
+            ArtifactKind.FIX_PACKET
+        )
+        assert store.load_model(Artifact, payload.last_diff_artifact_id).kind is (
+            ArtifactKind.DIFF
+        )
+        conn.close()
+
+    def test_default_bound_allows_at_most_four_attempts(self, build_workspace):
+        """max_fix_loops=3 (default) ⇒ ≤1 impl + 3 fix dispatches, 4 reviews."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace,
+            "--review-verdicts",
+            "findings,findings,findings,findings",
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 4" in result.output
+        assert "budget_exhausted" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING
+        runs = list(store.all_models(Run))
+        assert [r.role for r in runs].count("implementer") == 4
+        assert [r.role for r in runs].count("reviewer") == 4
+        diffs = [a for a in store.all_models(Artifact) if a.kind is ArtifactKind.DIFF]
+        assert len(diffs) == 4
+        payload = _decode_loop_record(_loop_records(store, task.id)[0])
+        assert payload.reason == "budget_exhausted"
+        assert payload.fix_runs_used == 3
+        conn.close()
+
+    def test_zero_budget_preserves_p61_one_pass(self, build_workspace):
+        relay_yaml = build_workspace / "relay.yaml"
+        relay_yaml.write_text(
+            relay_yaml.read_text(encoding="utf-8") + "budget:\n  max_fix_loops: 0\n",
+            encoding="utf-8",
+        )
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(build_workspace, "--review-verdicts", "findings")
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 1" in result.output
+        assert "loop_disabled" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING
+        runs = list(store.all_models(Run))
+        assert [r.role for r in runs] == ["planner", "implementer", "reviewer"]
+        assert (
+            len(
+                [
+                    a
+                    for a in store.all_models(Artifact)
+                    if a.kind is ArtifactKind.FIX_PACKET
+                ]
+            )
+            == 1
+        )
+        assert _loop_records(store, task.id) == []
+        conn.close()
+
+    def test_failed_verification_reworks_then_passes(self, build_workspace):
+        """A red exam feeds the fixer its persisted TEST_RESULT, then green."""
+        # Under .relay/ so the retry counter never enters the diff.
+        counter = build_workspace / ".relay" / "verify-count.txt"
+        script = (
+            "import sys, pathlib\n"
+            f"p = pathlib.Path({json.dumps(str(counter))})\n"
+            "n = int(p.read_text() or '0') if p.exists() else 0\n"
+            "p.write_text(str(n + 1))\n"
+            "sys.exit(3 if n == 0 else 0)\n"
+        )
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), f'["-c", {json.dumps(script)}]'
+        )
+        loop_impl = _loop_implementer(build_workspace)
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "pass_promoted" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.APPROVAL_REQUIRED
+        fix_run = [r for r in store.all_models(Run) if r.role == "implementer"][1]
+        fix_input = store.artifacts_for_run(fix_run.id, kind=ArtifactKind.RUN_INPUT)[0]
+        fix_prompt = fix_input.content or ""
+        assert "fix attempt 2" in fix_prompt
+        assert "FAILED VERIFICATION OUTPUT" in fix_prompt
+        assert "exit=3" in fix_prompt
+        verify_rows = [t for t in store.all_models(ToolRun) if t.tool == "verification"]
+        assert [t.status.value for t in verify_rows] == ["failed", "succeeded"]
+        # The passing review pins the POST-FIX verification records.
+        review = next(
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        )
+        subject = decode_review_record(review.content or "").sources.subject
+        assert subject.implementation_run_id == fix_run.id
+        assert subject.verification_tool_run_id == verify_rows[1].id
+        conn.close()
+
+    def test_identical_fix_stops_without_new_evidence(self, build_workspace):
+        """A fix run producing a byte-identical workspace = §24 no-progress."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings", "--identical-fix"
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "no_workspace_change" in result.output
+
+        conn, store = _open_store(build_workspace)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING
+        runs = list(store.all_models(Run))
+        # The fix run was dispatched but minted nothing new: 1 DIFF, 1
+        # IMPLEMENTATION_PRODUCED, 1 reviewer (no second review ran).
+        assert [r.role for r in runs].count("implementer") == 2
+        assert [r.role for r in runs].count("reviewer") == 1
+        diffs = [a for a in store.all_models(Artifact) if a.kind is ArtifactKind.DIFF]
+        assert len(diffs) == 1
+        impl_evidence = [
+            r
+            for r in evidence.records_for_task(task.id)
+            if r.kind is EvidenceKind.IMPLEMENTATION_PRODUCED
+        ]
+        assert len(impl_evidence) == 1
+        payload = _decode_loop_record(_loop_records(store, task.id)[0])
+        assert payload.reason == "no_workspace_change"
+        assert payload.fix_runs_used == 1
+        # The parked state's diff is still reachable through the record.
+        assert payload.last_diff_artifact_id == diffs[0].id
+        conn.close()
+
+    def test_reviewer_crash_mid_loop_parks_without_retry(self, build_workspace):
+        """P6.1 contract inside the loop: a failed review leg parks at
+        REVIEWING — the loop never retries it."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace,
+            "--review-verdicts",
+            "findings,pass",
+            "--review-crash-at",
+            "2",
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "review_blocked" in result.output
+
+        conn, store = _open_store(build_workspace)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING
+        runs = list(store.all_models(Run))
+        reviewer_runs = [r for r in runs if r.role == "reviewer"]
+        assert len(reviewer_runs) == 2  # exactly one failed — never retried
+        assert reviewer_runs[1].status is RunStatus.FAILED
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        assert _loop_records(store, task.id) == []
+        conn.close()
+
+    def test_planning_failure_counts_zero_attempts(self, build_workspace):
+        """Frozen semantics: the planner never counts as an attempt."""
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = store.save_model(Task(title="planning failure"))
+        loop_impl = _loop_implementer(build_workspace, "--plan-crash")
+        agent = loop_impl(
+            settings=AgentSettings(adapter="fake_implementer_build"),
+            profile=HarnessAgentConfig(
+                executable_path=sys.executable,
+                grant=ExecutionGrantKind.WORKSPACE_WRITE,
+            ),
+            workspace_root=build_workspace,
+        )
+        request = AgentRequest(prompt="x", role=AgentRole.IMPLEMENTER, task_id=task.id)
+        outcome = asyncio.run(
+            run_build(store, writer, evidence, agent, request, workspace_root=build_workspace)
+        )
+        assert outcome.attempts == 0
+        assert outcome.ask is None
+        assert outcome.planner is not None
+        assert outcome.planner.run.status is RunStatus.FAILED
+        assert store.load_model(Task, task.id).state is TaskState.CONTEXT_READY
+        conn.close()
+
+    def test_second_findings_promotion_rolls_back_atomically(
+        self, build_workspace, monkeypatch
+    ):
+        """Mid-loop rework edges stay atomic: a crash on the SECOND
+        findings → implementing promotion leaves the first committed and
+        the second entirely absent."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,findings,pass"
+        )
+        monkeypatch.setattr(
+            "relay.cli.main.EventLogWriter",
+            _writer_failing_nth("reviewing -> implementing", 2),
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING  # old side of the failed edge
+        reviews = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        ]
+        packets = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.FIX_PACKET
+        ]
+        assert len(reviews) == 1  # first promotion committed
+        assert len(packets) == 1
+        diffs = [a for a in store.all_models(Artifact) if a.kind is ArtifactKind.DIFF]
+        assert len(diffs) == 2  # both attempts' work survives honestly
+        conn.close()
+
+    def test_pass_promotion_after_fix_loop_rolls_back_atomically(
+        self, build_workspace, monkeypatch
+    ):
+        """A crash on the post-loop PASS promotion leaves the earlier
+        findings promotion durable and the gate entirely uncommitted."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,pass"
+        )
+        monkeypatch.setattr(
+            "relay.cli.main.EventLogWriter",
+            _writer_failing_on("reviewing -> approval_required"),
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn, store = _open_store(build_workspace)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING
+        reviews = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        ]
+        assert len(reviews) == 1  # findings review survived; pass review rolled back
+        assert (
+            decode_review_record(reviews[0].content or "").report.verdict.value == "findings"
+        )
+        packets = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.FIX_PACKET
+        ]
+        assert len(packets) == 1
+        assert [a for a in store.all_models(Approval) if a.task_id == task.id] == []
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        conn.close()
+
+
+def _writer_failing_nth(content_marker: str, n: int):
+    """Like ``_writer_failing_on`` but fires only on the Nth match."""
+
+    class _FaultyWriter(EventLogWriter):
+        def record(self, entry):
+            if entry.type is EventType.STATE_TRANSITIONED and content_marker in entry.content:
+                self._seen = getattr(self, "_seen", 0) + 1
+                if self._seen == n:
+                    raise _FaultInjected(f"injected fault at: {entry.content}")
+            return super().record(entry)
+
+    return _FaultyWriter

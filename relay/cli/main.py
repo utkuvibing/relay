@@ -255,6 +255,7 @@ def build(
                     reviewer_name=config.reviewer,
                     reviewer_model=None if reviewer_settings is None else reviewer_settings.model,
                     approval=config.approval,
+                    budget=config.budget,
                 )
             )
 

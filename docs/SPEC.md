@@ -1064,6 +1064,11 @@ budget:
   stop_on_consensus: true
 ```
 
+P6.2 wires the first of these: `budget.max_fix_loops` bounds the build fix
+loop (see P6.2). The remaining keys are future vocabulary — until their
+phases land, strict config validation rejects them rather than silently
+accepting a no-op limit.
+
 İleride:
 
 ```text
@@ -1457,6 +1462,48 @@ Harness reviewers are always rebound to an explicit `READ_ONLY_ACCESS`
 profile, including a configured write/default profile or a missing profile.
 If the adapter cannot honor that profile, review fails closed before spawn.
 Provider-specific response vocabulary never enters the persisted contract.
+
+## P6.2 — Bounded fix loop (implemented slice)
+
+P6.2 executes the fix half of Phase 6 inside one `relay build` invocation:
+review findings or a failed verification re-enter `IMPLEMENTING` and dispatch
+a bounded number of fix runs through the same configured implementer agent
+(`role=IMPLEMENTER`, same crash-safe run spine). Resume/`relay continue`,
+re-driving parked tasks, micro-interactions inside stages, reviewer retry,
+and new task states remain deferred.
+
+A fix run is grounded in the pending blocking input — the canonical
+`FIX_PACKET` after findings, or the failed `TEST_RESULT` after a failed exam —
+embedded verbatim in the fix prompt alongside the canonical plan and the
+original request. Every attempt re-diffs the workspace against the one frozen
+pre-implementation baseline (a later PASS certifies the cumulative change,
+never just the last delta), is re-verified by the Relay-owned command, and is
+re-reviewed with rebuilt `ReviewInputs` so the review pins that attempt's
+exact run/diff/tool/evidence ids. A run producing an empty diff — or a
+byte-identical cumulative diff to the previous attempt — mints no DIFF and
+no `IMPLEMENTATION_PRODUCED`; identical state is the deterministic §24
+"no new evidence" stop.
+
+The bound is `budget.max_fix_loops` (default `3`; `0` preserves the P6.2-free
+one-pass behavior). P6.2 recognizes only that key: the other §23 fields
+(`max_agents_per_task`, `max_discussion_rounds`, `stop_on_consensus`) remain
+future vocabulary and unknown keys are a config error, never silently
+accepted. `attempts` counts dispatched implementation/fix runs only — the
+planner never counts — so `fix_runs_used == max(0, attempts - 1)` and the
+default bound allows at most 4 runs (1 implementation + 3 fixes).
+
+The loop ends with a deterministic stop reason: `pass_promoted`,
+`budget_exhausted`, `no_workspace_change`, `run_failed`,
+`verification_blocked`, `review_blocked`, `loop_disabled`, or
+`no_blocking_input`. Budget exhaustion and no-progress persist a
+`relay.build.loop.v1` `REPORT` artifact recording the reason,
+`fix_runs_used`, and the latest review/packet/diff ids — a stored
+observation only: no evidence, no transition; the task remains honestly
+parked (`IMPLEMENTING`, `VERIFYING`, or `REVIEWING` per the blocked stage).
+Reviewer process failure or malformed output still parks at `REVIEWING`
+with no retry, inside the loop exactly as in P6.1. Interruption is
+boundary-only: stop conditions are evaluated at stage boundaries, never
+mid-run.
 
 ## Bounded micro-interactions inside stages (Appendix D.6/D.11)
 
