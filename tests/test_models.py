@@ -12,7 +12,10 @@ from relay.storage.models import (
     ApprovalStatus,
     Artifact,
     ArtifactKind,
+    BuildBaselineManifestPayload,
+    BuildBaselineRecordPayload,
     BuildLoopRecordPayload,
+    BuildRequestRecordPayload,
     Decision,
     DecisionStatus,
     EventLogEntry,
@@ -284,6 +287,108 @@ class TestBuildLoopRecordPayload:
                         "fix_runs_used": 0,
                     }
                 )
+
+
+class TestBuildResumePayloads:
+    """P6.3 resume contracts are strict, frozen, and canonical."""
+
+    def test_request_record_is_strict_and_frozen(self):
+        payload = BuildRequestRecordPayload(
+            schema_version="relay.build.request.v1",
+            task_id="task-1",
+            prompt="write implemented.txt",
+            implementer="impl",
+            model="fake-1",
+        )
+        assert payload.model == "fake-1"
+        with pytest.raises(ValidationError):
+            payload.prompt = "mutate"  # type: ignore[misc]
+
+    def test_request_record_rejects_extra_blank_and_wrong_version(self):
+        with pytest.raises(ValidationError):
+            BuildRequestRecordPayload.model_validate(
+                {
+                    "schema_version": "relay.build.request.v1",
+                    "task_id": "task-1",
+                    "prompt": "x",
+                    "implementer": "impl",
+                    "provider_note": "vendor-specific",
+                }
+            )
+        with pytest.raises(ValidationError):
+            BuildRequestRecordPayload.model_validate(
+                {
+                    "schema_version": "relay.build.request.v2",
+                    "task_id": "task-1",
+                    "prompt": "x",
+                    "implementer": "impl",
+                }
+            )
+        with pytest.raises(ValidationError):
+            BuildRequestRecordPayload.model_validate(
+                {
+                    "schema_version": "relay.build.request.v1",
+                    "task_id": "task-1",
+                    "prompt": "   ",
+                    "implementer": "impl",
+                }
+            )
+
+    def test_baseline_manifest_validates_paths_and_digests(self):
+        digest = "a" * 64
+        manifest = BuildBaselineManifestPayload(
+            schema_version="relay.build.baseline.manifest.v1",
+            task_id="task-1",
+            files={"src/app.py": digest},
+            oversized_paths=("big.bin",),
+        )
+        assert manifest.files["src/app.py"] == digest
+        for bad_path in ("../up.py", "C:\\abs.py", "/abs.py", "a//b.py", " a.py"):
+            with pytest.raises(ValidationError):
+                BuildBaselineManifestPayload.model_validate(
+                    {
+                        "schema_version": "relay.build.baseline.manifest.v1",
+                        "task_id": "task-1",
+                        "files": {bad_path: digest},
+                    }
+                )
+        with pytest.raises(ValidationError):
+            BuildBaselineManifestPayload.model_validate(
+                {
+                    "schema_version": "relay.build.baseline.manifest.v1",
+                    "task_id": "task-1",
+                    "files": {"src/app.py": "not-a-digest"},
+                }
+            )
+
+    def test_baseline_pin_is_strict(self):
+        payload = BuildBaselineRecordPayload(
+            schema_version="relay.build.baseline.v1",
+            task_id="task-1",
+            manifest_digest="b" * 64,
+            file_count=2,
+            oversized_count=1,
+        )
+        assert payload.file_count == 2
+        with pytest.raises(ValidationError):
+            BuildBaselineRecordPayload.model_validate(
+                {
+                    "schema_version": "relay.build.baseline.v1",
+                    "task_id": "task-1",
+                    "manifest_digest": "b" * 64,
+                    "file_count": -1,
+                }
+            )
+        with pytest.raises(ValidationError):
+            BuildBaselineRecordPayload.model_validate(
+                {
+                    "schema_version": "relay.build.baseline.v1",
+                    "task_id": "task-1",
+                    "manifest_digest": "b" * 64,
+                    "file_count": 0,
+                    "provider_note": "x",
+                }
+            )
 
 
 class TestSystemEventsAreDistinctFromConversation:

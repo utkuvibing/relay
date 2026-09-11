@@ -299,7 +299,11 @@ def build_result(*, task, outcome, view=None) -> None:
         )
         if outcome.attempts:
             detail += f" | attempts {outcome.attempts}"
+            if outcome.prior_attempts:
+                detail += f" ({outcome.prior_attempts} prior)"
         _out().print(f"[dim]{detail}[/dim]")
+    if outcome.resumed_from is not None:
+        _out().print(f"[dim]resumed from {outcome.resumed_from.value}[/dim]")
     review = outcome.review
     if review is not None:
         detail = f"review {review.disposition.value}"

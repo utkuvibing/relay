@@ -27,6 +27,7 @@ Conversation is coordination input, not workflow authority. Messages cannot sile
 - `relay build "<task>"` drives a task through context, planning, implementation, configured verification, review, and completion gates.
 - Reviewers return a strict `relay.review.v1` JSON report. Findings persist as a canonical review plus a deterministic `fix_packet` artifact, then a bounded fix loop re-dispatches the implementer (same adapter, `role=IMPLEMENTER`) fed by the packet — or by the failed `TEST_RESULT` after a failed verification — re-verifying and re-reviewing each attempt. The bound is `budget.max_fix_loops` (default `3`; `0` is one-pass). A clean PASS commits with the resulting approval or completion transition atomically; exhaustion or a workspace with no net change parks the task honestly with a `relay.build.loop.v1` report.
 - `relay approve <task-id> --by <name>` records explicit human approval. The default path is `approval_required`; `approval: {mode: direct}` is an explicit opt-out that still requires verification and review evidence.
+- `relay continue [task-id] [--settle-interrupted]` resumes a parked build from durable ledger state — persisted stage boundaries advance without new agent runs, the fix-loop budget stays cumulative, and the frozen workspace baseline is verified before use. Resume pins the original implementer identity/model while verification, reviewer, approval, and budget policy come from the current `relay.yaml`.
 - `relay status`, `relay history`, and `relay inspect` expose the local ledger.
 
 The ledger lives at `.relay/relay.sqlite3` and stores tasks, runs, artifacts, tool runs, evidence, approvals, events, and inter-agent messages.
@@ -107,7 +108,7 @@ The current adapter registry includes OpenAI-compatible API adapters and harness
 These are roadmap items, not current capabilities:
 
 - P5 remaining: semantic loop/convergence detection; discussion CLI, bounded protocols, policy, budgets, and stored escalation notices are available;
-- P6 remaining: resume/`relay continue` for parked tasks, and bounded micro-interactions inside stages; structured findings, deterministic fix packets, and the bounded fix loop (attempt-scoped cumulative diffs, per-attempt re-verification and re-review) are available;
+- P6 remaining: bounded micro-interactions inside stages; structured findings, deterministic fix packets, the bounded fix loop (attempt-scoped cumulative diffs, per-attempt re-verification and re-review), and `relay continue` resume for parked builds are available;
 - P7: persistent Rooms, seats, and long-lived participant context;
 - P8: decision provenance;
 - P9: Relay server;
