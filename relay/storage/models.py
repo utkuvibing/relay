@@ -444,6 +444,30 @@ class InvalidReviewDiagnosticPayload(BaseModel):
     review_output_artifact_id: _RequiredId | None = None
 
 
+class BuildLoopRecordPayload(BaseModel):
+    """Durable ``relay.build.loop.v1`` observation (P6.2).
+
+    Persisted as a ``REPORT`` artifact when the bounded fix loop stops
+    without a verdict (budget exhausted or no workspace change). A stored
+    observation only — it mints no evidence and no transition; the pinned
+    artifact ids keep the parked state's ledger reachable for inspection
+    and for a future resume slice.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.build.loop.v1"]
+    task_id: _RequiredId
+    #: Only the two stop reasons P6.2 ever persists — the rest of the
+    #: orchestrator's stop vocabulary (pass_promoted, run_failed, ...)
+    #: never becomes a stored observation.
+    reason: Literal["budget_exhausted", "no_workspace_change"]
+    fix_runs_used: StrictInt = Field(ge=0)
+    last_review_artifact_id: _RequiredId | None = None
+    last_fix_packet_artifact_id: _RequiredId | None = None
+    last_diff_artifact_id: _RequiredId | None = None
+
+
 class DecisionStatus(str, enum.Enum):
     PROPOSED = "proposed"
     ACCEPTED = "accepted"

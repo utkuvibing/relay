@@ -16,6 +16,8 @@ import asyncio
 import json
 import subprocess
 import sys
+from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from typer.testing import CliRunner
@@ -24,18 +26,21 @@ from relay.agents.base import AgentRequest, AgentRole, ToolObservation
 from relay.agents.config import AgentSettings
 from relay.agents.registry import transient_adapters
 from relay.cli.main import app
-from relay.context.config import HarnessAgentConfig
+from relay.context.config import HarnessAgentConfig, VerificationConfig
 from relay.core.evidence import EvidenceKind
 from relay.core.orchestrator import (
     BuildRefusal,
+    LoopStopReason,
     _capture_baseline,
-    _diff_against_baseline,
+    _diff_and_state_against_baseline,
     _open_approval_gate,
     _reviewer_for,
+    _workspace_state_digest,
     advance_task,
     run_build,
 )
 from relay.core.permissions import PermissionGate
+from relay.core.reviews import decode_review_record
 from relay.core.state_machine import TaskState, TaskStateMachine
 from relay.harness.capabilities import HarnessCapability
 from relay.harness.errors import HarnessOutputError
@@ -48,9 +53,11 @@ from relay.storage.models import (
     ApprovalStatus,
     Artifact,
     ArtifactKind,
+    BuildLoopRecordPayload,
     EventType,
     EvidenceRecord,
     Run,
+    RunStatus,
     Task,
     ToolRun,
 )
@@ -1602,8 +1609,8 @@ class TestBaselineIsolation:
         (ws_a / "keep.txt").write_text("a-changed\n", encoding="utf-8")
         (ws_a / "new.txt").write_text("a-new\n", encoding="utf-8")
 
-        diff_a = _diff_against_baseline(gate, ws_a, "task-a", baseline_a)
-        diff_b = _diff_against_baseline(gate, ws_b, "task-b", baseline_b)
+        diff_a, _ = _diff_and_state_against_baseline(gate, ws_a, "task-a", baseline_a)
+        diff_b, _ = _diff_and_state_against_baseline(gate, ws_b, "task-b", baseline_b)
 
         # A's diff reflects only A's own delta — under the global handoff,
         # B's baseline would have made "keep.txt" look new and "bfile.txt"
@@ -1612,3 +1619,1006 @@ class TestBaselineIsolation:
         assert "new file: new.txt" in diff_a
         assert "bfile.txt" not in diff_a
         assert diff_b.strip() == ""
+
+    def test_tracked_file_growing_past_cap_is_not_a_phantom_deletion(
+        self, tmp_path, monkeypatch
+    ):
+        """Case A: a baseline-tracked file crossing the cap stays tracked.
+
+        Under the per-scan cap the grown file would drop out of the current
+        snapshot while remaining in the baseline — a phantom ``deleted
+        file:`` line. Frozen membership keeps it tracked; the rendered diff
+        uses a bounded marker and the raw-byte digest still sees the change.
+        """
+        from relay.core import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        gate = PermissionGate()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "big.dat").write_bytes(b"a" * 60)  # under cap → tracked member
+
+        baseline = _capture_baseline(ws)
+        (ws / "big.dat").write_bytes(b"b" * 100)  # grown past cap
+
+        diff, digest = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert "deleted file" not in diff
+        assert "big.dat" in diff  # honest bounded representation
+        assert digest != _workspace_state_digest(baseline.files)
+
+        # The grown file is read into the tracked set deterministically —
+        # an identical rescan produces the identical digest.
+        diff2, digest2 = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert digest2 == digest
+        assert diff2 == diff
+
+    def test_baseline_oversized_file_shrinking_is_not_a_phantom_creation(
+        self, tmp_path, monkeypatch
+    ):
+        """Case B: a baseline-oversized file stays untracked after shrinking.
+
+        Under the per-scan cap the shrunken file would enter the current
+        snapshot while absent from the baseline — a phantom ``new file:``
+        line. Frozen membership keeps it deliberately untracked, and the
+        digest is unchanged by invisible bytes.
+        """
+        from relay.core import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        gate = PermissionGate()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "big.dat").write_bytes(b"a" * 100)  # over cap → untracked member
+
+        baseline = _capture_baseline(ws)
+        (ws / "big.dat").write_bytes(b"b" * 10)  # shrunk under cap
+
+        diff, digest = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert "new file" not in diff
+        assert "big.dat" not in diff
+        assert diff.strip() == ""
+        # An untracked file contributes nothing — digest equals empty state.
+        assert digest == _workspace_state_digest({})
+
+    def test_new_file_created_past_cap_stays_bounded_deterministically(
+        self, tmp_path, monkeypatch
+    ):
+        """Post-baseline files keep the size bound — deliberately untracked.
+
+        A new oversized file never enters the tracked set (bounded scanning),
+        and the rule is deterministic: every scan reaches the same verdict.
+        """
+        from relay.core import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        gate = PermissionGate()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+
+        baseline = _capture_baseline(ws)
+        (ws / "huge.dat").write_bytes(b"x" * 200)  # new file, over cap
+
+        diff, digest = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert diff.strip() == ""
+        assert digest == _workspace_state_digest({})
+        _, digest2 = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert digest2 == digest
+
+    def test_oversized_tracked_member_is_streamed_not_read_wholesale(
+        self, tmp_path, monkeypatch
+    ):
+        """Bounded I/O: an oversized contract member never hits read_bytes.
+
+        Membership stays tracked, the rendered DIFF carries the bounded
+        oversized marker, and the digest sees the real byte change — all
+        without the file's contents ever entering memory.
+        """
+        from relay.core import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        gate = PermissionGate()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        big = ws / "big.dat"
+        big.write_bytes(b"a" * 60)  # under cap → tracked member
+
+        baseline = _capture_baseline(ws)
+        big.write_bytes(b"b" * 100)  # grown past cap
+
+        read_calls: list[Path] = []
+        real_read_bytes = Path.read_bytes
+
+        def _spy(self: Path) -> bytes:
+            read_calls.append(self)
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", _spy)
+
+        diff, digest = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert "oversized file big.dat differs" in diff
+        assert "deleted file" not in diff
+        assert digest != _workspace_state_digest(baseline.files)
+        # The whole point of the fix: the oversized member was streamed,
+        # never loaded wholesale through read_bytes.
+        assert big not in read_calls
+
+    def test_oversized_tracked_member_digest_is_deterministic_and_exact(
+        self, tmp_path, monkeypatch
+    ):
+        """Streamed identity is stable: same oversized state → same digest,
+        different oversized bytes → different digest (no-progress exactness).
+        """
+        from relay.core import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        gate = PermissionGate()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        big = ws / "big.dat"
+        big.write_bytes(b"a" * 60)
+
+        baseline = _capture_baseline(ws)
+        big.write_bytes(b"b" * 100)  # oversized member, state 1
+
+        _, digest1 = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        _, digest2 = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert digest1 == digest2  # unchanged oversized state → no-progress
+
+        big.write_bytes(b"c" * 100)  # same size, different bytes, still over cap
+        diff3, digest3 = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert digest3 != digest1  # streamed SHA-256 sees the change
+        assert "oversized file big.dat differs" in diff3
+
+
+# ---------------------------------------------------------------------------
+# P6.2 — bounded fix loop (SPEC §27 Phase 6)
+# ---------------------------------------------------------------------------
+
+_LOOP_SRC = r"""
+import json, sys
+data = sys.stdin.read()
+argv = sys.argv
+if "--version" in argv:
+    print("build-fake 1.0.0"); sys.exit(0)
+review_counter = __REVIEW_COUNTER__
+fix_counter = __FIX_COUNTER__
+
+def _bump(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            n = int(fh.read().strip() or "0")
+    except OSError:
+        n = 0
+    n += 1
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(str(n))
+    return n
+
+if "You are the planner" in data:
+    if "--plan-crash" in argv:
+        sys.exit(9)
+    print(json.dumps({"type": "thread.started", "thread_id": "t-plan"}))
+    print(json.dumps({"type": "item.completed",
+                      "item": {"id": "m", "type": "agent_message",
+                               "text": "# Plan\n\nGoal: implement the task\n"
+                                       "Steps: write implemented.txt\n"
+                                       "Files: implemented.txt\n"
+                                       "Verification: file exists"}}))
+    print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 3}}))
+    sys.exit(0)
+if "You are the reviewer" in data:
+    n = _bump(review_counter)
+    crash_at = 0
+    if "--review-crash-at" in argv:
+        crash_at = int(argv[argv.index("--review-crash-at") + 1])
+    if crash_at and n == crash_at:
+        sys.exit(9)
+    seq = ["pass"]
+    if "--review-verdicts" in argv:
+        seq = [v.strip().upper() for v in argv[argv.index("--review-verdicts") + 1].split(",")]
+    verdict = seq[n - 1] if n - 1 < len(seq) else "PASS"
+    if verdict == "NONE":
+        review_text = "looks fine but no structured report"
+    elif verdict == "FINDINGS":
+        review_text = json.dumps({
+            "schema_version": "relay.review.v1",
+            "verdict": "findings",
+            "summary": "One issue blocks completion.",
+            "findings": [{
+                "id": "F1",
+                "severity": "medium",
+                "title": "Missing regression coverage",
+                "description": "The implementation lacks a focused assertion.",
+                "requested_change": "Add the focused assertion described by the plan.",
+                "validation_expectation": "The configured verification command passes.",
+                "location": {"path": "implemented.txt"}
+            }]
+        })
+    else:
+        review_text = json.dumps({
+            "schema_version": "relay.review.v1",
+            "verdict": "pass",
+            "summary": "The changes match the plan.",
+            "findings": []
+        })
+    print(json.dumps({"type": "thread.started", "thread_id": "t-review"}))
+    print(json.dumps({"type": "item.completed",
+                      "item": {"id": "m", "type": "agent_message", "text": review_text}}))
+    print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 6, "output_tokens": 2}}))
+    sys.exit(0)
+# implementation / fix leg — flags shape the workspace write:
+#   --fix-crash      fix runs exit nonzero (durable run failure, no retry)
+#   --noop           write nothing at all (no-op run → no diff, no evidence)
+#   --binary         distinct BINARY bytes per dispatch — every attempt
+#                    renders the same 'Binary files differ' text, so only
+#                    the raw state digest can tell real progress
+#   --identical-fix  fix runs rewrite identical bytes (true no-progress)
+if "fix attempt" in data and "--fix-crash" in argv:
+    sys.exit(9)
+if "--noop" in argv:
+    pass
+elif "--binary" in argv:
+    n = _bump(fix_counter)
+    with open("implemented.bin", "wb") as handle:
+        handle.write(b"\x00\x01 binary-state-%d \xff\xfe\x00" % n)
+elif "fix attempt" in data and "--identical-fix" not in argv:
+    n = _bump(fix_counter)
+    with open("implemented.txt", "w", encoding="utf-8") as handle:
+        handle.write("implemented by fake harness - fix pass %d\n" % n)
+else:
+    with open("implemented.txt", "w", encoding="utf-8") as handle:
+        handle.write("implemented by fake harness\n")
+print(json.dumps({"type": "thread.started", "thread_id": "t-build"}))
+print(json.dumps({"type": "item.completed",
+                  "item": {"id": "m", "type": "agent_message", "text": "done: wrote implemented.txt"}}))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 42, "output_tokens": 7}}))
+"""
+
+
+def _loop_implementer(tmp_path, *argv_flags):
+    """A sequenced fake harness for the fix loop.
+
+    ``--review-verdicts a,b,c`` sequences per-review verdicts (missing →
+    pass); ``--review-crash-at N`` exits nonzero on the Nth review;
+    ``--identical-fix`` makes fix runs rewrite identical content
+    (no-progress); ``--plan-crash`` fails the planning leg. Sequencing
+    state lives in counter files under ``.relay/`` — excluded from both
+    the baseline and diff extraction, so they never pollute a DIFF.
+    """
+    src = _LOOP_SRC.replace(
+        "__REVIEW_COUNTER__", json.dumps(str(tmp_path / ".relay" / "review-count.txt"))
+    ).replace(
+        "__FIX_COUNTER__", json.dumps(str(tmp_path / ".relay" / "fix-count.txt"))
+    )
+
+    class _Loop(_FakeImplementer):
+        # Every AgentRequest this class serves (impl, fix, planner, and
+        # reviewer instances alike — _planner_for/_reviewer_for rebind via
+        # type(agent)) lands here for assertions on prompt/context_refs.
+        seen_requests: ClassVar[list[AgentRequest]] = []
+
+        async def run(self, request):
+            type(self).seen_requests.append(request)
+            return await super().run(request)
+
+        def invocation_argv(self, resolved):
+            return (resolved.command, "-c", src, *argv_flags)
+
+    return _Loop
+
+
+def _loop_agent(cls, workspace):
+    """A workspace-write instance of a sequenced fake for direct run_build calls."""
+    return cls(
+        settings=AgentSettings(adapter="fake_implementer_build"),
+        profile=HarnessAgentConfig(
+            executable_path=sys.executable,
+            grant=ExecutionGrantKind.WORKSPACE_WRITE,
+        ),
+        workspace_root=workspace,
+    )
+
+
+def _loop_records(store, task_id: str) -> list:
+    """Persisted relay.build.loop.v1 REPORT artifacts for one task."""
+    return [
+        a
+        for a in store.all_models(Artifact)
+        if a.kind is ArtifactKind.REPORT
+        and a.task_id == task_id
+        and "relay.build.loop.v1" in (a.content or "")
+    ]
+
+
+def _decode_loop_record(artifact) -> BuildLoopRecordPayload:
+    return BuildLoopRecordPayload.model_validate(json.loads(artifact.content or "{}"))
+
+
+def _open_store(root):
+    conn = __import__("relay.storage", fromlist=["connect"]).connect(
+        root / ".relay" / "relay.sqlite3"
+    )
+    return conn, SqliteRelayStore(conn)
+
+
+class TestFixLoop:
+    """P6.2: findings / failed-verification rework through a bounded loop."""
+
+    def test_findings_then_pass_promotes_with_attempt_scoped_pinning(self, build_workspace):
+        """Flagship: review 1 findings → fix run → review 2 pass → gated."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,pass"
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "pass_promoted" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.APPROVAL_REQUIRED
+
+        # Post-plan run sequence: impl → reviewer(findings) → fix → reviewer(pass).
+        runs = list(store.all_models(Run))
+        assert [r.role for r in runs] == [
+            "planner",
+            "implementer",
+            "reviewer",
+            "implementer",
+            "reviewer",
+        ]
+        fix_run = runs[3]
+
+        # The fix run consumed the persisted packet bytes verbatim.
+        packets = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.FIX_PACKET
+        ]
+        assert len(packets) == 1
+        fix_input = store.artifacts_for_run(fix_run.id, kind=ArtifactKind.RUN_INPUT)[0]
+        fix_prompt = fix_input.content or ""
+        assert "fix attempt 2" in fix_prompt
+        assert "FIX PACKET (relay.fix_packet.v1)" in fix_prompt
+        assert (packets[0].content or "") in fix_prompt
+
+        # The second review binds the FIX attempt's run/diff/verification.
+        reviews = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        ]
+        assert len(reviews) == 2
+        pass_record = decode_review_record(reviews[-1].content or "")
+        subject = pass_record.sources.subject
+        fix_diff = store.artifacts_for_run(fix_run.id, kind=ArtifactKind.DIFF)[0]
+        verify_rows = [t for t in store.all_models(ToolRun) if t.tool == "verification"]
+        assert len(verify_rows) == 2
+        assert subject.implementation_run_id == fix_run.id
+        assert subject.diff_artifact_id == fix_diff.id
+        assert subject.verification_tool_run_id == verify_rows[1].id
+
+        writer = EventLogWriter(conn)
+        contents = [e.content for e in writer.all() if e.type is EventType.STATE_TRANSITIONED]
+        assert "task state: reviewing -> implementing" in contents
+        assert contents.count("task state: implementing -> implemented") == 2
+        conn.close()
+
+    def test_budget_exhaustion_parks_and_records_loop_stop(self, build_workspace):
+        relay_yaml = build_workspace / "relay.yaml"
+        relay_yaml.write_text(
+            relay_yaml.read_text(encoding="utf-8") + "budget:\n  max_fix_loops: 1\n",
+            encoding="utf-8",
+        )
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,findings"
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "budget_exhausted" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING
+        runs = list(store.all_models(Run))
+        assert [r.role for r in runs] == [
+            "planner",
+            "implementer",
+            "reviewer",
+            "implementer",
+            "reviewer",
+        ]
+        records = _loop_records(store, task.id)
+        assert len(records) == 1
+        payload = _decode_loop_record(records[0])
+        assert payload.reason == "budget_exhausted"
+        assert payload.fix_runs_used == 1
+        assert payload.last_review_artifact_id is not None
+        assert payload.last_fix_packet_artifact_id is not None
+        assert payload.last_diff_artifact_id is not None
+        assert store.load_model(Artifact, payload.last_fix_packet_artifact_id).kind is (
+            ArtifactKind.FIX_PACKET
+        )
+        assert store.load_model(Artifact, payload.last_diff_artifact_id).kind is (
+            ArtifactKind.DIFF
+        )
+        conn.close()
+
+    def test_default_bound_allows_at_most_four_attempts(self, build_workspace):
+        """max_fix_loops=3 (default) ⇒ ≤1 impl + 3 fix dispatches, 4 reviews."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace,
+            "--review-verdicts",
+            "findings,findings,findings,findings",
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 4" in result.output
+        assert "budget_exhausted" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING
+        runs = list(store.all_models(Run))
+        assert [r.role for r in runs].count("implementer") == 4
+        assert [r.role for r in runs].count("reviewer") == 4
+        diffs = [a for a in store.all_models(Artifact) if a.kind is ArtifactKind.DIFF]
+        assert len(diffs) == 4
+        payload = _decode_loop_record(_loop_records(store, task.id)[0])
+        assert payload.reason == "budget_exhausted"
+        assert payload.fix_runs_used == 3
+        conn.close()
+
+    def test_zero_budget_preserves_p61_one_pass(self, build_workspace):
+        relay_yaml = build_workspace / "relay.yaml"
+        relay_yaml.write_text(
+            relay_yaml.read_text(encoding="utf-8") + "budget:\n  max_fix_loops: 0\n",
+            encoding="utf-8",
+        )
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(build_workspace, "--review-verdicts", "findings")
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 1" in result.output
+        assert "loop_disabled" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING
+        runs = list(store.all_models(Run))
+        assert [r.role for r in runs] == ["planner", "implementer", "reviewer"]
+        assert (
+            len(
+                [
+                    a
+                    for a in store.all_models(Artifact)
+                    if a.kind is ArtifactKind.FIX_PACKET
+                ]
+            )
+            == 1
+        )
+        assert _loop_records(store, task.id) == []
+        conn.close()
+
+    def test_failed_verification_reworks_then_passes(self, build_workspace):
+        """A red exam feeds the fixer its persisted TEST_RESULT, then green."""
+        # Under .relay/ so the retry counter never enters the diff.
+        counter = build_workspace / ".relay" / "verify-count.txt"
+        script = (
+            "import sys, pathlib\n"
+            f"p = pathlib.Path({json.dumps(str(counter))})\n"
+            "n = int(p.read_text() or '0') if p.exists() else 0\n"
+            "p.write_text(str(n + 1))\n"
+            "sys.exit(3 if n == 0 else 0)\n"
+        )
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), f'["-c", {json.dumps(script)}]'
+        )
+        loop_impl = _loop_implementer(build_workspace)
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "pass_promoted" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.APPROVAL_REQUIRED
+        fix_run = [r for r in store.all_models(Run) if r.role == "implementer"][1]
+        fix_input = store.artifacts_for_run(fix_run.id, kind=ArtifactKind.RUN_INPUT)[0]
+        fix_prompt = fix_input.content or ""
+        assert "fix attempt 2" in fix_prompt
+        assert "FAILED VERIFICATION OUTPUT" in fix_prompt
+        assert "exit=3" in fix_prompt
+        verify_rows = [t for t in store.all_models(ToolRun) if t.tool == "verification"]
+        assert [t.status.value for t in verify_rows] == ["failed", "succeeded"]
+        # The passing review pins the POST-FIX verification records.
+        review = next(
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        )
+        subject = decode_review_record(review.content or "").sources.subject
+        assert subject.implementation_run_id == fix_run.id
+        assert subject.verification_tool_run_id == verify_rows[1].id
+        conn.close()
+
+    def test_identical_fix_stops_without_new_evidence(self, build_workspace):
+        """A fix run producing a byte-identical workspace = §24 no-progress."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings", "--identical-fix"
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "no_workspace_change" in result.output
+
+        conn, store = _open_store(build_workspace)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING
+        runs = list(store.all_models(Run))
+        # The fix run was dispatched but minted nothing new: 1 DIFF, 1
+        # IMPLEMENTATION_PRODUCED, 1 reviewer (no second review ran).
+        assert [r.role for r in runs].count("implementer") == 2
+        assert [r.role for r in runs].count("reviewer") == 1
+        diffs = [a for a in store.all_models(Artifact) if a.kind is ArtifactKind.DIFF]
+        assert len(diffs) == 1
+        impl_evidence = [
+            r
+            for r in evidence.records_for_task(task.id)
+            if r.kind is EvidenceKind.IMPLEMENTATION_PRODUCED
+        ]
+        assert len(impl_evidence) == 1
+        payload = _decode_loop_record(_loop_records(store, task.id)[0])
+        assert payload.reason == "no_workspace_change"
+        assert payload.fix_runs_used == 1
+        # The parked state's diff is still reachable through the record.
+        assert payload.last_diff_artifact_id == diffs[0].id
+        conn.close()
+
+    def test_reviewer_crash_mid_loop_parks_without_retry(self, build_workspace):
+        """P6.1 contract inside the loop: a failed review leg parks at
+        REVIEWING — the loop never retries it."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace,
+            "--review-verdicts",
+            "findings,pass",
+            "--review-crash-at",
+            "2",
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "review_blocked" in result.output
+
+        conn, store = _open_store(build_workspace)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING
+        runs = list(store.all_models(Run))
+        reviewer_runs = [r for r in runs if r.role == "reviewer"]
+        assert len(reviewer_runs) == 2  # exactly one failed — never retried
+        assert reviewer_runs[1].status is RunStatus.FAILED
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        assert _loop_records(store, task.id) == []
+        conn.close()
+
+    def test_planning_failure_counts_zero_attempts(self, build_workspace):
+        """Frozen semantics: the planner never counts as an attempt."""
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = store.save_model(Task(title="planning failure"))
+        loop_impl = _loop_implementer(build_workspace, "--plan-crash")
+        agent = loop_impl(
+            settings=AgentSettings(adapter="fake_implementer_build"),
+            profile=HarnessAgentConfig(
+                executable_path=sys.executable,
+                grant=ExecutionGrantKind.WORKSPACE_WRITE,
+            ),
+            workspace_root=build_workspace,
+        )
+        request = AgentRequest(prompt="x", role=AgentRole.IMPLEMENTER, task_id=task.id)
+        outcome = asyncio.run(
+            run_build(store, writer, evidence, agent, request, workspace_root=build_workspace)
+        )
+        assert outcome.attempts == 0
+        assert outcome.ask is None
+        assert outcome.planner is not None
+        assert outcome.planner.run.status is RunStatus.FAILED
+        assert store.load_model(Task, task.id).state is TaskState.CONTEXT_READY
+        conn.close()
+
+    def test_second_findings_promotion_rolls_back_atomically(
+        self, build_workspace, monkeypatch
+    ):
+        """Mid-loop rework edges stay atomic: a crash on the SECOND
+        findings → implementing promotion leaves the first committed and
+        the second entirely absent."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,findings,pass"
+        )
+        monkeypatch.setattr(
+            "relay.cli.main.EventLogWriter",
+            _writer_failing_nth("reviewing -> implementing", 2),
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn, store = _open_store(build_workspace)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING  # old side of the failed edge
+        reviews = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        ]
+        packets = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.FIX_PACKET
+        ]
+        assert len(reviews) == 1  # first promotion committed
+        assert len(packets) == 1
+        diffs = [a for a in store.all_models(Artifact) if a.kind is ArtifactKind.DIFF]
+        assert len(diffs) == 2  # both attempts' work survives honestly
+        conn.close()
+
+    def test_pass_promotion_after_fix_loop_rolls_back_atomically(
+        self, build_workspace, monkeypatch
+    ):
+        """A crash on the post-loop PASS promotion leaves the earlier
+        findings promotion durable and the gate entirely uncommitted."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,pass"
+        )
+        monkeypatch.setattr(
+            "relay.cli.main.EventLogWriter",
+            _writer_failing_on("reviewing -> approval_required"),
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.txt"])
+        assert isinstance(result.exception, _FaultInjected)
+
+        conn, store = _open_store(build_workspace)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.REVIEWING
+        reviews = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        ]
+        assert len(reviews) == 1  # findings review survived; pass review rolled back
+        assert (
+            decode_review_record(reviews[0].content or "").report.verdict.value == "findings"
+        )
+        packets = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.FIX_PACKET
+        ]
+        assert len(packets) == 1
+        assert [a for a in store.all_models(Approval) if a.task_id == task.id] == []
+        kinds = {r.kind for r in evidence.records_for_task(task.id)}
+        assert EvidenceKind.REVIEW_PASSED not in kinds
+        conn.close()
+
+    def test_fix_run_failure_returns_only_latest_attempt_facts(self, build_workspace):
+        """PR-review: a crashed fixer must not leak attempt-1 records.
+
+        findings → fix dispatched → fixer process fails: every
+        latest-attempt field belongs to attempt 2 alone.
+        """
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = store.save_model(Task(title="fixer crash"))
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings", "--fix-crash"
+        )
+        agent = _loop_agent(loop_impl, build_workspace)
+        outcome = asyncio.run(
+            run_build(
+                store,
+                writer,
+                evidence,
+                agent,
+                AgentRequest(
+                    prompt="x", role=AgentRole.IMPLEMENTER, task_id=task.id
+                ),
+                workspace_root=build_workspace,
+                verification=VerificationConfig(
+                    program=sys.executable, args=["-c", "print('ok')"]
+                ),
+            )
+        )
+        assert outcome.attempts == 2
+        assert outcome.stop is LoopStopReason.RUN_FAILED
+        assert outcome.ask is not None
+        assert outcome.ask.response is None
+        impl_runs = [r for r in store.all_models(Run) if r.role == "implementer"]
+        assert len(impl_runs) == 2
+        assert outcome.ask.run.id == impl_runs[1].id
+        assert outcome.ask.run.status is RunStatus.FAILED
+        # Attempt-1 records must not leak into latest-attempt fields.
+        assert outcome.diff_artifact_id is None
+        assert outcome.tool_run_ids == ()
+        assert outcome.verification is None
+        assert outcome.review is None
+        assert store.load_model(Task, task.id).state is TaskState.IMPLEMENTING
+        # The earlier attempt's ledger stays durable for inspection.
+        assert (
+            len(
+                [
+                    a
+                    for a in store.all_models(Artifact)
+                    if a.kind is ArtifactKind.DIFF
+                ]
+            )
+            == 1
+        )
+        assert (
+            len(
+                [
+                    a
+                    for a in store.all_models(Artifact)
+                    if a.kind is ArtifactKind.FIX_PACKET
+                ]
+            )
+            == 1
+        )
+        conn.close()
+
+    def test_verification_blocked_after_fix_leaks_no_prior_review(
+        self, build_workspace
+    ):
+        """PR-review: a later attempt blocked in VERIFYING returns its own
+        verification result and NO review — attempt 1's findings review
+        must not leak into outcome.review."""
+        counter = build_workspace / ".relay" / "verify-count.txt"
+        script = (
+            "import sys, pathlib, time\n"
+            f"p = pathlib.Path({json.dumps(str(counter))})\n"
+            "n = int(p.read_text() or '0') if p.exists() else 0\n"
+            "p.write_text(str(n + 1))\n"
+            "if n == 0: sys.exit(0)\n"
+            "time.sleep(30)\n"
+        )
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = store.save_model(Task(title="blocked verify"))
+        loop_impl = _loop_implementer(build_workspace, "--review-verdicts", "findings")
+        agent = _loop_agent(loop_impl, build_workspace)
+        outcome = asyncio.run(
+            run_build(
+                store,
+                writer,
+                evidence,
+                agent,
+                AgentRequest(
+                    prompt="x", role=AgentRole.IMPLEMENTER, task_id=task.id
+                ),
+                workspace_root=build_workspace,
+                verification=VerificationConfig(
+                    program=sys.executable,
+                    args=["-c", script],
+                    timeout_seconds=1,
+                ),
+            )
+        )
+        assert outcome.attempts == 2
+        assert outcome.stop is LoopStopReason.VERIFICATION_BLOCKED
+        assert outcome.ask is not None
+        fix_run = outcome.ask.run
+        assert fix_run.status is RunStatus.SUCCEEDED
+        # Latest-attempt fields: the fix run minted a fresh cumulative DIFF
+        # and reached verification — which timed out and parked VERIFYING.
+        fix_diffs = store.artifacts_for_run(fix_run.id, kind=ArtifactKind.DIFF)
+        assert len(fix_diffs) == 1
+        assert outcome.diff_artifact_id == fix_diffs[0].id
+        assert outcome.verification is not None
+        assert outcome.verification.tool_run is not None
+        assert outcome.verification.tool_run.status is RunStatus.FAILED
+        assert outcome.review is None  # the attempt-1 findings must not leak
+        assert store.load_model(Task, task.id).state is TaskState.VERIFYING
+        conn.close()
+
+    def test_binary_change_between_attempts_is_progress(self, build_workspace):
+        """PR-review: every binary edit renders identically ('Binary files
+        differ') — only the raw state digest can tell real progress."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,pass", "--binary"
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.bin"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "pass_promoted" in result.output
+
+        conn, store = _open_store(build_workspace)
+        diffs = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.DIFF
+        ]
+        # Two attempts → two DIFFs whose rendered text aliases; the loop
+        # correctly saw progress anyway (under rendered-text equality the
+        # fix run would have been misjudged no-progress).
+        assert len(diffs) == 2
+        assert all(
+            "Binary files implemented.bin differ" in (a.content or "") for a in diffs
+        )
+        conn.close()
+
+    def test_preexisting_ignored_trees_mint_no_diff_or_evidence(self, build_workspace):
+        """PR-review: baseline and snapshot share ONE exclusion policy — a
+        pre-existing node_modules/__pycache__ can never manufacture a fake
+        'deleted file' DIFF or IMPLEMENTATION_PRODUCED."""
+        (build_workspace / "node_modules" / "pkg").mkdir(parents=True)
+        (build_workspace / "node_modules" / "pkg" / "index.js").write_text(
+            "x", encoding="utf-8"
+        )
+        (build_workspace / "__pycache__").mkdir()
+        (build_workspace / "__pycache__" / "m.pyc").write_bytes(b"\x00\x01")
+        loop_impl = _loop_implementer(build_workspace, "--noop")
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "no-op task"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 1" in result.output
+        assert "no_blocking_input" in result.output
+
+        conn, store = _open_store(build_workspace)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING
+        assert [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.DIFF
+        ] == []
+        assert [
+            r
+            for r in evidence.records_for_task(task.id)
+            if r.kind is EvidenceKind.IMPLEMENTATION_PRODUCED
+        ] == []
+        conn.close()
+
+    def test_fix_attempt_context_refs_carry_canonical_inputs(self, build_workspace):
+        """PR-review: a fix run keeps the caller's refs and names every
+        pinned canonical input the packet certifies — never just the
+        blocking artifact."""
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = store.save_model(Task(title="ctx refs"))
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,pass"
+        )
+        agent = _loop_agent(loop_impl, build_workspace)
+        outcome = asyncio.run(
+            run_build(
+                store,
+                writer,
+                evidence,
+                agent,
+                AgentRequest(
+                    prompt="x",
+                    role=AgentRole.IMPLEMENTER,
+                    task_id=task.id,
+                    context_refs=["room:r9", "artifact:custom"],
+                ),
+                workspace_root=build_workspace,
+                verification=VerificationConfig(
+                    program=sys.executable, args=["-c", "print('ok')"]
+                ),
+            )
+        )
+        assert outcome.stop is LoopStopReason.PASS_PROMOTED
+        impl_requests = [
+            r for r in loop_impl.seen_requests if r.role is AgentRole.IMPLEMENTER
+        ]
+        assert len(impl_requests) == 2
+        refs = impl_requests[1].context_refs
+        assert refs[:2] == ["room:r9", "artifact:custom"]  # originals preserved first
+        assert len(refs) == len(set(refs))  # de-duplicated
+        packet = next(
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.FIX_PACKET
+        )
+        review = next(
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        )
+        plan = next(a for a in store.all_models(Artifact) if a.kind is ArtifactKind.PLAN)
+        impl_run_1 = next(r for r in store.all_models(Run) if r.role == "implementer")
+        review_run = next(r for r in store.all_models(Run) if r.role == "reviewer")
+        assert f"task:{task.id}" in refs
+        assert f"artifact:{plan.id}" in refs
+        assert f"artifact:{packet.id}" in refs
+        assert f"artifact:{review.id}" in refs  # packet's pinned review artifact
+        assert f"run:{impl_run_1.id}" in refs  # pinned implementation run
+        assert f"run:{review_run.id}" in refs  # pinned reviewer run
+        assert any(r.startswith("evidence:") for r in refs)
+        assert any(r.startswith("tool_run:") for r in refs)
+        conn.close()
+
+    def test_failed_verification_fix_refs_include_plan_and_result(
+        self, build_workspace
+    ):
+        """The TEST_RESULT blocking input names the failed exam artifact
+        and the canonical plan alongside the task."""
+        counter = build_workspace / ".relay" / "verify-count.txt"
+        script = (
+            "import sys, pathlib\n"
+            f"p = pathlib.Path({json.dumps(str(counter))})\n"
+            "n = int(p.read_text() or '0') if p.exists() else 0\n"
+            "p.write_text(str(n + 1))\n"
+            "sys.exit(3 if n == 0 else 0)\n"
+        )
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = store.save_model(Task(title="ctx refs test-result"))
+        loop_impl = _loop_implementer(build_workspace)
+        agent = _loop_agent(loop_impl, build_workspace)
+        outcome = asyncio.run(
+            run_build(
+                store,
+                writer,
+                evidence,
+                agent,
+                AgentRequest(
+                    prompt="x", role=AgentRole.IMPLEMENTER, task_id=task.id
+                ),
+                workspace_root=build_workspace,
+                verification=VerificationConfig(
+                    program=sys.executable, args=["-c", script]
+                ),
+            )
+        )
+        assert outcome.stop is LoopStopReason.PASS_PROMOTED
+        impl_requests = [
+            r for r in loop_impl.seen_requests if r.role is AgentRole.IMPLEMENTER
+        ]
+        assert len(impl_requests) == 2
+        refs = impl_requests[1].context_refs
+        test_result = next(
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.TEST_RESULT
+        )
+        plan = next(a for a in store.all_models(Artifact) if a.kind is ArtifactKind.PLAN)
+        assert f"task:{task.id}" in refs
+        assert f"artifact:{plan.id}" in refs
+        assert f"artifact:{test_result.id}" in refs
+        conn.close()
+
+
+def _writer_failing_nth(content_marker: str, n: int):
+    """Like ``_writer_failing_on`` but fires only on the Nth match."""
+
+    class _FaultyWriter(EventLogWriter):
+        def record(self, entry):
+            if entry.type is EventType.STATE_TRANSITIONED and content_marker in entry.content:
+                self._seen = getattr(self, "_seen", 0) + 1
+                if self._seen == n:
+                    raise _FaultInjected(f"injected fault at: {entry.content}")
+            return super().record(entry)
+
+    return _FaultyWriter

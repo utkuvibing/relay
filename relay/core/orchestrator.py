@@ -36,12 +36,14 @@ Core never sees provider event vocabulary: adapters expose normalized
 from __future__ import annotations
 
 import enum
+import hashlib
 import json
 import os
 import shutil
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from relay.agents.base import (
     Agent,
@@ -52,7 +54,7 @@ from relay.agents.base import (
     RunObservation,
 )
 from relay.agents.errors import AgentError
-from relay.context.config import ApprovalPolicyConfig, VerificationConfig
+from relay.context.config import ApprovalPolicyConfig, BudgetConfig, VerificationConfig
 from relay.core.evidence import EvidenceKind, EvidenceStore
 from relay.core.permissions import Action, PermissionGate, ToolRequest
 from relay.core.reviews import (
@@ -62,6 +64,8 @@ from relay.core.reviews import (
     build_review_record,
     build_review_sources,
     build_review_subject,
+    canonical_json,
+    decode_fix_packet,
     encode_fix_packet,
     encode_invalid_review_diagnostic,
     encode_review_record,
@@ -75,6 +79,7 @@ from relay.storage.models import (
     ApprovalStatus,
     Artifact,
     ArtifactKind,
+    BuildLoopRecordPayload,
     EventLogEntry,
     EventType,
     EvidenceRecord,
@@ -253,13 +258,46 @@ class ReviewStageOutcome:
     result: ReviewResult
 
 
+class LoopStopReason(str, enum.Enum):
+    """Why a bounded fix loop ended (P6.2).
+
+    Outcome vocabulary only — persisted records carry the string value
+    (``relay.build.loop.v1`` ``reason`` field), never the enum.
+    """
+
+    PASS_PROMOTED = "pass_promoted"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    NO_WORKSPACE_CHANGE = "no_workspace_change"
+    RUN_FAILED = "run_failed"
+    VERIFICATION_BLOCKED = "verification_blocked"
+    REVIEW_BLOCKED = "review_blocked"
+    LOOP_DISABLED = "loop_disabled"
+    NO_BLOCKING_INPUT = "no_blocking_input"
+
+
 @dataclass(frozen=True)
 class BuildOutcome:
+    """Latest-attempt facts for one ``relay build`` (P6.2 frozen semantics).
+
+    ``ask``, ``diff_artifact_id``, ``tool_run_ids``, ``verification`` and
+    ``review`` describe the LAST implementation/fix run actually dispatched
+    — never attempt 1 after later fixes ran. ``ask`` is ``None`` when no
+    impl/fix run was ever dispatched (planning failure, early refusal);
+    ``planner`` then carries the planning run's outcome. ``attempts``
+    counts dispatched implementation/fix runs only — the planner never
+    counts, so ``fix_runs_used == max(0, attempts - 1)`` and the default
+    bound (``max_fix_loops=3``) allows at most 4.
+    """
+
     task: Task
-    ask: AskOutcome
+    ask: AskOutcome | None = None
+    planner: AskOutcome | None = None
     diff_artifact_id: str | None = None
     tool_run_ids: tuple[str, ...] = ()
+    verification: _VerificationResult | None = None
     review: ReviewResult | None = None
+    attempts: int = 0
+    stop: LoopStopReason | None = None
 
 
 class BuildRefusal(Exception):
@@ -301,72 +339,154 @@ def _record_observed_events(
     return tuple(ids)
 
 
-def _capture_baseline(root: Path) -> dict[str, bytes]:
-    """Snapshot every working-tree file Relay could later attribute to a run.
+# One shared exclusion policy for every workspace scan — baseline capture,
+# post-run snapshots, and the raw state digest must see exactly the same
+# tracked file set, or an ignored tree manufactures phantom deletions.
+_WORKSPACE_EXCLUDED_PARTS = frozenset({".git", ".relay", "node_modules", "__pycache__"})
 
-    Bounded: skips the Relay store dir and .git. Used as the provenance
-    baseline so pre-existing files are never attributed to the harness.
+
+def _workspace_path_is_excluded(rel: Path) -> bool:
+    """True when a workspace-relative path is outside Relay's tracked set."""
+    return any(part in _WORKSPACE_EXCLUDED_PARTS for part in rel.parts)
+
+
+@dataclass(frozen=True)
+class _TrackedFileState:
+    """State of one tracked workspace path (P6.2).
+
+    ``sha256`` is the file's content identity — always present. ``content``
+    is resident only when the file is within the size bound; an oversized
+    tracked member streams its SHA-256 in bounded chunks and keeps
+    ``content=None``, so membership survives growth without ever loading
+    the file wholesale.
     """
-    baseline: dict[str, bytes] = {}
-    git_dir = root / ".git"
-    relay_dir = root / ".relay"
+
+    sha256: str
+    content: bytes | None
+
+
+@dataclass(frozen=True)
+class _WorkspaceBaseline:
+    """Frozen tracked-set contract for one build (P6.2).
+
+    ``files`` holds pre-existing tracked contents; ``oversized_paths`` the
+    pre-existing paths deliberately left untracked by the size bound. The
+    split freezes membership across every attempt: a tracked file growing
+    past the cap stays tracked, an oversized file shrinking under the cap
+    stays untracked — threshold crossings can never manufacture a phantom
+    deletion or creation.
+    """
+
+    files: dict[str, _TrackedFileState]
+    oversized_paths: frozenset[str]
+
+
+def _capture_baseline(root: Path) -> _WorkspaceBaseline:
+    """Snapshot the working tree Relay could later attribute to a run.
+
+    Bounded: skips the shared exclusion set (``.git``, ``.relay``,
+    ``node_modules``, ``__pycache__``) and records — rather than silently
+    drops — paths over the size bound, so the post-run scans inherit a
+    stable membership contract and pre-existing files are never
+    re-adjudicated.
+    """
+    files: dict[str, _TrackedFileState] = {}
+    oversized: set[str] = set()
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
         rel = path.relative_to(root)
-        if any(part in (".git", ".relay") for part in rel.parts):
+        if _workspace_path_is_excluded(rel):
+            continue
+        name = str(rel).replace("\\", "/")
+        try:
+            if path.stat().st_size > _BASELINE_FILE_CAP_BYTES:
+                oversized.add(name)
+                continue
+            content = path.read_bytes()
+            files[name] = _TrackedFileState(
+                sha256=hashlib.sha256(content).hexdigest(), content=content
+            )
+        except OSError:
+            continue
+    return _WorkspaceBaseline(files=files, oversized_paths=frozenset(oversized))
+
+
+def _sha256_file(path: Path) -> str:
+    """Bounded streaming SHA-256 — never loads the file wholesale."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(_STREAM_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tracked_workspace_files(
+    root: Path, baseline: _WorkspaceBaseline
+) -> dict[str, _TrackedFileState]:
+    """Read the current tracked workspace under the baseline's contract.
+
+    Membership is frozen at baseline for pre-existing files: a contract
+    member stays tracked whatever it grows to (growth past the cap can
+    never fake a deletion); a baseline-oversized path stays untracked
+    (shrinkage can never fake a creation). Membership is separate from
+    content residency — an oversized contract member's SHA-256 is STREAMED
+    in bounded chunks and its bytes never enter memory; files first created
+    after the baseline keep the bounded-size policy, deterministic per scan.
+    """
+    files: dict[str, _TrackedFileState] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if _workspace_path_is_excluded(rel):
+            continue
+        name = str(rel).replace("\\", "/")
+        if name in baseline.oversized_paths:
             continue
         try:
             if path.stat().st_size > _BASELINE_FILE_CAP_BYTES:
+                if name not in baseline.files:
+                    continue  # post-baseline files stay bounded
+                # Oversized contract member: stream identity, keep no bytes.
+                files[name] = _TrackedFileState(
+                    sha256=_sha256_file(path), content=None
+                )
                 continue
-            baseline[str(rel).replace("\\", "/")] = path.read_bytes()
+            content = path.read_bytes()
+            files[name] = _TrackedFileState(
+                sha256=hashlib.sha256(content).hexdigest(), content=content
+            )
         except OSError:
             continue
-    del git_dir, relay_dir  # documentation-only locals
-    return baseline
+    return files
 
 
-def _diff_against_baseline(
-    gate: PermissionGate, root: Path, task_id: str, baseline: dict[str, bytes]
+def _workspace_state_digest(files: dict[str, _TrackedFileState]) -> str:
+    """Collision-safe identity of the tracked workspace state (P6.2).
+
+    Rendered diff text is a human-readable representation — binary files
+    collapse to ``Binary files <path> differ`` and lossy UTF-8 replacement
+    decoding can make distinct raw bytes render identically. No-progress
+    decisions therefore hash the tracked identity: sorted normalized paths
+    paired with each file's SHA-256 (streamed for oversized members — raw
+    bytes are never required to be resident); presence and deletion are
+    structural (a path absent from the map can never alias into the digest).
+    """
+    state = hashlib.sha256()
+    for name in sorted(files):
+        state.update(name.encode("utf-8"))
+        state.update(b"\x00")
+        state.update(files[name].sha256.encode("ascii"))
+        state.update(b"\x00")
+    return state.hexdigest()
+
+
+def _render_workspace_diff(
+    baseline: dict[str, _TrackedFileState],
+    current_files: dict[str, _TrackedFileState],
 ) -> str:
-    """Relay-owned diff vs pre-run baseline through the single gate path (A.4).
-
-    Non-mutating: no git index/HEAD changes at all. Only files that differ
-    from the captured baseline are attributed to this run. Binary-safe via
-    literal ``diff --git``-style textual patch construction over UTF-8 text
-    with lossy fallback markers for binary content.
-
-    The baseline is execution-local — passed in by the caller, never shared
-    module state — so concurrent builds cannot contaminate each other's
-    provenance.
-    """
-    decision = gate.check(
-        ToolRequest(
-            action=Action.READ_FILES,
-            agent="relay",
-            task_id=task_id,
-            reason="post-run repository diff extraction (compensating control)",
-        )
-    )
-    if decision.outcome != "allow":
-        raise BuildRefusal(
-            f"diff extraction refused by policy: {decision.action.value} -> {decision.outcome}"
-        )
-    current_files: dict[str, bytes] = {}
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(root)
-        parts = rel.parts
-        if any(part in (".git", ".relay", "node_modules", "__pycache__") for part in parts):
-            continue
-        try:
-            if path.stat().st_size > _BASELINE_FILE_CAP_BYTES:
-                continue
-            current_files[str(rel).replace("\\", "/")] = path.read_bytes()
-        except OSError:
-            continue
-
+    """Human-readable cumulative diff between two tracked snapshots."""
     changed_paths: set[str] = set()
     for name, before in baseline.items():
         after = current_files.get(name)
@@ -379,18 +499,30 @@ def _diff_against_baseline(
     for name in sorted(changed_paths):
         before = baseline.get(name)
         after = current_files.get(name)
+        before_bytes = before.content if before is not None else None
+        after_bytes = after.content if after is not None else None
 
         def _text(blob: bytes | None) -> str:
             return blob.decode("utf-8", errors="replace") if blob is not None else ""
 
-        is_binary_before = before is not None and b"\x00" in before[:_BINARY_SNIFF_BYTES]
-        is_binary_after = after is not None and b"\x00" in after[:_BINARY_SNIFF_BYTES]
+        is_binary_before = before_bytes is not None and b"\x00" in before_bytes[
+            :_BINARY_SNIFF_BYTES
+        ]
+        is_binary_after = after_bytes is not None and b"\x00" in after_bytes[
+            :_BINARY_SNIFF_BYTES
+        ]
         if is_binary_before or is_binary_after:
             lines.append(f"Binary files {name} differ")
             continue
+        if after is not None and after.content is None:
+            # Oversized contract member — bounded marker instead of a
+            # multi-MB unified diff; its streamed SHA-256 still feeds the
+            # state digest, so no-progress stays exact.
+            lines.append(f"oversized file {name} differs")
+            continue
 
-        before_text = _text(before).splitlines(keepends=True)
-        after_text = _text(after).splitlines(keepends=True)
+        before_text = _text(before_bytes).splitlines(keepends=True)
+        after_text = _text(after_bytes).splitlines(keepends=True)
         if before is None:
             lines.append(f"new file: {name}")
         elif after is None:
@@ -407,8 +539,37 @@ def _diff_against_baseline(
     return "\n".join(lines)
 
 
+def _diff_and_state_against_baseline(
+    gate: PermissionGate, root: Path, task_id: str, baseline: _WorkspaceBaseline
+) -> tuple[str, str]:
+    """One gate-checked scan → (rendered cumulative diff, raw state digest).
+
+    The digest is the no-progress identity; the text is the reviewer/human
+    DIFF artifact. Both derive from the SAME scan so a workspace changing
+    mid-extraction can never produce a diff and a verdict that disagree.
+    """
+    decision = gate.check(
+        ToolRequest(
+            action=Action.READ_FILES,
+            agent="relay",
+            task_id=task_id,
+            reason="post-run repository diff extraction (compensating control)",
+        )
+    )
+    if decision.outcome != "allow":
+        raise BuildRefusal(
+            f"diff extraction refused by policy: {decision.action.value} -> {decision.outcome}"
+        )
+    current_files = _tracked_workspace_files(root, baseline)
+    return (
+        _render_workspace_diff(baseline.files, current_files),
+        _workspace_state_digest(current_files),
+    )
+
+
 _BASELINE_FILE_CAP_BYTES = 4 * 1024 * 1024
 _BINARY_SNIFF_BYTES = 8000
+_STREAM_CHUNK_BYTES = 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +585,15 @@ _PLAN_DIRECTIVE = (
 _IMPLEMENT_DIRECTIVE = (
     "Implement the following accepted plan exactly.\n\n"
     "ACCEPTED PLAN:\n{plan}\n\nORIGINAL REQUEST:\n{prompt}"
+)
+
+_FIX_DIRECTIVE = (
+    "You are the implementer executing fix attempt {attempt} of a bounded loop.\n"
+    "Work only within the accepted plan; address the blocking input below "
+    "exactly.\n\n"
+    "ACCEPTED PLAN:\n{plan}\n\n"
+    "{blocking_label}:\n{blocking}\n\n"
+    "ORIGINAL REQUEST:\n{prompt}"
 )
 
 
@@ -1169,6 +1339,221 @@ def _open_approval_gate(task: Task) -> tuple[Approval, EventLogEntry]:
     return approval, event
 
 
+# ---------------------------------------------------------------------------
+# P6.2 — bounded fix loop (SPEC §27 Phase 6; §23 budgets)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _AttemptOutcome:
+    """Records produced by one dispatched implementation/fix run."""
+
+    task: Task
+    ask: AskOutcome | None = None
+    tool_run_ids: tuple[str, ...] = ()
+    diff_artifact: Artifact | None = None
+    state_digest: str = ""
+
+
+async def _run_implementation_attempt(
+    store: SqliteRelayStore,
+    writer: EventLogWriter,
+    evidence: EvidenceStore,
+    gate: PermissionGate,
+    machine: TaskStateMachine,
+    task: Task,
+    agent: Agent,
+    request: AgentRequest,
+    *,
+    model: str | None,
+    agent_name: str | None,
+    workspace_root: Path,
+    baseline: _WorkspaceBaseline,
+    previous_state_digest: str | None,
+) -> _AttemptOutcome:
+    """Dispatch one implementation/fix run through the crash-safe spine.
+
+    Records observed tool events, then extracts the CUMULATIVE workspace
+    diff against the frozen pre-implementation baseline (one baseline for
+    the whole build — a later PASS certifies the whole change, never just
+    the last delta). Only a fresh, non-empty diff mints a DIFF artifact +
+    ``IMPLEMENTATION_PRODUCED`` and advances IMPLEMENTING → IMPLEMENTED →
+    VERIFYING; a run that produces no net change mints nothing and leaves
+    the task honestly at IMPLEMENTING. No-progress compares RAW workspace
+    state digests — never rendered diff text, which collapses binary and
+    lossy-decode differences (the §24 "no new evidence" condition in
+    deterministic, collision-safe form).
+    """
+    outcome = await run_ask(
+        store, writer, agent, request, model=model, agent_name=agent_name
+    )
+    if outcome.response is None:
+        return _AttemptOutcome(task=task, ask=outcome)
+
+    # Adapter-normalized tool observations → ToolRun rows (observability only).
+    tool_run_ids = _record_observed_events(
+        store, writer, outcome.response, outcome.run.id
+    )
+
+    # Relay-owned non-mutating extraction: rendered DIFF artifact + the raw
+    # state digest share ONE scan so they can never disagree.
+    diff_text, state_digest = _diff_and_state_against_baseline(
+        gate, workspace_root, task.id, baseline
+    )
+    if not diff_text.strip() or state_digest == previous_state_digest:
+        return _AttemptOutcome(
+            task=task,
+            ask=outcome,
+            tool_run_ids=tool_run_ids,
+            state_digest=state_digest,
+        )
+
+    with store.transaction():
+        diff_artifact = store.save_model(
+            Artifact(
+                kind=ArtifactKind.DIFF,
+                run_id=outcome.run.id,
+                task_id=task.id,
+                content=diff_text,
+            )
+        )
+        writer.record(
+            EventLogEntry(
+                type=EventType.ARTIFACT_CREATED,
+                content="diff extracted from workspace after build",
+                references=[
+                    f"run:{outcome.run.id}",
+                    f"artifact:{diff_artifact.id}",
+                    f"task:{task.id}",
+                ],
+            )
+        )
+
+    # IMPLEMENTATION_PRODUCED only when the run actually produced changes
+    # (Blocker 4): a no-op mints nothing — and the machine therefore keeps
+    # the task at IMPLEMENTING (§27 Phase 3 exit gate).
+    evidence.record(
+        EvidenceRecord(
+            kind=EvidenceKind.IMPLEMENTATION_PRODUCED,
+            task_id=task.id,
+            run_id=outcome.run.id,
+            produced_by=f"agent:{agent.name}",
+        )
+    )
+    writer.record(
+        EventLogEntry(
+            type=EventType.EVIDENCE_RECORDED,
+            content=f"{EvidenceKind.IMPLEMENTATION_PRODUCED.value} recorded for task",
+            references=[f"task:{task.id}", f"run:{outcome.run.id}"],
+        )
+    )
+    task = advance_task(machine, store, writer, task, TaskState.IMPLEMENTED)
+    task = advance_task(machine, store, writer, task, TaskState.VERIFYING)
+    return _AttemptOutcome(
+        task=task,
+        ask=outcome,
+        tool_run_ids=tool_run_ids,
+        diff_artifact=diff_artifact,
+        state_digest=state_digest,
+    )
+
+
+def _fix_context_refs(
+    request: AgentRequest,
+    task: Task,
+    plan_artifact: Artifact,
+    blocking: Artifact,
+) -> list[str]:
+    """Ordered, de-duplicated context refs for one fix attempt's request.
+
+    A fix run keeps the caller's original refs and additionally names the
+    canonical inputs it must work from: the task, the frozen plan artifact,
+    and the blocking artifact itself. When the blocker is a FIX_PACKET the
+    packet's own pinned source references are surfaced too — decoded
+    read-only; the persisted packet bytes remain the blocking authority and
+    are never regenerated or reinterpreted.
+    """
+    refs: list[str] = []
+
+    def _add(ref: str) -> None:
+        if ref not in refs:
+            refs.append(ref)
+
+    for ref in request.context_refs:
+        _add(ref)
+    _add(f"task:{task.id}")
+    _add(f"artifact:{plan_artifact.id}")
+    _add(f"artifact:{blocking.id}")
+    if blocking.kind is ArtifactKind.FIX_PACKET and blocking.content:
+        packet = decode_fix_packet(blocking.content)
+        subject = packet.sources.subject
+        _add(f"artifact:{packet.review_artifact_id}")
+        _add(f"run:{subject.plan_run_id}")
+        _add(f"artifact:{subject.plan_artifact_id}")
+        _add(f"run:{subject.implementation_run_id}")
+        _add(f"artifact:{subject.diff_artifact_id}")
+        _add(f"evidence:{subject.verification_evidence_id}")
+        _add(f"tool_run:{subject.verification_tool_run_id}")
+        _add(f"artifact:{subject.test_result_artifact_id}")
+        _add(f"run:{packet.sources.review_run_id}")
+        _add(f"artifact:{packet.sources.review_output_artifact_id}")
+    return refs
+
+
+# The only loop stops that ever become a stored observation — the map keeps
+# the storage-layer Literal vocabulary honest without an import cycle.
+_LOOP_RECORD_REASONS: dict[
+    LoopStopReason, Literal["budget_exhausted", "no_workspace_change"]
+] = {
+    LoopStopReason.BUDGET_EXHAUSTED: "budget_exhausted",
+    LoopStopReason.NO_WORKSPACE_CHANGE: "no_workspace_change",
+}
+
+
+def _persist_loop_record(
+    store: SqliteRelayStore,
+    writer: EventLogWriter,
+    task: Task,
+    *,
+    reason: LoopStopReason,
+    fix_runs_used: int,
+    last_review_artifact_id: str | None,
+    last_fix_packet_artifact_id: str | None,
+    last_diff_artifact_id: str | None,
+) -> Artifact:
+    """Persist the ``relay.build.loop.v1`` stop observation (P6.2 D6).
+
+    A stored observation only — no evidence, no transition. Pinned ids keep
+    the parked state's ledger reachable for inspection (and a future
+    resume slice): the most recent DIFF still describes the workspace even
+    when the last dispatched run minted none.
+    """
+    payload = BuildLoopRecordPayload(
+        schema_version="relay.build.loop.v1",
+        task_id=task.id,
+        reason=_LOOP_RECORD_REASONS[reason],
+        fix_runs_used=fix_runs_used,
+        last_review_artifact_id=last_review_artifact_id,
+        last_fix_packet_artifact_id=last_fix_packet_artifact_id,
+        last_diff_artifact_id=last_diff_artifact_id,
+    )
+    artifact = Artifact(
+        kind=ArtifactKind.REPORT,
+        task_id=task.id,
+        content=canonical_json(payload),
+    )
+    with store.transaction():
+        store.save_model(artifact)
+        writer.record(
+            EventLogEntry(
+                type=EventType.ARTIFACT_CREATED,
+                content=f"fix loop stopped: {reason.value}",
+                references=[f"task:{task.id}", f"artifact:{artifact.id}"],
+            )
+        )
+    return artifact
+
+
 async def run_build(
     store: SqliteRelayStore,
     writer: EventLogWriter,
@@ -1185,6 +1570,7 @@ async def run_build(
     reviewer_name: str | None = None,
     reviewer_model: str | None = None,
     approval: ApprovalPolicyConfig | None = None,
+    budget: BudgetConfig | None = None,
 ) -> BuildOutcome:
     """Drive one task through the deterministic lifecycle to closure.
 
@@ -1199,6 +1585,15 @@ async def run_build(
     P3.2 chains Relay-scoped verification after ``IMPLEMENTED``; P3.3 chains
     the review run and lands the task at ``APPROVAL_REQUIRED`` (gated
     default) or ``DONE`` (``approval: {mode: direct}`` policy opt-out).
+
+    P6.2 closes the Phase-6 loop inside this one invocation: review
+    findings or a failed verification re-enter ``IMPLEMENTING`` and dispatch
+    a bounded number of fix runs (``budget.max_fix_loops``, default 3; 0 =
+    the P6.1 one-pass behavior) — each consuming the pending blocking input
+    (the deterministic FIX_PACKET or the failed TEST_RESULT), re-diffed
+    against the frozen baseline, re-verified, and re-reviewed. Interruption
+    semantics are boundary-only: stop conditions are evaluated at stage
+    boundaries, never mid-run.
     """
     gate = gate or PermissionGate()
     if request.task_id is None:
@@ -1253,7 +1648,7 @@ async def run_build(
     if plan_outcome.response is None or not plan_outcome.response.output.strip():
         # Planning failed or produced nothing usable: the task stays honestly
         # blocked at CONTEXT_READY (no plan evidence, no implementation).
-        return BuildOutcome(task=task, ask=plan_outcome)
+        return BuildOutcome(task=task, planner=plan_outcome)
     plan_artifact = _freeze_plan(store, writer, evidence, task, plan_outcome)
     task = advance_task(machine, store, writer, task, TaskState.PLAN_READY)
 
@@ -1261,98 +1656,132 @@ async def run_build(
     # human's explicit initiation — the PLAN_READY→IMPLEMENTING edge.
     task = advance_task(machine, store, writer, task, TaskState.IMPLEMENTING)
 
-    # 4. Implementation run — the prompt is the frozen plan artifact content,
-    # not the raw prompt (App. D.3: downstream agents operate against the
-    # canonical plan).
-    implement_request = request.model_copy(
-        update={
-            "prompt": _IMPLEMENT_DIRECTIVE.format(
-                plan=plan_artifact.content, prompt=request.prompt
-            )
-        }
-    )
+    # 4. Implementation + bounded fix loop (P6.2). Attempt 1 runs the
+    # implement directive; every later attempt is a fix run fed by the
+    # pending blocking input — the deterministic FIX_PACKET after review
+    # findings, or the failed TEST_RESULT after a failed verification.
+    # Each attempt re-diffs against the one frozen baseline, re-verifies,
+    # and re-reviews; the loop ends on PASS promotion, budget exhaustion,
+    # no net workspace change, or a blocked stage.
+    max_fix_loops = (budget or BudgetConfig()).max_fix_loops
+    selected_reviewer = _reviewer_for(reviewer or agent)
 
     # Blocker 2 provenance baseline: snapshot BEFORE implement-run I/O so
-    # pre-existing files are never attributed to the run. (The plan run is
+    # pre-existing files are never attributed to a run. (The plan run is
     # READ_ONLY; anything it left behind is pre-existing by definition.)
-    # Execution-local: concurrent builds can never share this map.
+    # Execution-local: concurrent builds can never share this map — and the
+    # SAME baseline serves every attempt, so each review certifies the whole
+    # cumulative change, never just the last delta. The baseline also freezes
+    # the tracked-set contract: which pre-existing files count (and which
+    # oversized ones deliberately don't) is decided once, so a file crossing
+    # the size bound mid-build can never fake a deletion or creation.
     baseline = _capture_baseline(workspace_root)
 
-    outcome = await run_ask(
-        store, writer, agent, implement_request, model=model, agent_name=agent_name
-    )
-    if outcome.response is None:
-        return BuildOutcome(task=task, ask=outcome)
-
-    response = outcome.response
-
-    # Adapter-normalized tool observations → ToolRun rows (observability only).
-    tool_run_ids = _record_observed_events(store, writer, response, outcome.run.id)
-
-    # Relay-owned non-mutating diff extraction as DIFF artifact.
-    diff_text = _diff_against_baseline(gate, workspace_root, task.id, baseline)
+    attempts = 0
+    fix_runs_used = 0
+    stop: LoopStopReason | None = None
+    blocking: Artifact | None = None
+    last_state_digest: str | None = None
+    last_diff_artifact_id: str | None = None
+    last_review_artifact_id: str | None = None
+    last_fix_packet_artifact_id: str | None = None
+    # Latest-attempt outcome fields — re-assigned wholesale every iteration
+    # so the returned BuildOutcome can never mix records from two attempts.
+    outcome: AskOutcome | None = None
+    tool_run_ids: tuple[str, ...] = ()
     diff_artifact_id: str | None = None
-    diff_artifact: Artifact | None = None
-    if diff_text.strip():
-        with store.transaction():
-            diff_artifact = store.save_model(
-                Artifact(
-                    kind=ArtifactKind.DIFF,
-                    run_id=outcome.run.id,
-                    task_id=task.id,
-                    content=diff_text,
-                )
-            )
-            writer.record(
-                EventLogEntry(
-                    type=EventType.ARTIFACT_CREATED,
-                    content="diff extracted from workspace after build",
-                    references=[
-                        f"run:{outcome.run.id}",
-                        f"artifact:{diff_artifact.id}",
-                        f"task:{task.id}",
-                    ],
-                )
-            )
-        assert diff_artifact is not None
-        diff_artifact_id = diff_artifact.id
-
+    verification_result: _VerificationResult | None = None
     review_result: ReviewResult | None = None
 
-    # IMPLEMENTATION_PRODUCED only when the run actually produced changes
-    # (Blocker 4): a no-op build mints nothing — and the machine therefore
-    # keeps the task at IMPLEMENTING (§27 Phase 3 exit gate).
-    if diff_text.strip():
-        evidence.record(
-            EvidenceRecord(
-                kind=EvidenceKind.IMPLEMENTATION_PRODUCED,
-                task_id=task.id,
-                run_id=outcome.run.id,
-                produced_by=f"agent:{agent.name}",
+    while True:
+        if attempts == 0:
+            # The prompt is the frozen plan artifact content, not the raw
+            # prompt (App. D.3: downstream agents work the canonical plan).
+            prompt = _IMPLEMENT_DIRECTIVE.format(
+                plan=plan_artifact.content, prompt=request.prompt
             )
-        )
-        writer.record(
-            EventLogEntry(
-                type=EventType.EVIDENCE_RECORDED,
-                content=f"{EvidenceKind.IMPLEMENTATION_PRODUCED.value} recorded for task",
-                references=[f"task:{task.id}", f"run:{outcome.run.id}"],
+            context_refs = request.context_refs
+        else:
+            assert blocking is not None
+            label = (
+                "FIX PACKET (relay.fix_packet.v1)"
+                if blocking.kind is ArtifactKind.FIX_PACKET
+                else "FAILED VERIFICATION OUTPUT"
             )
+            prompt = _FIX_DIRECTIVE.format(
+                attempt=attempts + 1,
+                plan=plan_artifact.content,
+                blocking_label=label,
+                blocking=blocking.content or "",
+                prompt=request.prompt,
+            )
+            context_refs = _fix_context_refs(request, task, plan_artifact, blocking)
+        attempt_request = request.model_copy(
+            update={"prompt": prompt, "context_refs": context_refs}
         )
-        task = advance_task(machine, store, writer, task, TaskState.IMPLEMENTED)
+        attempt = await _run_implementation_attempt(
+            store,
+            writer,
+            evidence,
+            gate,
+            machine,
+            task,
+            agent,
+            attempt_request,
+            model=model,
+            agent_name=agent_name,
+            workspace_root=workspace_root,
+            baseline=baseline,
+            previous_state_digest=last_state_digest,
+        )
+        attempts += 1
+        if attempts > 1:
+            fix_runs_used += 1
+        task = attempt.task
+        # Every latest-attempt field describes THIS dispatch only — earlier
+        # attempts' records survive on the separate last_* pointers used for
+        # the loop report, never in the returned BuildOutcome.
+        outcome = attempt.ask
+        tool_run_ids = attempt.tool_run_ids
+        diff_artifact_id = (
+            attempt.diff_artifact.id if attempt.diff_artifact is not None else None
+        )
+        verification_result = None
+        review_result = None
+        if outcome is None or outcome.response is None:
+            stop = LoopStopReason.RUN_FAILED
+            break
+        if attempt.diff_artifact is None:
+            # No net workspace change: on attempt 1 the honest no-op park
+            # (nothing to fix against); on a fix run the identical raw
+            # state means the same inputs would only burn budget repeating.
+            stop = (
+                LoopStopReason.NO_BLOCKING_INPUT
+                if attempts == 1
+                else LoopStopReason.NO_WORKSPACE_CHANGE
+            )
+            break
+        last_diff_artifact_id = attempt.diff_artifact.id
+        last_state_digest = attempt.state_digest
 
         # P3.2: auto-chained Relay-scoped verification (frozen plan Q-f) —
         # endings: REVIEWING (pass), IMPLEMENTING (test-failure rework), or
         # blocked in VERIFYING (no config / could-not-execute / timeout).
-        task = advance_task(machine, store, writer, task, TaskState.VERIFYING)
         verification_result = await _run_verification(
             store, writer, evidence, gate, machine, task, verification, workspace_root
         )
         task = verification_result.task
-
-        # P6.1: review uses pinned persisted inputs and promotes PASS atomically
-        # with the resulting closure edge. Invalid output never becomes evidence.
-        if task.state is TaskState.REVIEWING:
-            assert diff_artifact is not None
+        if task.state is TaskState.VERIFYING:
+            stop = LoopStopReason.VERIFICATION_BLOCKED
+            break
+        if task.state is TaskState.IMPLEMENTING:
+            # Failed exam — its persisted TEST_RESULT is the next fix input.
+            blocking = verification_result.test_result_artifact
+        elif task.state is TaskState.REVIEWING:
+            # P6.1: review uses pinned persisted inputs — rebuilt each
+            # iteration so the review binds THIS attempt's run, diff, and
+            # verification records exactly. PASS promotes atomically with
+            # the closure edge; invalid output never becomes evidence.
             assert verification_result.tool_run is not None
             assert verification_result.test_result_artifact is not None
             assert verification_result.evidence_record is not None
@@ -1361,7 +1790,7 @@ async def run_build(
                 plan_run=plan_outcome.run,
                 plan_artifact=plan_artifact,
                 implementation_run=outcome.run,
-                diff_artifact=diff_artifact,
+                diff_artifact=attempt.diff_artifact,
                 verification_evidence=verification_result.evidence_record,
                 verification_tool_run=verification_result.tool_run,
                 test_result_artifact=verification_result.test_result_artifact,
@@ -1375,28 +1804,69 @@ async def run_build(
                     diagnostic_artifact_id=diagnostic.id,
                     reason_code=exc.code,
                 )
+                stop = LoopStopReason.REVIEW_BLOCKED
+                break
+            review_stage = await _run_review(
+                store,
+                writer,
+                evidence,
+                machine,
+                task,
+                selected_reviewer,
+                request,
+                review_inputs,
+                approval=approval,
+                model=reviewer_model if reviewer is not None else model,
+                agent_name=reviewer_name if reviewer is not None else agent_name,
+            )
+            task = review_stage.task
+            review_result = review_stage.result
+            if review_result.review_artifact_id is not None:
+                last_review_artifact_id = review_result.review_artifact_id
+            if review_result.fix_packet_artifact_id is not None:
+                last_fix_packet_artifact_id = review_result.fix_packet_artifact_id
+            if task.state is TaskState.IMPLEMENTING:
+                # Findings promotion — the packet is the next blocking input.
+                assert review_result.fix_packet_artifact_id is not None
+                blocking = store.load_model(Artifact, review_result.fix_packet_artifact_id)
+            elif task.state is TaskState.REVIEWING:
+                # Reviewer run failure or invalid output parks here (P6.1 —
+                # no retry).
+                stop = LoopStopReason.REVIEW_BLOCKED
+                break
             else:
-                selected_reviewer = _reviewer_for(reviewer or agent)
-                review_stage = await _run_review(
-                    store,
-                    writer,
-                    evidence,
-                    machine,
-                    task,
-                    selected_reviewer,
-                    request,
-                    review_inputs,
-                    approval=approval,
-                    model=reviewer_model if reviewer is not None else model,
-                    agent_name=reviewer_name if reviewer is not None else agent_name,
-                )
-                task = review_stage.task
-                review_result = review_stage.result
+                stop = LoopStopReason.PASS_PROMOTED
+                break
+
+        # Task is IMPLEMENTING with a blocking input — another fix run, or
+        # the bounded loop is done (D4/D5).
+        if fix_runs_used < max_fix_loops:
+            continue
+        stop = (
+            LoopStopReason.BUDGET_EXHAUSTED if max_fix_loops else LoopStopReason.LOOP_DISABLED
+        )
+        break
+
+    if stop in (LoopStopReason.BUDGET_EXHAUSTED, LoopStopReason.NO_WORKSPACE_CHANGE):
+        _persist_loop_record(
+            store,
+            writer,
+            task,
+            reason=stop,
+            fix_runs_used=fix_runs_used,
+            last_review_artifact_id=last_review_artifact_id,
+            last_fix_packet_artifact_id=last_fix_packet_artifact_id,
+            last_diff_artifact_id=last_diff_artifact_id,
+        )
 
     return BuildOutcome(
         task=task,
         ask=outcome,
+        planner=plan_outcome,
         diff_artifact_id=diff_artifact_id,
         tool_run_ids=tool_run_ids,
+        verification=verification_result,
         review=review_result,
+        attempts=attempts,
+        stop=stop,
     )
