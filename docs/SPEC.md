@@ -306,7 +306,8 @@ Agent'ların ürettiği kalıcı çıktı.
 * report,
 * test result,
 * architecture proposal,
-* review finding.
+* review finding,
+* deterministic fix packet.
 
 ---
 
@@ -1411,6 +1412,52 @@ Bu otomatik yürütme yalnızca kabul edilmiş (frozen) bir canonical planın
 varlığında başlar; tartışma-first akışında bu sınır insanın açık
 "plan freeze & execute" geçişidir (Appendix D.3).
 
+## P6.1 — Structured findings and deterministic fix packets (implemented slice)
+
+P6.1 delivers only the findings/fix-packet half of Phase 6: no fixer run,
+retry, loop count, resume, or post-fix verification is implied. The outer
+one-pass build remains `Plan → Implementer → Verification → Reviewer`, with
+the existing approval policy deciding what a valid PASS may close.
+
+Reviewer output is strictly versioned JSON (`relay.review.v1`): a `pass`
+verdict requires an empty `findings` array; `findings` requires at least one
+finding. Every finding blocks PASS. `severity` (`critical`, `high`, `medium`,
+`low`) is metadata only and never gates promotion, filtering, or packet
+inclusion. Prose, malformed/duplicate-key/oversized/deeply nested output,
+unsupported versions, contradictory verdicts, and extra fields are refused.
+
+For a valid review, Relay persists a canonical `REVIEW_FINDING` artifact whose
+`relay.review.record.v1` payload contains the report plus pinned source refs:
+the frozen plan, implementation run/diff, Relay-owned `TESTS_PASSED` evidence,
+`ToolRun`, `TEST_RESULT`, reviewer run, and raw reviewer `RUN_OUTPUT`. Artifact
+digests are SHA-256 over the exact persisted UTF-8 bytes. Generated structured
+payloads use the frozen canonical encoding `json.dumps(..., sort_keys=True,
+ensure_ascii=True, separators=(",", ":"), allow_nan=False)`; the same bytes are
+stored and hashed, and readers never normalize or reserialize them into a match.
+
+A findings report additionally produces one deterministic `FIX_PACKET`
+artifact (`relay.fix_packet.v1`) without another model call. The packet pins
+the review artifact ID/digest and all source IDs/digests, preserves finding
+order, and carries fixed instructions. It is proposed work only — not a patch,
+decision, plan revision, approval, or completion evidence. Source drift,
+foreign-task refs, wrong kinds/runs, failed verification provenance, missing
+content, or digest mismatches are refused.
+
+PASS promotion is atomic. Gated mode commits the canonical review,
+`REVIEW_PASSED`, the pending `Approval`, `APPROVAL_REQUESTED`, and
+`REVIEWING → APPROVAL_REQUIRED` in one transaction. Direct mode commits the
+canonical review, `REVIEW_PASSED`, `NO_PENDING_APPROVALS`, and `REVIEWING →
+DONE` in one transaction. Any failed write rolls back the entire promotion.
+Findings commit the canonical review, packet, artifact events, and
+`REVIEWING → IMPLEMENTING` together. Malformed output leaves the task at
+`REVIEWING` with a safe `relay.review.invalid.v1` `REPORT`; reviewer execution
+failure leaves durable run history and `REVIEWING` unchanged.
+
+Harness reviewers are always rebound to an explicit `READ_ONLY_ACCESS`
+profile, including a configured write/default profile or a missing profile.
+If the adapter cannot honor that profile, review fails closed before spawn.
+Provider-specific response vocabulary never enters the persisted contract.
+
 ## Bounded micro-interactions inside stages (Appendix D.6/D.11)
 
 Dış (outer) workflow yukarıdaki gibi birebir kalır; dispatch ve stage
@@ -2123,6 +2170,11 @@ REVIEWING → DONE                       (requires TESTS_PASSED
 * `CompletionPolicy.require_human_approval` defaults to **true**.
 * Relay may attest `NO_PENDING_APPROVALS` only when policy does not
   demand a human AND no approval request is pending.
+* A structured-review PASS commits with its resulting edge as one unit:
+  gated mode atomically writes the canonical review, `REVIEW_PASSED`, the
+  pending Approval, request event, and `REVIEWING → APPROVAL_REQUIRED`;
+  direct mode atomically writes the canonical review, `REVIEW_PASSED`,
+  `NO_PENDING_APPROVALS`, and `REVIEWING → DONE`.
 * Safety invariant: if policy requires human approval, DONE is
   unreachable without explicit `human:*`-produced approval evidence.
 

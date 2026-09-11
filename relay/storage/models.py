@@ -12,10 +12,20 @@ the schema contract.
 from __future__ import annotations
 
 import enum
+import re
 import uuid
 from datetime import UTC, datetime
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from relay.core.evidence import EvidenceKind
 from relay.core.permissions import Action
@@ -214,6 +224,7 @@ class ArtifactKind(str, enum.Enum):
     TEST_RESULT = "test_result"
     PROPOSAL = "proposal"
     REVIEW_FINDING = "review_finding"
+    FIX_PACKET = "fix_packet"
     #: Canonical record of what entered / came out of one agent run
     #: (SPEC Appendix B.1). Lifecycle events reference these instead of
     #: carrying prompt/response payloads, and remain pure lifecycle markers.
@@ -235,6 +246,202 @@ class Artifact(BaseModel):
     )
     content: str | None = Field(default=None, description="Inline content for small artifacts.")
     created_at: datetime = Field(default_factory=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# P6.1 structured review contracts — artifact payloads, not database rows.
+# ---------------------------------------------------------------------------
+
+_Digest = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
+_RequiredId = Annotated[StrictStr, Field(min_length=1)]
+_BoundedText = Annotated[StrictStr, Field(min_length=1, max_length=4_000)]
+
+
+def _nonblank(value: str) -> str:
+    if not value.strip():
+        raise ValueError("value must be nonblank")
+    return value
+
+
+class ReviewSeverity(str, enum.Enum):
+    """Reviewer-provided ordering metadata; never a blocking threshold."""
+
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class ReviewVerdict(str, enum.Enum):
+    PASS = "pass"
+    FINDINGS = "findings"
+
+
+class ReviewLocationPayload(BaseModel):
+    """Optional workspace-relative source hint authored by a reviewer."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    path: Annotated[StrictStr, Field(min_length=1, max_length=1_024)]
+    start_line: StrictInt | None = Field(default=None, ge=1, le=1_000_000)
+    end_line: StrictInt | None = Field(default=None, ge=1, le=1_000_000)
+
+    @field_validator("path")
+    @classmethod
+    def _workspace_relative_path(cls, value: str) -> str:
+        _nonblank(value)
+        if (
+            value != value.strip()
+            or "\\" in value
+            or value.startswith("/")
+            or re.match(r"^[A-Za-z]:", value)
+            or any(part in ("", ".", "..") for part in value.split("/"))
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        ):
+            raise ValueError("location.path must be a normalized workspace-relative '/' path")
+        return value
+
+    @model_validator(mode="after")
+    def _line_range(self) -> ReviewLocationPayload:
+        if self.end_line is not None and self.start_line is None:
+            raise ValueError("location.end_line requires location.start_line")
+        if (
+            self.start_line is not None
+            and self.end_line is not None
+            and self.end_line < self.start_line
+        ):
+            raise ValueError("location.end_line must not precede location.start_line")
+        return self
+
+
+class ReviewFindingPayload(BaseModel):
+    """One actionable finding in a ``relay.review.v1`` report."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: Annotated[StrictStr, Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")]
+    severity: ReviewSeverity
+    title: Annotated[StrictStr, Field(min_length=1, max_length=200)]
+    description: _BoundedText
+    requested_change: _BoundedText
+    validation_expectation: _BoundedText
+    location: ReviewLocationPayload | None = None
+
+    @field_validator("title", "description", "requested_change", "validation_expectation")
+    @classmethod
+    def _nonblank_text(cls, value: str) -> str:
+        return _nonblank(value)
+
+
+class ReviewReportPayload(BaseModel):
+    """The strict object a reviewer emits for ``relay.review.v1``."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.review.v1"]
+    verdict: ReviewVerdict
+    summary: _BoundedText
+    findings: tuple[ReviewFindingPayload, ...] = Field(max_length=100)
+
+    @field_validator("summary")
+    @classmethod
+    def _nonblank_summary(cls, value: str) -> str:
+        return _nonblank(value)
+
+    @model_validator(mode="after")
+    def _verdict_matches_findings(self) -> ReviewReportPayload:
+        if self.verdict is ReviewVerdict.PASS and self.findings:
+            raise ValueError("verdict 'pass' requires an empty findings list")
+        if self.verdict is ReviewVerdict.FINDINGS and not self.findings:
+            raise ValueError("verdict 'findings' requires at least one finding")
+        ids = [finding.id for finding in self.findings]
+        if len(ids) != len(set(ids)):
+            raise ValueError("finding ids must be unique")
+        return self
+
+
+class ReviewSubjectPayload(BaseModel):
+    """Pinned build inputs a review assessed; assigned only by Relay."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: _RequiredId
+    plan_run_id: _RequiredId
+    plan_artifact_id: _RequiredId
+    plan_digest: _Digest
+    implementation_run_id: _RequiredId
+    diff_artifact_id: _RequiredId
+    diff_digest: _Digest
+    verification_evidence_id: _RequiredId
+    verification_tool_run_id: _RequiredId
+    test_result_artifact_id: _RequiredId
+    test_result_digest: _Digest
+
+
+class ReviewSourcesPayload(BaseModel):
+    """Subject references plus the reviewer output that authored the review."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    subject: ReviewSubjectPayload
+    review_run_id: _RequiredId
+    review_output_artifact_id: _RequiredId
+    review_output_digest: _Digest
+
+
+class ReviewRecordPayload(BaseModel):
+    """Canonical ``REVIEW_FINDING`` content (``relay.review.record.v1``)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.review.record.v1"]
+    task_id: _RequiredId
+    report: ReviewReportPayload
+    sources: ReviewSourcesPayload
+
+    @model_validator(mode="after")
+    def _task_matches_sources(self) -> ReviewRecordPayload:
+        if self.task_id != self.sources.subject.task_id:
+            raise ValueError("review record task_id must match its pinned subject")
+        return self
+
+
+class FixPacketPayload(BaseModel):
+    """Canonical ``FIX_PACKET`` content (``relay.fix_packet.v1``)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.fix_packet.v1"]
+    task_id: _RequiredId
+    review_artifact_id: _RequiredId
+    review_digest: _Digest
+    summary: _BoundedText
+    sources: ReviewSourcesPayload
+    instructions: tuple[StrictStr, ...] = Field(min_length=1)
+    findings: tuple[ReviewFindingPayload, ...] = Field(min_length=1, max_length=100)
+
+    @field_validator("summary")
+    @classmethod
+    def _nonblank_packet_summary(cls, value: str) -> str:
+        return _nonblank(value)
+
+    @model_validator(mode="after")
+    def _task_matches_sources(self) -> FixPacketPayload:
+        if self.task_id != self.sources.subject.task_id:
+            raise ValueError("fix packet task_id must match its pinned subject")
+        return self
+
+
+class InvalidReviewDiagnosticPayload(BaseModel):
+    """Safe diagnostic report for a review run whose output failed validation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.review.invalid.v1"]
+    task_id: _RequiredId
+    code: _RequiredId
+    review_run_id: _RequiredId | None = None
+    review_output_artifact_id: _RequiredId | None = None
 
 
 class DecisionStatus(str, enum.Enum):

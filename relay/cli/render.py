@@ -292,6 +292,18 @@ def build_result(*, task, outcome, view=None) -> None:
         f"[dim]task {task.id[:8]}... | run {ask.run.id[:8]}... | {ask.run.status.value} | "
         f"{observations} observed harness events | {diff_note} | evidence recorded[/dim]"
     )
+    review = outcome.review
+    if review is not None:
+        detail = f"review {review.disposition.value}"
+        if review.review_artifact_id is not None:
+            detail += f" | review artifact {review.review_artifact_id[:8]}..."
+        if review.fix_packet_artifact_id is not None:
+            detail += f" | fix packet {review.fix_packet_artifact_id[:8]}..."
+        if review.finding_count:
+            detail += f" | {review.finding_count} finding(s)"
+        if review.reason_code is not None:
+            detail += f" | reason {review.reason_code}"
+        _out().print(f"[dim]{detail}[/dim]")
     _final_state_line(task, view)
 
 

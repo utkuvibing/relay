@@ -8,6 +8,7 @@ tests. Every run is offline and deterministic (``derandomize=True``).
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 
 import pytest
@@ -55,6 +56,7 @@ from relay.core.protocols import (
     StageRequestFact,
     evaluate_stage,
 )
+from relay.core.reviews import artifact_digest
 from relay.core.state_machine import (
     TRANSITIONS,
     IllegalTransitionError,
@@ -227,6 +229,16 @@ def test_evidence_provenance_is_enforced(kind, bad_producer):
 # ---------------------------------------------------------------------------
 # Deterministic identity / canonical encoding
 # ---------------------------------------------------------------------------
+
+
+@_GIVEN
+@given(content=st.text(alphabet=st.characters(exclude_categories=("Cs",)), max_size=256))
+def test_review_artifact_digest_hashes_exact_utf8_bytes(content):
+    """P6.1: persisted Unicode/newline bytes hash exactly; no normalization."""
+    assert artifact_digest(content) == hashlib.sha256(
+        content.encode("utf-8", errors="strict")
+    ).hexdigest()
+
 
 _IDENT = st.fixed_dictionaries(
     {

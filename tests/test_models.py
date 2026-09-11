@@ -19,6 +19,11 @@ from relay.storage.models import (
     EvidenceRecord,
     Message,
     MessageType,
+    ReviewFindingPayload,
+    ReviewLocationPayload,
+    ReviewReportPayload,
+    ReviewSeverity,
+    ReviewVerdict,
     Room,
     RoomMember,
     Run,
@@ -154,6 +159,53 @@ class TestMessageAndEventLog:
         )
         assert entry.sequence is None  # store assigns it on insert
         assert entry.references == ["src/foo.py:42-71"]
+
+
+class TestStructuredReviewPayloads:
+    """P6.1 domain payload vocabulary is strict and provider-neutral."""
+
+    def test_report_payload_is_strict_and_frozen(self):
+        finding = ReviewFindingPayload(
+            id="F1",
+            severity=ReviewSeverity.LOW,
+            title="Issue",
+            description="What is wrong.",
+            requested_change="What to change.",
+            validation_expectation="How it is checked.",
+            location=ReviewLocationPayload(path="src/app.py", start_line=1),
+        )
+        report = ReviewReportPayload(
+            schema_version="relay.review.v1",
+            verdict=ReviewVerdict.FINDINGS,
+            summary="Needs work.",
+            findings=(finding,),
+        )
+        assert report.findings[0].severity is ReviewSeverity.LOW
+        with pytest.raises(ValidationError):
+            report.summary = "mutate"  # type: ignore[misc]
+
+    def test_report_rejects_extra_fields_and_nonstrict_types(self):
+        with pytest.raises(ValidationError):
+            ReviewReportPayload.model_validate(
+                {
+                    "schema_version": "relay.review.v1",
+                    "verdict": "pass",
+                    "summary": "ok",
+                    "findings": [],
+                    "provider_note": "vendor-specific",
+                }
+            )
+        with pytest.raises(ValidationError):
+            ReviewLocationPayload.model_validate(
+                {"path": "src/app.py", "start_line": "3"}
+            )
+        with pytest.raises(ValidationError):
+            ReviewLocationPayload.model_validate(
+                {"path": "src/app.py", "start_line": True}
+            )
+
+    def test_fix_packet_kind_is_additive(self):
+        assert ArtifactKind.FIX_PACKET.value == "fix_packet"
 
 
 class TestSystemEventsAreDistinctFromConversation:
