@@ -197,54 +197,7 @@ class _FakeImplementer(HarnessAgent):
         return list(getattr(self, "_last_observations", []) or [])
 
 
-@pytest.fixture()
-def git_repo(tmp_path):
-    """A real git repo with one committed file (build target workspace)."""
-    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
-    subprocess.run(
-        ["git", "-C", str(tmp_path), "config", "user.email", "test@relay.local"],
-        capture_output=True,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(tmp_path), "config", "user.name", "Relay Tests"],
-        capture_output=True,
-        check=True,
-    )
-    (tmp_path / "README.md").write_text("# fixture repo\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(tmp_path), "add", "."], capture_output=True, check=True)
-    subprocess.run(
-        ["git", "-C", str(tmp_path), "commit", "-m", "init"],
-        cwd=tmp_path,
-        capture_output=True,
-        check=True,
-    )
-    return tmp_path
-
-
-@pytest.fixture()
-def build_workspace(git_repo, monkeypatch):
-    """Initialized Relay workspace inside the git repo, configured harness agent."""
-    monkeypatch.chdir(git_repo)
-    # Pin the fake harness binary to this Python interpreter (json.dumps
-    # escapes Windows path separators for valid YAML).
-    import sys as _sys
-
-    executable = json.dumps(_sys.executable)
-    # Write relay.yaml directly (schema-stable) instead of relying on helpers.
-    (git_repo / "relay.yaml").write_text(
-        "agents:\n"
-        "  impl:\n"
-        "    backend: harness\n"
-        "    adapter: fake_implementer_build\n"
-        "    harness:\n"
-        f"      executable_path: {executable}\n"
-        "      grant: workspace_write\n"
-        "      timeout_seconds: 60\n",
-        encoding="utf-8",
-    )
-    runner.invoke(app, ["init"])
-    return git_repo
+# git_repo / build_workspace fixtures live in conftest.py (P6.3 shares them).
 
 
 class TestBuildFlowHappyPath:
@@ -1630,9 +1583,9 @@ class TestBaselineIsolation:
         file:`` line. Frozen membership keeps it tracked; the rendered diff
         uses a bounded marker and the raw-byte digest still sees the change.
         """
-        from relay.core import orchestrator
+        from relay.core import baseline as _baseline
 
-        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        monkeypatch.setattr(_baseline, "_BASELINE_FILE_CAP_BYTES", 64)
         gate = PermissionGate()
         ws = tmp_path / "ws"
         ws.mkdir()
@@ -1662,9 +1615,9 @@ class TestBaselineIsolation:
         line. Frozen membership keeps it deliberately untracked, and the
         digest is unchanged by invisible bytes.
         """
-        from relay.core import orchestrator
+        from relay.core import baseline as _baseline
 
-        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        monkeypatch.setattr(_baseline, "_BASELINE_FILE_CAP_BYTES", 64)
         gate = PermissionGate()
         ws = tmp_path / "ws"
         ws.mkdir()
@@ -1688,9 +1641,9 @@ class TestBaselineIsolation:
         A new oversized file never enters the tracked set (bounded scanning),
         and the rule is deterministic: every scan reaches the same verdict.
         """
-        from relay.core import orchestrator
+        from relay.core import baseline as _baseline
 
-        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        monkeypatch.setattr(_baseline, "_BASELINE_FILE_CAP_BYTES", 64)
         gate = PermissionGate()
         ws = tmp_path / "ws"
         ws.mkdir()
@@ -1713,9 +1666,9 @@ class TestBaselineIsolation:
         oversized marker, and the digest sees the real byte change — all
         without the file's contents ever entering memory.
         """
-        from relay.core import orchestrator
+        from relay.core import baseline as _baseline
 
-        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        monkeypatch.setattr(_baseline, "_BASELINE_FILE_CAP_BYTES", 64)
         gate = PermissionGate()
         ws = tmp_path / "ws"
         ws.mkdir()
@@ -1748,9 +1701,9 @@ class TestBaselineIsolation:
         """Streamed identity is stable: same oversized state → same digest,
         different oversized bytes → different digest (no-progress exactness).
         """
-        from relay.core import orchestrator
+        from relay.core import baseline as _baseline
 
-        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        monkeypatch.setattr(_baseline, "_BASELINE_FILE_CAP_BYTES", 64)
         gate = PermissionGate()
         ws = tmp_path / "ws"
         ws.mkdir()

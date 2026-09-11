@@ -1468,9 +1468,9 @@ Provider-specific response vocabulary never enters the persisted contract.
 P6.2 executes the fix half of Phase 6 inside one `relay build` invocation:
 review findings or a failed verification re-enter `IMPLEMENTING` and dispatch
 a bounded number of fix runs through the same configured implementer agent
-(`role=IMPLEMENTER`, same crash-safe run spine). Resume/`relay continue`,
-re-driving parked tasks, micro-interactions inside stages, reviewer retry,
-and new task states remain deferred.
+(`role=IMPLEMENTER`, same crash-safe run spine). Resume/`relay continue`
+lands in P6.3; micro-interactions inside stages, reviewer retry, and new
+task states remain deferred.
 
 A fix run is grounded in the pending blocking input — the canonical
 `FIX_PACKET` after findings, or the failed `TEST_RESULT` after a failed exam —
@@ -1507,6 +1507,59 @@ Reviewer process failure or malformed output still parks at `REVIEWING`
 with no retry, inside the loop exactly as in P6.1. Interruption is
 boundary-only: stop conditions are evaluated at stage boundaries, never
 mid-run.
+
+## P6.3 — Resume parked builds: `relay continue` (implemented slice)
+
+P6.3 re-drives a parked build from durable ledger state:
+
+```bash
+relay continue [TASK_ID] [--settle-interrupted]
+```
+
+`TASK_ID` may be omitted (the most recent non-DONE task is selected) or a
+unique prefix. Terminal tasks refuse; a task awaiting human approval
+refuses and points at `relay approve`. Micro-interactions inside stages,
+reviewer retry, and new task states remain deferred.
+
+The build driver is a single resumable state machine shared by `relay
+build` and `relay continue`. At every stage boundary it derives the next
+action from the ledger — context, plan, DIFF, evidence, verification,
+review, approval — and either advances an already-persisted boundary
+without dispatching an agent, or runs the missing stage. A crash between
+two boundary writes therefore resumes exactly, never duplicates work.
+
+`budget.max_fix_loops` is cumulative across invocations and is consulted
+at exactly one point: immediately before dispatching a NEW
+implementation/fix run. Advancing a persisted boundary, verifying an
+existing DIFF, re-running review, and PASS promotion never consume
+budget. `relay continue` refuses pre-execution with `budget_exhausted`
+only when the derived next action is a real new dispatch and the budget
+is spent.
+
+Build provenance is explicit: every build-dispatched run (planner,
+implementer/fix, reviewer) commits a `BUILD_RUN_DISPATCHED` event
+(`sender="relay:build"`, `build_stage:<plan|implement|fix|review>`,
+task/run refs) atomically inside the run's first transaction. Attempt
+counts and `--settle-interrupted` consider only marker-bound runs;
+P4 `MESSAGE_DELIVERED`-bound runs are ignored; a task-scoped run bound
+by neither marker refuses as `unattributed_runs`. Without the flag, an
+interrupted build-owned `RUNNING` row refuses the resume.
+
+The pre-implementation workspace baseline is durable: content-addressed
+blobs plus a canonical manifest under `.relay/baselines/<task_id>/`,
+published crash-safely (staging dir → per-file fsync → atomic rename →
+parent-dir fsync on POSIX), then pinned by a `relay.build.baseline.v1`
+REPORT carrying the manifest digest. `continue` verifies the pin, the
+manifest, and every blob before trusting it — missing, corrupt, or
+tampered data fails closed with zero ledger writes. A pin-less leftover
+snapshot is replaceable only before the first implementation attempt.
+
+The original build request is persisted as `relay.build.request.v1`
+(prompt + pinned implementer identity and model). Resume uses the pinned
+implementer/model, but *current* `relay.yaml` verification, reviewer,
+approval, and budget policy. A `DIFF` artifact and its
+`IMPLEMENTATION_PRODUCED` evidence mint atomically — a crash can leave
+neither, never a DIFF without evidence.
 
 ## Bounded micro-interactions inside stages (Appendix D.6/D.11)
 

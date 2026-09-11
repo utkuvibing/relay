@@ -468,6 +468,97 @@ class BuildLoopRecordPayload(BaseModel):
     last_diff_artifact_id: _RequiredId | None = None
 
 
+# ---------------------------------------------------------------------------
+# P6.3 resume contracts — artifact payloads and the on-disk baseline manifest.
+# ---------------------------------------------------------------------------
+
+
+class BuildRequestRecordPayload(BaseModel):
+    """Durable ``relay.build.request.v1`` record of one build (P6.3).
+
+    Persisted as a ``REPORT`` artifact at build start: ``Task.title`` only
+    keeps ``prompt[:200]``, so resume needs the full prompt and the pinned
+    implementer identity/model durably. A stored fact only — it mints no
+    evidence and no transition.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.build.request.v1"]
+    task_id: _RequiredId
+    prompt: Annotated[StrictStr, Field(min_length=1)]
+    implementer: _RequiredId
+    model: StrictStr | None = None
+
+    @field_validator("prompt")
+    @classmethod
+    def _nonblank_prompt(cls, value: str) -> str:
+        return _nonblank(value)
+
+
+def _workspace_rel_path(value: str) -> str:
+    """Normalized workspace-relative '/' path (review-location contract)."""
+    _nonblank(value)
+    if (
+        value != value.strip()
+        or "\\" in value
+        or value.startswith("/")
+        or re.match(r"^[A-Za-z]:", value)
+        or any(part in ("", ".", "..") for part in value.split("/"))
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise ValueError("expected a normalized workspace-relative '/' path")
+    return value
+
+
+class BuildBaselineManifestPayload(BaseModel):
+    """On-disk manifest of one durable build baseline (P6.3).
+
+    Lives at ``.relay/baselines/<task_id>/manifest.json``; ``files`` maps a
+    workspace-relative path to the SHA-256 naming its blob under
+    ``blobs/``. ``oversized_paths`` preserves membership metadata for
+    pre-existing files left untracked by the size bound.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.build.baseline.manifest.v1"]
+    task_id: _RequiredId
+    files: dict[StrictStr, _Digest]
+    oversized_paths: tuple[StrictStr, ...] = ()
+
+    @field_validator("files")
+    @classmethod
+    def _file_paths(cls, value: dict[str, str]) -> dict[str, str]:
+        for path in value:
+            _workspace_rel_path(path)
+        return value
+
+    @field_validator("oversized_paths")
+    @classmethod
+    def _oversized_are_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for path in value:
+            _workspace_rel_path(path)
+        return value
+
+
+class BuildBaselineRecordPayload(BaseModel):
+    """Ledger pin for the durable build baseline (``relay.build.baseline.v1``).
+
+    Written as a ``REPORT`` artifact only after the snapshot under
+    ``.relay/baselines/<task_id>/`` is fully published; resume verifies the
+    pin against the manifest digest and every blob before trusting it.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.build.baseline.v1"]
+    task_id: _RequiredId
+    manifest_digest: _Digest
+    file_count: StrictInt = Field(ge=0)
+    oversized_count: StrictInt = Field(ge=0)
+
+
 class DecisionStatus(str, enum.Enum):
     PROPOSED = "proposed"
     ACCEPTED = "accepted"
@@ -562,6 +653,13 @@ class EventType(str, enum.Enum):
     #: the delivery run's pre-provider Tx1; retained for failed runs (the
     #: outcome lives on the Run row + AGENT_RUN_FINISHED).
     MESSAGE_DELIVERED = "message_delivered"
+    #: P6.3: build-dispatch BINDING marker — Relay bound a build-owned run
+    #: to a build stage (plan/implement/fix/review). Committed atomically in
+    #: the run's pre-provider Tx1 via ``pre_provider``; retained for failed
+    #: or cancelled runs (the outcome lives on the Run row). This is the
+    #: provenance resume counts attempts and settles interrupted runs by —
+    #: never ``task_id + role``, which P4 delivery also produces.
+    BUILD_RUN_DISPATCHED = "build_run_dispatched"
     PROTOCOL_OUTCOME_RECORDED = "protocol_outcome_recorded"
 
 

@@ -285,6 +285,148 @@ def build(
     build_result(task=outcome.task, outcome=outcome, view=view)
 
 
+@app.command(name="continue")
+def continue_(
+    task_id: str | None = typer.Argument(
+        None, help="Task id (or unique prefix). Omitted: most recent non-done task."
+    ),
+    settle_interrupted: bool = typer.Option(
+        False,
+        "--settle-interrupted",
+        help="Mark build-owned interrupted runs CANCELLED before resuming.",
+    ),
+) -> None:
+    """Resume a parked build from durable ledger state (P6.3).
+
+    The pinned implementer + model come from the build's durable request
+    record; verification, reviewer, approval, and budget come from the
+    CURRENT relay.yaml. Refusals are pre-execution — they persist nothing.
+    """
+    from relay.cli.render import build_result
+    from relay.core.build_ledger import ContinueRefusal, derive_position
+    from relay.core.orchestrator import BuildRefusal, continue_build
+    from relay.storage.store import SqliteEvidenceStore
+
+    root = Path.cwd()
+    try:
+        config = load_config(root)
+        conn = _open_db(root)
+        try:
+            store = SqliteRelayStore(conn)
+            writer = EventLogWriter(conn)
+            evidence_store = SqliteEvidenceStore(store)
+
+            if task_id is not None:
+                task = _resolve_task(store, task_id)
+            else:
+                task = next(
+                    (
+                        t
+                        for t in store.all_models(
+                            Task, order_by="created_at DESC, rowid DESC"
+                        )
+                        if t.state is not TaskState.DONE
+                    ),
+                    None,
+                )
+                if task is None:
+                    raise ConfigError("no parked task to continue")
+            if task.state is TaskState.DONE:
+                raise ContinueRefusal(
+                    "terminal", f"task '{task.id}' is already done — nothing to resume"
+                )
+            if task.state is TaskState.APPROVAL_REQUIRED:
+                raise ContinueRefusal(
+                    "awaiting_approval",
+                    f"task '{task.id}' awaits human approval — "
+                    f"'relay approve {task.id} --by <name>' closes it",
+                )
+            position = derive_position(store, evidence_store, task.id)
+            if (
+                position.in_flight_runs or position.in_flight_tool_runs
+            ) and not settle_interrupted:
+                ids = [r.id for r in position.in_flight_runs] + [
+                    tr.id for tr in position.in_flight_tool_runs
+                ]
+                raise ContinueRefusal(
+                    "run_in_flight",
+                    f"task '{task.id}' has interrupted build-owned runs "
+                    f"({', '.join(ids)}) — pass --settle-interrupted to mark "
+                    "them cancelled and resume",
+                )
+            # A first-ever baseline capture demands the same clean-worktree
+            # rule as `relay build`; a pinned baseline permits the parked
+            # (possibly dirty) workspace — the baseline IS its reference.
+            if position.needs_baseline_capture and not _worktree_is_clean(root):
+                _out().print(
+                    "[red]ERROR[/red] working tree has uncommitted changes and no "
+                    "durable baseline exists — commit or stash them first "
+                    "(diff integrity)"
+                )
+                raise typer.Exit(code=1)
+
+            request = position.request
+            agent_cfg = agent_config(config, request.implementer)
+            settings = resolve_settings(
+                cli=CliOverrides(model=request.model), yaml_agent=agent_cfg
+            )
+            implementer = build_agent(
+                request.implementer, settings, agent_cfg, workspace_root=root
+            )
+            reviewer = None
+            reviewer_settings = None
+            if config.reviewer is not None:
+                reviewer_cfg = agent_config(config, config.reviewer)
+                reviewer_settings = resolve_settings(
+                    cli=CliOverrides(), yaml_agent=reviewer_cfg
+                )
+                reviewer = build_agent(
+                    config.reviewer, reviewer_settings, reviewer_cfg, workspace_root=root
+                )
+            outcome = asyncio.run(
+                continue_build(
+                    store,
+                    writer,
+                    evidence_store,
+                    implementer,
+                    task.id,
+                    workspace_root=root,
+                    model=settings.model,
+                    agent_name=request.implementer,
+                    verification=config.verification,
+                    reviewer=reviewer,
+                    reviewer_name=config.reviewer,
+                    reviewer_model=(
+                        None if reviewer_settings is None else reviewer_settings.model
+                    ),
+                    approval=config.approval,
+                    budget=config.budget,
+                    settle_interrupted=settle_interrupted,
+                )
+            )
+            from relay.cli.taskview import build_task_view
+
+            view = build_task_view(
+                task=outcome.task,
+                evidence_store=evidence_store,
+                events=writer.all(),
+                approvals=list(store.all_models(Approval)),
+            )
+        finally:
+            conn.close()
+    except (
+        ConfigError,
+        AgentError,
+        AgentNotConfigured,
+        UnknownAgentError,
+        BuildRefusal,
+    ) as exc:
+        _out().print(f"[red]ERROR[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    build_result(task=outcome.task, outcome=outcome, view=view)
+
+
 @app.command()
 def approve(
     task_id: str = typer.Argument(..., help="The task awaiting completion approval."),
