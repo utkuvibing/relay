@@ -16,6 +16,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -1702,6 +1703,71 @@ class TestBaselineIsolation:
         assert digest == _workspace_state_digest({})
         _, digest2 = _diff_and_state_against_baseline(gate, ws, "task", baseline)
         assert digest2 == digest
+
+    def test_oversized_tracked_member_is_streamed_not_read_wholesale(
+        self, tmp_path, monkeypatch
+    ):
+        """Bounded I/O: an oversized contract member never hits read_bytes.
+
+        Membership stays tracked, the rendered DIFF carries the bounded
+        oversized marker, and the digest sees the real byte change — all
+        without the file's contents ever entering memory.
+        """
+        from relay.core import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        gate = PermissionGate()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        big = ws / "big.dat"
+        big.write_bytes(b"a" * 60)  # under cap → tracked member
+
+        baseline = _capture_baseline(ws)
+        big.write_bytes(b"b" * 100)  # grown past cap
+
+        read_calls: list[Path] = []
+        real_read_bytes = Path.read_bytes
+
+        def _spy(self: Path) -> bytes:
+            read_calls.append(self)
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", _spy)
+
+        diff, digest = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert "oversized file big.dat differs" in diff
+        assert "deleted file" not in diff
+        assert digest != _workspace_state_digest(baseline.files)
+        # The whole point of the fix: the oversized member was streamed,
+        # never loaded wholesale through read_bytes.
+        assert big not in read_calls
+
+    def test_oversized_tracked_member_digest_is_deterministic_and_exact(
+        self, tmp_path, monkeypatch
+    ):
+        """Streamed identity is stable: same oversized state → same digest,
+        different oversized bytes → different digest (no-progress exactness).
+        """
+        from relay.core import orchestrator
+
+        monkeypatch.setattr(orchestrator, "_BASELINE_FILE_CAP_BYTES", 64)
+        gate = PermissionGate()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        big = ws / "big.dat"
+        big.write_bytes(b"a" * 60)
+
+        baseline = _capture_baseline(ws)
+        big.write_bytes(b"b" * 100)  # oversized member, state 1
+
+        _, digest1 = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        _, digest2 = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert digest1 == digest2  # unchanged oversized state → no-progress
+
+        big.write_bytes(b"c" * 100)  # same size, different bytes, still over cap
+        diff3, digest3 = _diff_and_state_against_baseline(gate, ws, "task", baseline)
+        assert digest3 != digest1  # streamed SHA-256 sees the change
+        assert "oversized file big.dat differs" in diff3
 
 
 # ---------------------------------------------------------------------------

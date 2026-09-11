@@ -351,6 +351,21 @@ def _workspace_path_is_excluded(rel: Path) -> bool:
 
 
 @dataclass(frozen=True)
+class _TrackedFileState:
+    """State of one tracked workspace path (P6.2).
+
+    ``sha256`` is the file's content identity — always present. ``content``
+    is resident only when the file is within the size bound; an oversized
+    tracked member streams its SHA-256 in bounded chunks and keeps
+    ``content=None``, so membership survives growth without ever loading
+    the file wholesale.
+    """
+
+    sha256: str
+    content: bytes | None
+
+
+@dataclass(frozen=True)
 class _WorkspaceBaseline:
     """Frozen tracked-set contract for one build (P6.2).
 
@@ -362,7 +377,7 @@ class _WorkspaceBaseline:
     deletion or creation.
     """
 
-    files: dict[str, bytes]
+    files: dict[str, _TrackedFileState]
     oversized_paths: frozenset[str]
 
 
@@ -375,7 +390,7 @@ def _capture_baseline(root: Path) -> _WorkspaceBaseline:
     stable membership contract and pre-existing files are never
     re-adjudicated.
     """
-    files: dict[str, bytes] = {}
+    files: dict[str, _TrackedFileState] = {}
     oversized: set[str] = set()
     for path in sorted(root.rglob("*")):
         if not path.is_file():
@@ -388,24 +403,38 @@ def _capture_baseline(root: Path) -> _WorkspaceBaseline:
             if path.stat().st_size > _BASELINE_FILE_CAP_BYTES:
                 oversized.add(name)
                 continue
-            files[name] = path.read_bytes()
+            content = path.read_bytes()
+            files[name] = _TrackedFileState(
+                sha256=hashlib.sha256(content).hexdigest(), content=content
+            )
         except OSError:
             continue
     return _WorkspaceBaseline(files=files, oversized_paths=frozenset(oversized))
 
 
+def _sha256_file(path: Path) -> str:
+    """Bounded streaming SHA-256 — never loads the file wholesale."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(_STREAM_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _tracked_workspace_files(
     root: Path, baseline: _WorkspaceBaseline
-) -> dict[str, bytes]:
+) -> dict[str, _TrackedFileState]:
     """Read the current tracked workspace under the baseline's contract.
 
     Membership is frozen at baseline for pre-existing files: a contract
-    member is always read (growth past the cap can never fake a deletion);
-    a baseline-oversized path stays untracked (shrinkage can never fake a
-    creation). Files first created after the baseline keep the bounded-size
-    policy — deterministic per scan.
+    member stays tracked whatever it grows to (growth past the cap can
+    never fake a deletion); a baseline-oversized path stays untracked
+    (shrinkage can never fake a creation). Membership is separate from
+    content residency — an oversized contract member's SHA-256 is STREAMED
+    in bounded chunks and its bytes never enter memory; files first created
+    after the baseline keep the bounded-size policy, deterministic per scan.
     """
-    files: dict[str, bytes] = {}
+    files: dict[str, _TrackedFileState] = {}
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -416,37 +445,47 @@ def _tracked_workspace_files(
         if name in baseline.oversized_paths:
             continue
         try:
-            if (
-                name not in baseline.files
-                and path.stat().st_size > _BASELINE_FILE_CAP_BYTES
-            ):
+            if path.stat().st_size > _BASELINE_FILE_CAP_BYTES:
+                if name not in baseline.files:
+                    continue  # post-baseline files stay bounded
+                # Oversized contract member: stream identity, keep no bytes.
+                files[name] = _TrackedFileState(
+                    sha256=_sha256_file(path), content=None
+                )
                 continue
-            files[name] = path.read_bytes()
+            content = path.read_bytes()
+            files[name] = _TrackedFileState(
+                sha256=hashlib.sha256(content).hexdigest(), content=content
+            )
         except OSError:
             continue
     return files
 
 
-def _workspace_state_digest(files: dict[str, bytes]) -> str:
+def _workspace_state_digest(files: dict[str, _TrackedFileState]) -> str:
     """Collision-safe identity of the tracked workspace state (P6.2).
 
     Rendered diff text is a human-readable representation — binary files
     collapse to ``Binary files <path> differ`` and lossy UTF-8 replacement
     decoding can make distinct raw bytes render identically. No-progress
-    decisions therefore hash the raw state: sorted normalized paths paired
-    with each file's raw SHA-256; presence and deletion are structural
-    (a path absent from the map can never alias into the digest).
+    decisions therefore hash the tracked identity: sorted normalized paths
+    paired with each file's SHA-256 (streamed for oversized members — raw
+    bytes are never required to be resident); presence and deletion are
+    structural (a path absent from the map can never alias into the digest).
     """
     state = hashlib.sha256()
     for name in sorted(files):
         state.update(name.encode("utf-8"))
         state.update(b"\x00")
-        state.update(hashlib.sha256(files[name]).digest())
+        state.update(files[name].sha256.encode("ascii"))
         state.update(b"\x00")
     return state.hexdigest()
 
 
-def _render_workspace_diff(baseline: dict[str, bytes], current_files: dict[str, bytes]) -> str:
+def _render_workspace_diff(
+    baseline: dict[str, _TrackedFileState],
+    current_files: dict[str, _TrackedFileState],
+) -> str:
     """Human-readable cumulative diff between two tracked snapshots."""
     changed_paths: set[str] = set()
     for name, before in baseline.items():
@@ -460,24 +499,30 @@ def _render_workspace_diff(baseline: dict[str, bytes], current_files: dict[str, 
     for name in sorted(changed_paths):
         before = baseline.get(name)
         after = current_files.get(name)
+        before_bytes = before.content if before is not None else None
+        after_bytes = after.content if after is not None else None
 
         def _text(blob: bytes | None) -> str:
             return blob.decode("utf-8", errors="replace") if blob is not None else ""
 
-        is_binary_before = before is not None and b"\x00" in before[:_BINARY_SNIFF_BYTES]
-        is_binary_after = after is not None and b"\x00" in after[:_BINARY_SNIFF_BYTES]
+        is_binary_before = before_bytes is not None and b"\x00" in before_bytes[
+            :_BINARY_SNIFF_BYTES
+        ]
+        is_binary_after = after_bytes is not None and b"\x00" in after_bytes[
+            :_BINARY_SNIFF_BYTES
+        ]
         if is_binary_before or is_binary_after:
             lines.append(f"Binary files {name} differ")
             continue
-        if after is not None and len(after) > _BASELINE_FILE_CAP_BYTES:
-            # Contract member grown past the display bound — report the
-            # change honestly without a multi-MB unified diff; raw bytes
-            # still feed the state digest, so no-progress stays exact.
+        if after is not None and after.content is None:
+            # Oversized contract member — bounded marker instead of a
+            # multi-MB unified diff; its streamed SHA-256 still feeds the
+            # state digest, so no-progress stays exact.
             lines.append(f"oversized file {name} differs")
             continue
 
-        before_text = _text(before).splitlines(keepends=True)
-        after_text = _text(after).splitlines(keepends=True)
+        before_text = _text(before_bytes).splitlines(keepends=True)
+        after_text = _text(after_bytes).splitlines(keepends=True)
         if before is None:
             lines.append(f"new file: {name}")
         elif after is None:
@@ -524,6 +569,7 @@ def _diff_and_state_against_baseline(
 
 _BASELINE_FILE_CAP_BYTES = 4 * 1024 * 1024
 _BINARY_SNIFF_BYTES = 8000
+_STREAM_CHUNK_BYTES = 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
