@@ -1479,10 +1479,13 @@ original request. Every attempt re-diffs the workspace against the one frozen
 pre-implementation baseline (a later PASS certifies the cumulative change,
 never just the last delta), is re-verified by the Relay-owned command, and is
 re-reviewed with rebuilt `ReviewInputs` so the review pins that attempt's
-exact run/diff/tool/evidence ids. A run producing an empty diff — or a
-byte-identical cumulative diff to the previous attempt — mints no DIFF and
-no `IMPLEMENTATION_PRODUCED`; identical state is the deterministic §24
-"no new evidence" stop.
+exact run/diff/tool/evidence ids. A run producing an empty diff — or a raw
+workspace state identical to the previous attempt — mints no DIFF and no
+`IMPLEMENTATION_PRODUCED`. No-progress compares a canonical SHA-256 digest
+of sorted paths + raw file bytes, never rendered diff text (binary and
+lossy-decode differences must not alias into a false stop). Baseline
+capture, post-run snapshots, and the state digest share one exclusion set:
+`.git`, `.relay`, `node_modules`, `__pycache__`.
 
 The bound is `budget.max_fix_loops` (default `3`; `0` preserves the P6.2-free
 one-pass behavior). P6.2 recognizes only that key: the other §23 fields

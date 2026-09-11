@@ -458,8 +458,10 @@ class BuildLoopRecordPayload(BaseModel):
 
     schema_version: Literal["relay.build.loop.v1"]
     task_id: _RequiredId
-    #: One LoopStopReason value (orchestrator vocabulary, not persisted enum).
-    reason: _RequiredId
+    #: Only the two stop reasons P6.2 ever persists — the rest of the
+    #: orchestrator's stop vocabulary (pass_promoted, run_failed, ...)
+    #: never becomes a stored observation.
+    reason: Literal["budget_exhausted", "no_workspace_change"]
     fix_runs_used: StrictInt = Field(ge=0)
     last_review_artifact_id: _RequiredId | None = None
     last_fix_packet_artifact_id: _RequiredId | None = None

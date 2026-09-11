@@ -262,6 +262,29 @@ class TestBuildLoopRecordPayload:
                 }
             )
 
+    def test_reason_vocabulary_is_strict(self):
+        """Only the two persisted loop stops validate — nothing else."""
+        for reason in ("budget_exhausted", "no_workspace_change"):
+            payload = BuildLoopRecordPayload.model_validate(
+                {
+                    "schema_version": "relay.build.loop.v1",
+                    "task_id": "task-1",
+                    "reason": reason,
+                    "fix_runs_used": 0,
+                }
+            )
+            assert payload.reason == reason
+        for rejected in ("banana", "pass_promoted", "review_blocked", ""):
+            with pytest.raises(ValidationError):
+                BuildLoopRecordPayload.model_validate(
+                    {
+                        "schema_version": "relay.build.loop.v1",
+                        "task_id": "task-1",
+                        "reason": rejected,
+                        "fix_runs_used": 0,
+                    }
+                )
+
 
 class TestSystemEventsAreDistinctFromConversation:
     """App. A.2: the event log speaks system vocabulary; MessageType stays conversational."""

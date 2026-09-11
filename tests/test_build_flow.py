@@ -16,6 +16,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from typing import ClassVar
 
 import pytest
 from typer.testing import CliRunner
@@ -24,12 +25,13 @@ from relay.agents.base import AgentRequest, AgentRole, ToolObservation
 from relay.agents.config import AgentSettings
 from relay.agents.registry import transient_adapters
 from relay.cli.main import app
-from relay.context.config import HarnessAgentConfig
+from relay.context.config import HarnessAgentConfig, VerificationConfig
 from relay.core.evidence import EvidenceKind
 from relay.core.orchestrator import (
     BuildRefusal,
+    LoopStopReason,
     _capture_baseline,
-    _diff_against_baseline,
+    _diff_and_state_against_baseline,
     _open_approval_gate,
     _reviewer_for,
     advance_task,
@@ -1605,8 +1607,8 @@ class TestBaselineIsolation:
         (ws_a / "keep.txt").write_text("a-changed\n", encoding="utf-8")
         (ws_a / "new.txt").write_text("a-new\n", encoding="utf-8")
 
-        diff_a = _diff_against_baseline(gate, ws_a, "task-a", baseline_a)
-        diff_b = _diff_against_baseline(gate, ws_b, "task-b", baseline_b)
+        diff_a, _ = _diff_and_state_against_baseline(gate, ws_a, "task-a", baseline_a)
+        diff_b, _ = _diff_and_state_against_baseline(gate, ws_b, "task-b", baseline_b)
 
         # A's diff reflects only A's own delta — under the global handoff,
         # B's baseline would have made "keep.txt" look new and "bfile.txt"
@@ -1693,15 +1695,28 @@ if "You are the reviewer" in data:
                       "item": {"id": "m", "type": "agent_message", "text": review_text}}))
     print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 6, "output_tokens": 2}}))
     sys.exit(0)
-# implementation / fix leg — fix runs write distinct content per dispatch
-# unless --identical-fix forces a byte-identical (no-progress) workspace.
-if "fix attempt" in data and "--identical-fix" not in argv:
+# implementation / fix leg — flags shape the workspace write:
+#   --fix-crash      fix runs exit nonzero (durable run failure, no retry)
+#   --noop           write nothing at all (no-op run → no diff, no evidence)
+#   --binary         distinct BINARY bytes per dispatch — every attempt
+#                    renders the same 'Binary files differ' text, so only
+#                    the raw state digest can tell real progress
+#   --identical-fix  fix runs rewrite identical bytes (true no-progress)
+if "fix attempt" in data and "--fix-crash" in argv:
+    sys.exit(9)
+if "--noop" in argv:
+    pass
+elif "--binary" in argv:
     n = _bump(fix_counter)
-    body = "implemented by fake harness - fix pass %d\n" % n
+    with open("implemented.bin", "wb") as handle:
+        handle.write(b"\x00\x01 binary-state-%d \xff\xfe\x00" % n)
+elif "fix attempt" in data and "--identical-fix" not in argv:
+    n = _bump(fix_counter)
+    with open("implemented.txt", "w", encoding="utf-8") as handle:
+        handle.write("implemented by fake harness - fix pass %d\n" % n)
 else:
-    body = "implemented by fake harness\n"
-with open("implemented.txt", "w", encoding="utf-8") as handle:
-    handle.write(body)
+    with open("implemented.txt", "w", encoding="utf-8") as handle:
+        handle.write("implemented by fake harness\n")
 print(json.dumps({"type": "thread.started", "thread_id": "t-build"}))
 print(json.dumps({"type": "item.completed",
                   "item": {"id": "m", "type": "agent_message", "text": "done: wrote implemented.txt"}}))
@@ -1726,10 +1741,31 @@ def _loop_implementer(tmp_path, *argv_flags):
     )
 
     class _Loop(_FakeImplementer):
+        # Every AgentRequest this class serves (impl, fix, planner, and
+        # reviewer instances alike — _planner_for/_reviewer_for rebind via
+        # type(agent)) lands here for assertions on prompt/context_refs.
+        seen_requests: ClassVar[list[AgentRequest]] = []
+
+        async def run(self, request):
+            type(self).seen_requests.append(request)
+            return await super().run(request)
+
         def invocation_argv(self, resolved):
             return (resolved.command, "-c", src, *argv_flags)
 
     return _Loop
+
+
+def _loop_agent(cls, workspace):
+    """A workspace-write instance of a sequenced fake for direct run_build calls."""
+    return cls(
+        settings=AgentSettings(adapter="fake_implementer_build"),
+        profile=HarnessAgentConfig(
+            executable_path=sys.executable,
+            grant=ExecutionGrantKind.WORKSPACE_WRITE,
+        ),
+        workspace_root=workspace,
+    )
 
 
 def _loop_records(store, task_id: str) -> list:
@@ -2134,6 +2170,292 @@ class TestFixLoop:
         assert [a for a in store.all_models(Approval) if a.task_id == task.id] == []
         kinds = {r.kind for r in evidence.records_for_task(task.id)}
         assert EvidenceKind.REVIEW_PASSED not in kinds
+        conn.close()
+
+    def test_fix_run_failure_returns_only_latest_attempt_facts(self, build_workspace):
+        """PR-review: a crashed fixer must not leak attempt-1 records.
+
+        findings → fix dispatched → fixer process fails: every
+        latest-attempt field belongs to attempt 2 alone.
+        """
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = store.save_model(Task(title="fixer crash"))
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings", "--fix-crash"
+        )
+        agent = _loop_agent(loop_impl, build_workspace)
+        outcome = asyncio.run(
+            run_build(
+                store,
+                writer,
+                evidence,
+                agent,
+                AgentRequest(
+                    prompt="x", role=AgentRole.IMPLEMENTER, task_id=task.id
+                ),
+                workspace_root=build_workspace,
+                verification=VerificationConfig(
+                    program=sys.executable, args=["-c", "print('ok')"]
+                ),
+            )
+        )
+        assert outcome.attempts == 2
+        assert outcome.stop is LoopStopReason.RUN_FAILED
+        assert outcome.ask is not None
+        assert outcome.ask.response is None
+        impl_runs = [r for r in store.all_models(Run) if r.role == "implementer"]
+        assert len(impl_runs) == 2
+        assert outcome.ask.run.id == impl_runs[1].id
+        assert outcome.ask.run.status is RunStatus.FAILED
+        # Attempt-1 records must not leak into latest-attempt fields.
+        assert outcome.diff_artifact_id is None
+        assert outcome.tool_run_ids == ()
+        assert outcome.verification is None
+        assert outcome.review is None
+        assert store.load_model(Task, task.id).state is TaskState.IMPLEMENTING
+        # The earlier attempt's ledger stays durable for inspection.
+        assert (
+            len(
+                [
+                    a
+                    for a in store.all_models(Artifact)
+                    if a.kind is ArtifactKind.DIFF
+                ]
+            )
+            == 1
+        )
+        assert (
+            len(
+                [
+                    a
+                    for a in store.all_models(Artifact)
+                    if a.kind is ArtifactKind.FIX_PACKET
+                ]
+            )
+            == 1
+        )
+        conn.close()
+
+    def test_verification_blocked_after_fix_leaks_no_prior_review(
+        self, build_workspace
+    ):
+        """PR-review: a later attempt blocked in VERIFYING returns its own
+        verification result and NO review — attempt 1's findings review
+        must not leak into outcome.review."""
+        counter = build_workspace / ".relay" / "verify-count.txt"
+        script = (
+            "import sys, pathlib, time\n"
+            f"p = pathlib.Path({json.dumps(str(counter))})\n"
+            "n = int(p.read_text() or '0') if p.exists() else 0\n"
+            "p.write_text(str(n + 1))\n"
+            "if n == 0: sys.exit(0)\n"
+            "time.sleep(30)\n"
+        )
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = store.save_model(Task(title="blocked verify"))
+        loop_impl = _loop_implementer(build_workspace, "--review-verdicts", "findings")
+        agent = _loop_agent(loop_impl, build_workspace)
+        outcome = asyncio.run(
+            run_build(
+                store,
+                writer,
+                evidence,
+                agent,
+                AgentRequest(
+                    prompt="x", role=AgentRole.IMPLEMENTER, task_id=task.id
+                ),
+                workspace_root=build_workspace,
+                verification=VerificationConfig(
+                    program=sys.executable,
+                    args=["-c", script],
+                    timeout_seconds=1,
+                ),
+            )
+        )
+        assert outcome.attempts == 2
+        assert outcome.stop is LoopStopReason.VERIFICATION_BLOCKED
+        assert outcome.ask is not None
+        fix_run = outcome.ask.run
+        assert fix_run.status is RunStatus.SUCCEEDED
+        # Latest-attempt fields: the fix run minted a fresh cumulative DIFF
+        # and reached verification — which timed out and parked VERIFYING.
+        fix_diffs = store.artifacts_for_run(fix_run.id, kind=ArtifactKind.DIFF)
+        assert len(fix_diffs) == 1
+        assert outcome.diff_artifact_id == fix_diffs[0].id
+        assert outcome.verification is not None
+        assert outcome.verification.tool_run is not None
+        assert outcome.verification.tool_run.status is RunStatus.FAILED
+        assert outcome.review is None  # the attempt-1 findings must not leak
+        assert store.load_model(Task, task.id).state is TaskState.VERIFYING
+        conn.close()
+
+    def test_binary_change_between_attempts_is_progress(self, build_workspace):
+        """PR-review: every binary edit renders identically ('Binary files
+        differ') — only the raw state digest can tell real progress."""
+        _with_verification(
+            build_workspace, json.dumps(sys.executable), '["-c", "print(\'tests ok\')"]'
+        )
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,pass", "--binary"
+        )
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "write implemented.bin"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 2" in result.output
+        assert "pass_promoted" in result.output
+
+        conn, store = _open_store(build_workspace)
+        diffs = [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.DIFF
+        ]
+        # Two attempts → two DIFFs whose rendered text aliases; the loop
+        # correctly saw progress anyway (under rendered-text equality the
+        # fix run would have been misjudged no-progress).
+        assert len(diffs) == 2
+        assert all(
+            "Binary files implemented.bin differ" in (a.content or "") for a in diffs
+        )
+        conn.close()
+
+    def test_preexisting_ignored_trees_mint_no_diff_or_evidence(self, build_workspace):
+        """PR-review: baseline and snapshot share ONE exclusion policy — a
+        pre-existing node_modules/__pycache__ can never manufacture a fake
+        'deleted file' DIFF or IMPLEMENTATION_PRODUCED."""
+        (build_workspace / "node_modules" / "pkg").mkdir(parents=True)
+        (build_workspace / "node_modules" / "pkg" / "index.js").write_text(
+            "x", encoding="utf-8"
+        )
+        (build_workspace / "__pycache__").mkdir()
+        (build_workspace / "__pycache__" / "m.pyc").write_bytes(b"\x00\x01")
+        loop_impl = _loop_implementer(build_workspace, "--noop")
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["build", "no-op task"])
+        assert result.exit_code == 0, result.output
+        assert "attempts 1" in result.output
+        assert "no_blocking_input" in result.output
+
+        conn, store = _open_store(build_workspace)
+        evidence = SqliteEvidenceStore(store)
+        task = next(iter(store.all_models(Task)))
+        assert task.state is TaskState.IMPLEMENTING
+        assert [
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.DIFF
+        ] == []
+        assert [
+            r
+            for r in evidence.records_for_task(task.id)
+            if r.kind is EvidenceKind.IMPLEMENTATION_PRODUCED
+        ] == []
+        conn.close()
+
+    def test_fix_attempt_context_refs_carry_canonical_inputs(self, build_workspace):
+        """PR-review: a fix run keeps the caller's refs and names every
+        pinned canonical input the packet certifies — never just the
+        blocking artifact."""
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = store.save_model(Task(title="ctx refs"))
+        loop_impl = _loop_implementer(
+            build_workspace, "--review-verdicts", "findings,pass"
+        )
+        agent = _loop_agent(loop_impl, build_workspace)
+        outcome = asyncio.run(
+            run_build(
+                store,
+                writer,
+                evidence,
+                agent,
+                AgentRequest(
+                    prompt="x",
+                    role=AgentRole.IMPLEMENTER,
+                    task_id=task.id,
+                    context_refs=["room:r9", "artifact:custom"],
+                ),
+                workspace_root=build_workspace,
+                verification=VerificationConfig(
+                    program=sys.executable, args=["-c", "print('ok')"]
+                ),
+            )
+        )
+        assert outcome.stop is LoopStopReason.PASS_PROMOTED
+        impl_requests = [
+            r for r in loop_impl.seen_requests if r.role is AgentRole.IMPLEMENTER
+        ]
+        assert len(impl_requests) == 2
+        refs = impl_requests[1].context_refs
+        assert refs[:2] == ["room:r9", "artifact:custom"]  # originals preserved first
+        assert len(refs) == len(set(refs))  # de-duplicated
+        packet = next(
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.FIX_PACKET
+        )
+        review = next(
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.REVIEW_FINDING
+        )
+        plan = next(a for a in store.all_models(Artifact) if a.kind is ArtifactKind.PLAN)
+        impl_run_1 = next(r for r in store.all_models(Run) if r.role == "implementer")
+        review_run = next(r for r in store.all_models(Run) if r.role == "reviewer")
+        assert f"task:{task.id}" in refs
+        assert f"artifact:{plan.id}" in refs
+        assert f"artifact:{packet.id}" in refs
+        assert f"artifact:{review.id}" in refs  # packet's pinned review artifact
+        assert f"run:{impl_run_1.id}" in refs  # pinned implementation run
+        assert f"run:{review_run.id}" in refs  # pinned reviewer run
+        assert any(r.startswith("evidence:") for r in refs)
+        assert any(r.startswith("tool_run:") for r in refs)
+        conn.close()
+
+    def test_failed_verification_fix_refs_include_plan_and_result(
+        self, build_workspace
+    ):
+        """The TEST_RESULT blocking input names the failed exam artifact
+        and the canonical plan alongside the task."""
+        counter = build_workspace / ".relay" / "verify-count.txt"
+        script = (
+            "import sys, pathlib\n"
+            f"p = pathlib.Path({json.dumps(str(counter))})\n"
+            "n = int(p.read_text() or '0') if p.exists() else 0\n"
+            "p.write_text(str(n + 1))\n"
+            "sys.exit(3 if n == 0 else 0)\n"
+        )
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        evidence = SqliteEvidenceStore(store)
+        task = store.save_model(Task(title="ctx refs test-result"))
+        loop_impl = _loop_implementer(build_workspace)
+        agent = _loop_agent(loop_impl, build_workspace)
+        outcome = asyncio.run(
+            run_build(
+                store,
+                writer,
+                evidence,
+                agent,
+                AgentRequest(
+                    prompt="x", role=AgentRole.IMPLEMENTER, task_id=task.id
+                ),
+                workspace_root=build_workspace,
+                verification=VerificationConfig(
+                    program=sys.executable, args=["-c", script]
+                ),
+            )
+        )
+        assert outcome.stop is LoopStopReason.PASS_PROMOTED
+        impl_requests = [
+            r for r in loop_impl.seen_requests if r.role is AgentRole.IMPLEMENTER
+        ]
+        assert len(impl_requests) == 2
+        refs = impl_requests[1].context_refs
+        test_result = next(
+            a for a in store.all_models(Artifact) if a.kind is ArtifactKind.TEST_RESULT
+        )
+        plan = next(a for a in store.all_models(Artifact) if a.kind is ArtifactKind.PLAN)
+        assert f"task:{task.id}" in refs
+        assert f"artifact:{plan.id}" in refs
+        assert f"artifact:{test_result.id}" in refs
         conn.close()
 
 
