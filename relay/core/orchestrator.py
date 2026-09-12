@@ -84,6 +84,20 @@ from relay.core.reviews import (
     encode_review_record,
     parse_review,
 )
+from relay.core.stage_signals import (
+    SignalContractError,
+    SignalDeliveryContext,
+    SignalServices,
+    check_signal_legal,
+    exchange_appendix,
+    notes_appendix,
+    parse_stage_signal,
+    persist_signal_diagnostic,
+    resolve_open_signal,
+    send_note_signal,
+    signal_appendix,
+    signal_is_blocking,
+)
 from relay.core.state_machine import TaskState, TaskStateMachine
 from relay.harness.sanitization import redact
 from relay.storage.events import EventLogWriter
@@ -102,6 +116,7 @@ from relay.storage.models import (
     ReviewVerdict,
     Run,
     RunStatus,
+    StageSignalPayload,
     Task,
     ToolRun,
     utcnow,
@@ -281,6 +296,12 @@ class ReviewDisposition(str, enum.Enum):
     INVALID_OUTPUT = "invalid_output"
     INVALID_CONTEXT = "invalid_context"
     RUN_FAILED = "run_failed"
+    #: The run emitted a valid blocking stage signal — no verdict minted
+    #: (P6.4); the driver resolves the exchange, then re-dispatches.
+    SIGNAL = "signal"
+    #: The run's output claimed the signal contract but failed validation —
+    #: a ``relay.build.signal.invalid.v1`` diagnostic was persisted.
+    SIGNAL_INVALID = "signal_invalid"
 
 
 @dataclass(frozen=True)
@@ -294,6 +315,8 @@ class ReviewResult:
     diagnostic_artifact_id: str | None = None
     reason_code: str | None = None
     finding_count: int = 0
+    #: The emitted blocking signal when disposition is SIGNAL (P6.4).
+    signal: StageSignalPayload | None = None
 
 
 @dataclass(frozen=True)
@@ -317,6 +340,10 @@ class LoopStopReason(str, enum.Enum):
     REVIEW_BLOCKED = "review_blocked"
     LOOP_DISABLED = "loop_disabled"
     NO_BLOCKING_INPUT = "no_blocking_input"
+    #: P6.4 — a blocking micro-exchange stalled (policy/budget/delivery)
+    #: or a run emitted an invalid signal; a durable escalation record
+    #: explains the park and ``relay continue`` resumes it.
+    COMMUNICATION_BLOCKED = "communication_blocked"
 
 
 @dataclass(frozen=True)
@@ -350,6 +377,9 @@ class BuildOutcome:
     prior_attempts: int = 0
     resumed_from: TaskState | None = None
     stop: LoopStopReason | None = None
+    #: P6.4 — the ``relay.build.escalation.v1`` artifact explaining a
+    #: COMMUNICATION_BLOCKED park, when one was recorded.
+    signal_escalation_id: str | None = None
 
 
 def _record_observed_events(
@@ -957,12 +987,19 @@ async def _run_review(
     model: str | None = None,
     agent_name: str | None = None,
     pre_provider: Callable[[Run, Artifact], Iterable[EventLogEntry]] | None = None,
+    signals: SignalServices | None = None,
+    prompt_suffix: str = "",
 ) -> ReviewStageOutcome:
     """Run and promote one strict structured review.
 
     Every PASS promotion is atomic with its resulting state transition. A
     findings report atomically writes its canonical review, fix packet, and
     REVIEWING -> IMPLEMENTING rework edge. Invalid output stays REVIEWING.
+
+    P6.4: before the review contract runs, the output is checked for a
+    stage signal — a valid blocking signal mints nothing (disposition
+    SIGNAL) and an intended-but-invalid one persists a signal diagnostic
+    (SIGNAL_INVALID), never a review verdict.
     """
 
     subject = build_review_subject(inputs)
@@ -980,7 +1017,8 @@ async def _run_review(
                 diff=inputs.diff_artifact.content,
                 verification=inputs.test_result_artifact.content,
                 prompt=request.prompt,
-            ),
+            )
+            + prompt_suffix,
             "context_refs": [
                 f"task:{task.id}",
                 f"run:{inputs.plan_run.id}",
@@ -1010,6 +1048,65 @@ async def _run_review(
                 run_id=review_run_outcome.run.id,
             ),
         )
+
+    # P6.4: a review run may answer with a stage signal instead of a
+    # verdict. The signal branch NEVER mints review artifacts — an intended
+    # but invalid signal is a signal-contract failure (parked), not an
+    # invalid review.
+    if signals is not None:
+        try:
+            signal = parse_stage_signal(review_run_outcome.response.output)
+        except SignalContractError as exc:
+            diagnostic = persist_signal_diagnostic(
+                store,
+                writer,
+                task,
+                review_run_outcome.run,
+                stage="review",
+                code=exc.code,
+            )
+            return ReviewStageOutcome(
+                task=task,
+                result=ReviewResult(
+                    disposition=ReviewDisposition.SIGNAL_INVALID,
+                    run_id=review_run_outcome.run.id,
+                    diagnostic_artifact_id=diagnostic.id,
+                    reason_code=exc.code,
+                ),
+            )
+        if signal is not None:
+            try:
+                check_signal_legal(signal, review_run_outcome.run.role)
+            except SignalContractError as exc:
+                diagnostic = persist_signal_diagnostic(
+                    store,
+                    writer,
+                    task,
+                    review_run_outcome.run,
+                    stage="review",
+                    code=exc.code,
+                )
+                return ReviewStageOutcome(
+                    task=task,
+                    result=ReviewResult(
+                        disposition=ReviewDisposition.SIGNAL_INVALID,
+                        run_id=review_run_outcome.run.id,
+                        diagnostic_artifact_id=diagnostic.id,
+                        reason_code=exc.code,
+                    ),
+                )
+            if signal_is_blocking(signal):
+                return ReviewStageOutcome(
+                    task=task,
+                    result=ReviewResult(
+                        disposition=ReviewDisposition.SIGNAL,
+                        run_id=review_run_outcome.run.id,
+                        signal=signal,
+                    ),
+                )
+            # A non-blocking kind from a reviewer (``note``) is already
+            # refused by check_signal_legal above — unreachable.
+            raise AssertionError("unreachable")  # pragma: no cover
 
     outputs = store.artifacts_for_run(review_run_outcome.run.id, kind=ArtifactKind.RUN_OUTPUT)
     output_artifact = outputs[0] if len(outputs) == 1 else None
@@ -1200,6 +1297,12 @@ class _AttemptOutcome:
     tool_run_ids: tuple[str, ...] = ()
     diff_artifact: Artifact | None = None
     state_digest: str = ""
+    #: A valid, legal, BLOCKING stage signal emitted as the run's whole
+    #: output (P6.4) — the run mints nothing; the driver resolves it.
+    signal: StageSignalPayload | None = None
+    #: ``relay.build.signal.invalid.v1`` diagnostic for an intended-but-
+    #: invalid signal — the stage parks COMMUNICATION_BLOCKED.
+    signal_invalid: Artifact | None = None
 
 
 async def _run_implementation_attempt(
@@ -1218,6 +1321,9 @@ async def _run_implementation_attempt(
     baseline: _WorkspaceBaseline,
     previous_state_digest: str | None,
     pre_provider: Callable[[Run, Artifact], Iterable[EventLogEntry]] | None = None,
+    signals: SignalServices | None = None,
+    stage: str = "implement",
+    attempt_number: int | None = None,
 ) -> _AttemptOutcome:
     """Dispatch one implementation/fix run through the crash-safe spine.
 
@@ -1250,6 +1356,55 @@ async def _run_implementation_attempt(
     tool_run_ids = _record_observed_events(
         store, writer, outcome.response, outcome.run.id
     )
+
+    # P6.4: a run may end its whole output with a stage signal instead of
+    # implementation work. Detection runs BEFORE diff extraction — a signal
+    # run must never mint a DIFF (fail closed).
+    if signals is not None:
+        try:
+            signal = parse_stage_signal(outcome.response.output)
+        except SignalContractError as exc:
+            diagnostic = persist_signal_diagnostic(
+                store, writer, task, outcome.run, stage=stage, code=exc.code
+            )
+            return _AttemptOutcome(
+                task=task,
+                ask=outcome,
+                tool_run_ids=tool_run_ids,
+                signal_invalid=diagnostic,
+            )
+        if signal is not None:
+            try:
+                check_signal_legal(signal, outcome.run.role)
+            except SignalContractError as exc:
+                diagnostic = persist_signal_diagnostic(
+                    store, writer, task, outcome.run, stage=stage, code=exc.code
+                )
+                return _AttemptOutcome(
+                    task=task,
+                    ask=outcome,
+                    tool_run_ids=tool_run_ids,
+                    signal_invalid=diagnostic,
+                )
+            if signal_is_blocking(signal):
+                return _AttemptOutcome(
+                    task=task,
+                    ask=outcome,
+                    tool_run_ids=tool_run_ids,
+                    signal=signal,
+                )
+            # ``note``: non-blocking — send best-effort, then fall through
+            # to normal diff extraction with nothing minted for the note.
+            send_note_signal(
+                store,
+                writer,
+                signals,
+                task,
+                outcome.run,
+                signal,
+                stage=stage,
+                attempt=attempt_number,
+            )
 
     # Relay-owned non-mutating extraction: rendered DIFF artifact + the raw
     # state digest share ONE scan so they can never disagree.
@@ -1428,6 +1583,7 @@ async def run_build(
     reviewer_model: str | None = None,
     approval: ApprovalPolicyConfig | None = None,
     budget: BudgetConfig | None = None,
+    signals: SignalServices | None = None,
 ) -> BuildOutcome:
     """Drive one task through the deterministic lifecycle to closure.
 
@@ -1521,6 +1677,7 @@ async def run_build(
         baseline=None,
         prior_attempts=0,
         resumed_from=None,
+        signals=signals,
     )
 
 
@@ -1602,6 +1759,7 @@ async def _drive_build(
     baseline: _WorkspaceBaseline | None,
     prior_attempts: int,
     resumed_from: TaskState | None,
+    signals: SignalServices | None = None,
 ) -> BuildOutcome:
     """The shared ledger-driven stage driver (P6.3 D1/D9).
 
@@ -1610,7 +1768,8 @@ async def _drive_build(
     ``relay continue`` identically. A stage whose output already exists is
     a pure ``advance``: no re-dispatch, no budget consult, no duplicate
     artifacts. ``budget.max_fix_loops`` is consulted at exactly one point —
-    immediately before dispatching a NEW implementer/fix run. Stop
+    immediately before dispatching a NEW implementer/fix run (a P6.4
+    same-attempt continuation never consults it). Stop
     conditions are evaluated only at stage boundaries (pre-P6 hardening:
     interruption is never mid-run).
     """
@@ -1622,6 +1781,7 @@ async def _drive_build(
     diff_artifact_id: str | None = None
     verification_result: _VerificationResult | None = None
     review_result: ReviewResult | None = None
+    signal_escalation_id: str | None = None
 
     while True:
         position = derive_position(store, evidence, task.id)
@@ -1710,6 +1870,32 @@ async def _drive_build(
                 )
                 stop = LoopStopReason.REVIEW_BLOCKED
                 break
+            # P6.4: an answered review-stage signal resumes the review as a
+            # continuation run carrying the exchange's provenance.
+            review_continuation: tuple[str, str] | None = None
+            if (
+                position.pending_signal is not None
+                and position.pending_signal.reply is not None
+                and position.pending_signal.message is not None
+            ):
+                review_continuation = (
+                    position.pending_signal.message.id,
+                    position.pending_signal.reply.id,
+                )
+            review_prompt_suffix = ""
+            if signals is not None:
+                review_prompt_suffix = signal_appendix(
+                    signals,
+                    task.id,
+                    AgentRole.REVIEWER,
+                    review_name or reviewer.name,
+                )
+            # Exchange history and notes are durable records — they ride
+            # the continuation prompt even if services were dropped since
+            # the exchange happened. Both are empty-string no-ops when the
+            # task has none, keeping pre-P6.4 prompts byte-compatible.
+            review_prompt_suffix += exchange_appendix(position.exchanges)
+            review_prompt_suffix += notes_appendix(store, task.id, AgentRole.REVIEWER)
             review_stage = await _run_review(
                 store,
                 writer,
@@ -1722,10 +1908,20 @@ async def _drive_build(
                 approval=approval,
                 model=review_model,
                 agent_name=review_name,
-                pre_provider=build_dispatch_hook(task.id, "review"),
+                pre_provider=build_dispatch_hook(
+                    task.id, "review", continuation=review_continuation
+                ),
+                signals=signals,
+                prompt_suffix=review_prompt_suffix,
             )
             task = review_stage.task
             review_result = review_stage.result
+            if review_result.disposition is ReviewDisposition.SIGNAL_INVALID:
+                signal_escalation_id = review_result.diagnostic_artifact_id
+                stop = LoopStopReason.COMMUNICATION_BLOCKED
+                break
+            if review_result.disposition is ReviewDisposition.SIGNAL:
+                continue  # open blocking signal — resolve on next derive
             if task.state is TaskState.IMPLEMENTING:
                 continue  # findings promotion — packet is the next blocker
             if task.state is TaskState.REVIEWING:
@@ -1734,6 +1930,70 @@ async def _drive_build(
                 break
             stop = LoopStopReason.PASS_PROMOTED
             break
+
+        if action == "recover_signal":
+            # Crash-gap recovery: the last bound run's RUN_OUTPUT is an
+            # intended-invalid signal whose diagnostic was never persisted.
+            # Persist it (idempotently) and park — never a fresh attempt,
+            # never a diff/verdict from that run.
+            invalid = position.invalid_signal
+            if invalid is None:
+                stop = LoopStopReason.COMMUNICATION_BLOCKED
+                break
+            diagnostic = persist_signal_diagnostic(
+                store,
+                writer,
+                task,
+                invalid.run,
+                stage=invalid.stage,
+                code=invalid.code,
+            )
+            signal_escalation_id = diagnostic.id
+            stop = LoopStopReason.COMMUNICATION_BLOCKED
+            break
+
+        if action == "resolve_signal":
+            # P6.4: the latest stage run emitted a blocking signal whose
+            # exchange is unresolved — send/deliver/promote from durable
+            # state. An answered signal is a "dispatch" (continuation), so
+            # this action always carries an unanswered one.
+            open_signal = position.pending_signal
+            if signals is None or open_signal is None:
+                stop = LoopStopReason.COMMUNICATION_BLOCKED
+                break
+            resolution = await resolve_open_signal(
+                store,
+                writer,
+                evidence,
+                signals,
+                task,
+                open_signal,
+                signal_context=SignalDeliveryContext(
+                    plan_artifact_id=(
+                        position.plan_artifact.id
+                        if position.plan_artifact is not None
+                        else None
+                    ),
+                    plan_content=(
+                        position.plan_artifact.content
+                        if position.plan_artifact is not None
+                        else None
+                    ),
+                    request_prompt=position.request.prompt,
+                    blocker_artifact_id=(
+                        position.pending_input.id
+                        if position.pending_input is not None
+                        else None
+                    ),
+                ),
+            )
+            if resolution.status == "escalated":
+                signal_escalation_id = (
+                    resolution.escalation.id if resolution.escalation is not None else None
+                )
+                stop = LoopStopReason.COMMUNICATION_BLOCKED
+                break
+            continue
 
         if action == "dispatch":
             if baseline is None:
@@ -1753,16 +2013,31 @@ async def _drive_build(
                     _persist_baseline_pin(store, writer, task, pin)
                     baseline = snapshot
 
-            # The ONLY budget consult: a genuinely new implementer/fix
-            # dispatch. Recovery, verification, review and PASS promotion
-            # never see this check.
-            if position.attempts >= 1 and position.fix_runs_used >= max_fix_loops:
-                stop = (
-                    LoopStopReason.BUDGET_EXHAUSTED
-                    if max_fix_loops
-                    else LoopStopReason.LOOP_DISABLED
+            # P6.4: an ANSWERED pending signal re-dispatches the SAME
+            # attempt as a continuation — the marker carries the exchange's
+            # causal refs and the fix budget is never consulted.
+            signal_state = position.pending_signal
+            continuation: tuple[str, str] | None = None
+            if signal_state is not None and signal_state.reply is not None:
+                assert signal_state.message is not None
+                assert signal_state.attempt is not None
+                continuation = (
+                    signal_state.message.id,
+                    signal_state.reply.id,
                 )
-                break
+                attempt_number = signal_state.attempt
+            else:
+                # The ONLY budget consult: a genuinely new implementer/fix
+                # dispatch. Recovery, verification, review, continuations
+                # and PASS promotion never see this check.
+                if position.attempts >= 1 and position.fix_runs_used >= max_fix_loops:
+                    stop = (
+                        LoopStopReason.BUDGET_EXHAUSTED
+                        if max_fix_loops
+                        else LoopStopReason.LOOP_DISABLED
+                    )
+                    break
+                attempt_number = position.attempts + 1
 
             assert position.plan_artifact is not None
             blocking = position.pending_input
@@ -1780,7 +2055,7 @@ async def _drive_build(
                     else "FAILED VERIFICATION OUTPUT"
                 )
                 prompt = _FIX_DIRECTIVE.format(
-                    attempt=position.attempts + 1,
+                    attempt=attempt_number,
                     plan=position.plan_artifact.content,
                     blocking_label=label,
                     blocking=blocking.content or "",
@@ -1790,6 +2065,19 @@ async def _drive_build(
                     request, task, position.plan_artifact, blocking
                 )
                 stage = "fix"
+
+            # P6.4: signal instructions are advertised only where currently
+            # deliverable; the exchange history (durable record) rides the
+            # continuation regardless of live services.
+            if signals is not None:
+                prompt += signal_appendix(
+                    signals,
+                    task.id,
+                    AgentRole.IMPLEMENTER,
+                    agent_name or agent.name,
+                )
+            prompt += exchange_appendix(position.exchanges)
+            prompt += notes_appendix(store, task.id, AgentRole.IMPLEMENTER)
 
             # No-progress is RAW workspace identity (D10): the pre-run
             # digest of the CURRENT tree — in-process this equals the prior
@@ -1815,8 +2103,11 @@ async def _drive_build(
                 baseline=baseline,
                 previous_state_digest=previous_state_digest,
                 pre_provider=build_dispatch_hook(
-                    task.id, stage, position.attempts + 1
+                    task.id, stage, attempt_number, continuation=continuation
                 ),
+                signals=signals,
+                stage=stage,
+                attempt_number=attempt_number,
             )
             task = attempt.task
             outcome = attempt.ask
@@ -1829,6 +2120,12 @@ async def _drive_build(
             if outcome is None or outcome.response is None:
                 stop = LoopStopReason.RUN_FAILED
                 break
+            if attempt.signal_invalid is not None:
+                signal_escalation_id = attempt.signal_invalid.id
+                stop = LoopStopReason.COMMUNICATION_BLOCKED
+                break
+            if attempt.signal is not None:
+                continue  # blocking signal — resolve on next derive
             if attempt.diff_artifact is None:
                 # No net workspace change: on the first-ever dispatch the
                 # honest no-op park; on a fix run the identical raw state
@@ -1870,6 +2167,7 @@ async def _drive_build(
         prior_attempts=prior_attempts,
         resumed_from=resumed_from,
         stop=stop,
+        signal_escalation_id=signal_escalation_id,
     )
 
 
@@ -1891,6 +2189,7 @@ async def continue_build(
     approval: ApprovalPolicyConfig | None = None,
     budget: BudgetConfig | None = None,
     settle_interrupted: bool = False,
+    signals: SignalServices | None = None,
 ) -> BuildOutcome:
     """Resume a parked build in a new process (P6.3).
 
@@ -1963,15 +2262,22 @@ async def continue_build(
             ) from exc
 
     # Interrupted build-owned runs block resume until explicitly settled —
-    # P4 deliveries and unbound rows are never touched either way.
-    if position.in_flight_runs or position.in_flight_tool_runs:
+    # including P6.4 delivery runs parked mid-signal. Unbound rows are
+    # never touched either way.
+    if (
+        position.in_flight_runs
+        or position.in_flight_delivery_runs
+        or position.in_flight_tool_runs
+    ):
         if not settle_interrupted:
-            ids = [r.id for r in position.in_flight_runs] + [
-                tr.id for tr in position.in_flight_tool_runs
-            ]
+            ids = (
+                [r.id for r in position.in_flight_runs]
+                + [r.id for r in position.in_flight_delivery_runs]
+                + [tr.id for tr in position.in_flight_tool_runs]
+            )
             raise ContinueRefusal(
                 "run_in_flight",
-                f"task '{task.id}' has interrupted build-owned runs "
+                f"task '{task.id}' has interrupted build-owned/delivery runs "
                 f"({', '.join(ids)}) — pass --settle-interrupted to mark "
                 "them cancelled and resume",
             )
@@ -1980,10 +2286,12 @@ async def continue_build(
 
     # Dispatch-only budget (D4): refuse ONLY when the derived next step is
     # a genuinely new implementer/fix run. Persisted boundaries, pending
-    # verification, review, and PASS promotion resume regardless.
+    # verification, review, P6.4 signal resolution/continuations, and PASS
+    # promotion resume regardless.
     max_fix_loops = (budget or BudgetConfig()).max_fix_loops
     if (
         position.next_action == "dispatch"
+        and position.pending_signal is None
         and position.attempts >= 1
         and position.fix_runs_used >= max_fix_loops
     ):
@@ -2021,4 +2329,5 @@ async def continue_build(
         baseline=baseline,
         prior_attempts=position.attempts,
         resumed_from=task.state,
+        signals=signals,
     )

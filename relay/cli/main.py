@@ -60,6 +60,31 @@ def _out() -> Console:
     return Console()
 
 
+def _signal_services(config, store, writer, root):
+    """P6.4: the communication seams for in-build micro-interactions.
+
+    Built from CURRENT config — role bindings, policy edges and budgets all
+    re-resolve on every invocation, so a corrected relay.yaml is what
+    ``relay continue`` retries against.
+    """
+    from relay.agents.factory import RegistryAgentFactory
+    from relay.core.bus import ConversationBus
+    from relay.core.delivery import MessageDelivery
+    from relay.core.policy import (
+        SqliteCommunicationPolicyGate,
+        policy_from_config,
+    )
+    from relay.core.resolver import role_resolver_from_config
+    from relay.core.stage_signals import SignalServices
+
+    factory = RegistryAgentFactory(config, root)
+    resolver = role_resolver_from_config(config)
+    gate = SqliteCommunicationPolicyGate(store, policy_from_config(config))
+    bus = ConversationBus(store, writer, resolver, gate)
+    delivery = MessageDelivery(store, writer, factory, bus, gate)
+    return SignalServices(bus=bus, delivery=delivery, resolver=resolver)
+
+
 def _harden_streams() -> None:
     """Never crash on characters outside the console encoding.
 
@@ -256,6 +281,7 @@ def build(
                     reviewer_model=None if reviewer_settings is None else reviewer_settings.model,
                     approval=config.approval,
                     budget=config.budget,
+                    signals=_signal_services(config, store, writer, root),
                 )
             )
 
@@ -343,14 +369,18 @@ def continue_(
                 )
             position = derive_position(store, evidence_store, task.id)
             if (
-                position.in_flight_runs or position.in_flight_tool_runs
+                position.in_flight_runs
+                or position.in_flight_delivery_runs
+                or position.in_flight_tool_runs
             ) and not settle_interrupted:
-                ids = [r.id for r in position.in_flight_runs] + [
-                    tr.id for tr in position.in_flight_tool_runs
-                ]
+                ids = (
+                    [r.id for r in position.in_flight_runs]
+                    + [r.id for r in position.in_flight_delivery_runs]
+                    + [tr.id for tr in position.in_flight_tool_runs]
+                )
                 raise ContinueRefusal(
                     "run_in_flight",
-                    f"task '{task.id}' has interrupted build-owned runs "
+                    f"task '{task.id}' has interrupted build-owned/delivery runs "
                     f"({', '.join(ids)}) — pass --settle-interrupted to mark "
                     "them cancelled and resume",
                 )
@@ -402,6 +432,7 @@ def continue_(
                     approval=config.approval,
                     budget=config.budget,
                     settle_interrupted=settle_interrupted,
+                    signals=_signal_services(config, store, writer, root),
                 )
             )
             from relay.cli.taskview import build_task_view

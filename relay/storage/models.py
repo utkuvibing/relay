@@ -559,6 +559,137 @@ class BuildBaselineRecordPayload(BaseModel):
     oversized_count: StrictInt = Field(ge=0)
 
 
+class StageSignalPayload(BaseModel):
+    """Emitted contract for build-stage micro-interactions (``relay.stage_signal.v1``).
+
+    A build implement/fix/review run may emit exactly one such object as its
+    WHOLE output instead of its normal output (P6.4, App. D.6). The payload
+    is validated only — the durable record of the exchange is the ``Message``
+    row Relay persists from it. ``kind`` maps onto the frozen ``MessageType``
+    vocabulary; ``to_role`` must be an ``AgentRole`` value (checked by the
+    signal layer so invalid roles surface as ``bad_role`` diagnostics rather
+    than schema errors).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.stage_signal.v1"]
+    kind: Literal["clarification_request", "challenge", "proposal", "note"]
+    to_role: _RequiredId
+    body: _BoundedText
+    references: tuple[StrictStr, ...] = Field(default_factory=tuple, max_length=16)
+
+    @field_validator("body", "to_role")
+    @classmethod
+    def _nonblank_field(cls, value: str) -> str:
+        return _nonblank(value)
+
+
+class PlannerDecisionPayload(BaseModel):
+    """Planner's typed answer to a ``challenge``/``proposal`` (``relay.planner_decision.v1``).
+
+    Carried as the whole content of the planner's ``final_position`` reply.
+    ``plan_effect`` is explicit: ``supersede`` requires a non-empty
+    ``revised_plan`` and only makes sense on ``accept``; ``unchanged``
+    forbids ``revised_plan`` outright. A rejected decision can never move
+    the plan.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.planner_decision.v1"]
+    outcome: Literal["accept", "reject"]
+    plan_effect: Literal["unchanged", "supersede"]
+    statement: _BoundedText
+    rationale: _BoundedText | None = None
+    revised_plan: StrictStr | None = None
+
+    @field_validator("statement", "rationale")
+    @classmethod
+    def _nonblank_field(cls, value: str | None) -> str | None:
+        return _nonblank(value) if value is not None else value
+
+    @model_validator(mode="after")
+    def _consistent(self) -> PlannerDecisionPayload:
+        if self.plan_effect == "supersede":
+            if self.outcome == "reject":
+                raise ValueError("a rejected decision cannot supersede the plan")
+            if self.revised_plan is None or not self.revised_plan.strip():
+                raise ValueError("plan_effect 'supersede' requires a non-empty revised_plan")
+        elif self.revised_plan is not None:
+            raise ValueError("plan_effect 'unchanged' forbids revised_plan")
+        return self
+
+
+class PlanRevisionPayload(BaseModel):
+    """Supersession link minted by a plan-changing decision (``relay.plan_revision.v1``).
+
+    Persisted as a ``REPORT`` artifact in the same transaction as the new
+    ``PLAN`` artifact, its ``PLAN_PRODUCED`` evidence, and the ``Decision``:
+    the chain (``supersedes_plan_artifact_id`` → ``plan_artifact_id``) is how
+    the ledger resolves the canonical plan tip when several exist.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.plan_revision.v1"]
+    task_id: _RequiredId
+    plan_artifact_id: _RequiredId
+    supersedes_plan_artifact_id: _RequiredId
+    decision_id: _RequiredId
+    signal_message_id: _RequiredId
+    reply_message_id: _RequiredId
+    #: The planner delivery run whose reply authored the revised plan.
+    author_run_id: _RequiredId
+
+
+class BuildEscalationPayload(BaseModel):
+    """Durable observation that a blocking build micro-exchange stalled (``relay.build.escalation.v1``).
+
+    A stored observation only — no evidence, no transition. Persisted once
+    per open signal (deduped on ``signal_message_id``, or ``run_id`` when the
+    send itself was refused before a message existed) so a parked task tells
+    the human WHY it parked and ``relay continue`` can retry delivery.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.build.escalation.v1"]
+    task_id: _RequiredId
+    stage: _RequiredId
+    attempt: StrictInt | None = Field(default=None, ge=1)
+    signal_message_id: _RequiredId | None = None
+    run_id: _RequiredId | None = None
+    reason: Literal[
+        "policy_refused",
+        "budget_exhausted",
+        "unresolved_role",
+        "self_send",
+        "delivery_failed",
+        "delivery_pending",
+        "turn_budget_exhausted",
+    ]
+    detail: _BoundedText
+
+
+class SignalInvalidPayload(BaseModel):
+    """Diagnostic for a run whose output claimed ``relay.stage_signal`` but failed validation.
+
+    Persisted as a ``REPORT`` artifact; the stage parks blocked rather than
+    silently reinterpreting a malformed signal as ordinary output (fail
+    closed — a signal run never mints a DIFF or a review verdict).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.build.signal.invalid.v1"]
+    task_id: _RequiredId
+    run_id: _RequiredId
+    stage: _RequiredId
+    code: _RequiredId
+    output_artifact_id: _RequiredId | None = None
+
+
 class DecisionStatus(str, enum.Enum):
     PROPOSED = "proposed"
     ACCEPTED = "accepted"
