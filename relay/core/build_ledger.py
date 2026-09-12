@@ -12,6 +12,11 @@ Provenance rules:
   marker names it (``sender="relay:build"``, refs ``run:``, ``task:``,
   ``build_stage:<plan|implement|fix|review>``; implement/fix additionally
   carry ``build_attempt:<n>``);
+* P6.4 continuation runs REPEAT their attempt number and must carry the
+  full causal chain — ``build_continuation:<message_id>`` +
+  ``signal_reply:<reply_id>`` resolving to the previous run's blocking
+  signal message and its canonical answering reply — else the ledger
+  refuses closed;
 * P4 deliveries are bound by ``MESSAGE_DELIVERED`` and ignored everywhere;
 * a task-scoped run bound by NEITHER marker refuses ``unattributed_runs`` —
   attempt counting can never silently miscount a foreign run.
@@ -30,6 +35,16 @@ import pydantic
 
 from relay.core.evidence import EvidenceKind, EvidenceStore
 from relay.core.reviews import ReviewContractError, decode_fix_packet
+from relay.core.stage_signals import (
+    OpenSignal,
+    SignalContractError,
+    blocking_messages_authored_by,
+    canonical_replies_for,
+    check_signal_legal,
+    signal_for_run_output,
+    signal_is_blocking,
+    signal_message_type,
+)
 from relay.core.state_machine import TaskState
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
@@ -37,9 +52,13 @@ from relay.storage.models import (
     ArtifactKind,
     BuildBaselineRecordPayload,
     BuildRequestRecordPayload,
+    Decision,
     EventLogEntry,
     EventType,
     EvidenceRecord,
+    Message,
+    MessageType,
+    PlanRevisionPayload,
     Run,
     RunStatus,
     Task,
@@ -56,8 +75,24 @@ BuildStage = Literal["plan", "implement", "fix", "review"]
 _BUILD_STAGES = frozenset({"plan", "implement", "fix", "review"})
 _IMPL_STAGES = frozenset({"implement", "fix"})
 
+#: Blocking signal message types that admit a canonical reply (P6.4).
+_REPLY_PARENT_TYPES = frozenset(
+    {
+        MessageType.CLARIFICATION_REQUEST,
+        MessageType.CHALLENGE,
+        MessageType.PROPOSAL,
+    }
+)
+
 NextAction = Literal[
-    "collect_context", "plan", "advance", "dispatch", "verify", "review", "stop"
+    "collect_context",
+    "plan",
+    "advance",
+    "dispatch",
+    "resolve_signal",
+    "verify",
+    "review",
+    "stop",
 ]
 
 
@@ -81,18 +116,29 @@ def _refuse(code: str, message: str) -> NoReturn:
 
 
 def build_dispatch_hook(
-    task_id: str, stage: BuildStage, attempt: int | None = None
+    task_id: str,
+    stage: BuildStage,
+    attempt: int | None = None,
+    continuation: tuple[str, str] | None = None,
 ) -> Callable[[Run, Artifact], Iterable[EventLogEntry]]:
     """``pre_provider`` hook committing this run's build binding in Tx1.
 
     The marker asserts a binding, never a success — failed and cancelled
     runs retain it, which is exactly what resume needs to attribute them.
+
+    ``continuation`` carries ``(signal_message_id, reply_message_id)`` for
+    P6.4 same-attempt continuation dispatches — the persisted blocking
+    exchange this run resumes from. The ledger refuses a repeated attempt
+    number without it.
     """
 
     def bind(run: Run, _input_artifact: Artifact) -> Iterable[EventLogEntry]:
         references = [f"task:{task_id}", f"run:{run.id}", f"build_stage:{stage}"]
         if stage in _IMPL_STAGES and attempt is not None:
             references.append(f"build_attempt:{attempt}")
+        if continuation is not None:
+            references.append(f"build_continuation:{continuation[0]}")
+            references.append(f"signal_reply:{continuation[1]}")
         return [
             EventLogEntry(
                 type=EventType.BUILD_RUN_DISPATCHED,
@@ -124,7 +170,7 @@ class AttemptRecords:
 
 @dataclass(frozen=True)
 class BuildPosition:
-    """Read-only ledger-derived position of one task's build (P6.3)."""
+    """Read-only ledger-derived position of one task's build (P6.3/P6.4)."""
 
     task: Task
     request: BuildRequestRecordPayload
@@ -132,9 +178,23 @@ class BuildPosition:
     plan_artifact: Artifact | None
     plan_run: Run | None
     impl_runs: tuple[Run, ...]
+    #: Attempt number of each impl run, parallel to ``impl_runs``.
+    #: Continuation runs repeat the previous number.
+    impl_attempts: tuple[int, ...]
     latest_records: AttemptRecords | None
     pending_input: Artifact | None
+    #: The latest no-diff impl/review run's blocking signal state, when it
+    #: has one — answered signals drive continuation dispatch, unanswered
+    #: ones drive ``resolve_signal``.
+    pending_signal: OpenSignal | None
+    #: Signal exchanges of the current attempt (or review streak), paired
+    #: ``(signal message, canonical reply|None)`` — the continuation
+    #: prompt's exchange history.
+    exchanges: tuple[tuple[Message, Message | None], ...]
     in_flight_runs: tuple[Run, ...]
+    #: RUNNING delivery runs for this task's signal messages — zombie
+    #: deliveries ``--settle-interrupted`` cancels.
+    in_flight_delivery_runs: tuple[Run, ...]
     in_flight_tool_runs: tuple[ToolRun, ...]
     next_action: NextAction
     advance_target: TaskState | None
@@ -145,12 +205,13 @@ class BuildPosition:
 
     @property
     def attempts(self) -> int:
-        """Build-owned implement/fix dispatches across ALL invocations."""
-        return len(self.impl_runs)
+        """Build attempts across ALL invocations — continuation runs do
+        not increment this (P6.4)."""
+        return self.impl_attempts[-1] if self.impl_attempts else 0
 
     @property
     def fix_runs_used(self) -> int:
-        """Cumulative fix runs — the ``budget.max_fix_loops`` currency."""
+        """Cumulative fix attempts — the ``budget.max_fix_loops`` currency."""
         return max(0, self.attempts - 1)
 
 
@@ -209,6 +270,137 @@ def _pending_input(records: AttemptRecords | None) -> Artifact | None:
     return None
 
 
+def _validate_continuation(
+    store: SqliteRelayStore,
+    task_id: str,
+    continuation: tuple[str, str] | None,
+    predecessor_run_id: str,
+) -> None:
+    """Fail-closed check that a repeated dispatch is a P6.4 continuation.
+
+    The marker must name (a) the LATEST blocking signal message authored by
+    the immediately preceding run, and (b) that message's canonical
+    answering reply. Anything less means an attempt number was repeated
+    without provenance — ledger corruption, refuse.
+    """
+    if continuation is None:
+        _refuse(
+            "ledger_inconsistent",
+            f"run '{predecessor_run_id}' was followed by a same-attempt run "
+            "without continuation provenance",
+        )
+    message_id, reply_id = continuation
+    message = store.load_model(Message, message_id)
+    authored = blocking_messages_authored_by(store, task_id, predecessor_run_id)
+    if (
+        message is None
+        or message.task_id != task_id
+        or not message.blocking
+        or message.type not in _REPLY_PARENT_TYPES
+        or message.run_id != predecessor_run_id
+        or not authored
+        or authored[-1].id != message.id
+    ):
+        _refuse(
+            "ledger_inconsistent",
+            f"continuation ref 'message:{message_id}' does not name the "
+            f"latest blocking signal authored by run '{predecessor_run_id}'",
+        )
+    reply = store.load_model(Message, reply_id)
+    if reply is None or reply.id not in {
+        r.id for r in canonical_replies_for(store, message)
+    }:
+        _refuse(
+            "ledger_inconsistent",
+            f"continuation ref 'message:{reply_id}' is not a canonical "
+            f"answer to signal 'message:{message_id}'",
+        )
+
+
+def _validate_plan_revision(
+    store: SqliteRelayStore,
+    task_id: str,
+    revision: PlanRevisionPayload,
+    tip: Artifact,
+) -> None:
+    """Fail-closed check that a plan revision link is fully provenance-bound:
+    the reply must be the canonical answer to the named signal, and the new
+    plan artifact must be authored by that reply's delivery run."""
+
+    signal = store.load_model(Message, revision.signal_message_id)
+    reply = store.load_model(Message, revision.reply_message_id)
+    decision = store.load_model(Decision, revision.decision_id)
+    if (
+        signal is None
+        or signal.task_id != task_id
+        or reply is None
+        or reply.id not in {r.id for r in canonical_replies_for(store, signal)}
+        or decision is None
+        or decision.task_id != task_id
+        or revision.author_run_id != reply.run_id
+        or tip.run_id != reply.run_id
+        or reply.run_id is None
+    ):
+        _refuse(
+            "ledger_inconsistent",
+            f"plan revision '{revision.plan_artifact_id}' is not bound to "
+            "its decision/exchange provenance",
+        )
+
+
+def _open_signal_for_run(
+    store: SqliteRelayStore,
+    task: Task,
+    run: Run,
+    *,
+    stage: str,
+    attempt: int | None,
+) -> OpenSignal | None:
+    """Ledger-derived signal state for one run — the valid, legal, blocking
+    signal it emitted plus its latest message/reply, or None."""
+
+    signal = signal_for_run_output(store, run)
+    if signal is None or not signal_is_blocking(signal):
+        return None
+    try:
+        check_signal_legal(signal, run.role)
+    except SignalContractError:
+        return None
+    authored = blocking_messages_authored_by(store, task.id, run.id)
+    message = authored[-1] if authored else None
+    reply: Message | None = None
+    if message is not None:
+        replies = canonical_replies_for(store, message)
+        if len(replies) > 1:
+            _refuse(
+                "ledger_inconsistent",
+                f"signal message '{message.id}' has multiple canonical replies",
+            )
+        reply = replies[0] if replies else None
+    return OpenSignal(
+        run=run, signal=signal, stage=stage, attempt=attempt, message=message, reply=reply
+    )
+
+
+def _exchanges_for_runs(
+    store: SqliteRelayStore, task_id: str, run_ids: list[str]
+) -> tuple[tuple[Message, Message | None], ...]:
+    """All blocking signal messages authored by ``run_ids`` paired with
+    their canonical reply — the exchange history a continuation prompt
+    embeds."""
+    pairs: list[tuple[Message, Message | None]] = []
+    for run_id in run_ids:
+        for message in blocking_messages_authored_by(store, task_id, run_id):
+            replies = canonical_replies_for(store, message)
+            if len(replies) > 1:
+                _refuse(
+                    "ledger_inconsistent",
+                    f"signal message '{message.id}' has multiple canonical replies",
+                )
+            pairs.append((message, replies[0] if replies else None))
+    return tuple(pairs)
+
+
 def derive_position(
     store: SqliteRelayStore, evidence: EvidenceStore, task_id: str
 ) -> BuildPosition:
@@ -218,7 +410,8 @@ def derive_position(
         _refuse("no_task", f"task '{task_id}' does not exist")
 
     # --- build-run provenance: markers bind runs to build stages ---------
-    bound: dict[str, tuple[str, int, int | None]] = {}  # run_id -> (stage, seq, attempt)
+    # run_id -> (stage, seq, attempt, continuation (message_id, reply_id))
+    bound: dict[str, tuple[str, int, int | None, tuple[str, str] | None]] = {}
     for marker in store.all_models(
         EventLogEntry,
         "WHERE type = ? AND task_id = ?",
@@ -228,11 +421,18 @@ def derive_position(
         run_refs = [r[4:] for r in marker.references if r.startswith("run:")]
         stage_refs = [r[12:] for r in marker.references if r.startswith("build_stage:")]
         attempt_refs = [r[14:] for r in marker.references if r.startswith("build_attempt:")]
+        cont_refs = [
+            r[19:] for r in marker.references if r.startswith("build_continuation:")
+        ]
+        reply_refs = [r[13:] for r in marker.references if r.startswith("signal_reply:")]
         if (
             len(run_refs) != 1
             or len(stage_refs) != 1
             or stage_refs[0] not in _BUILD_STAGES
             or len(attempt_refs) > 1
+            or len(cont_refs) > 1
+            or len(reply_refs) > 1
+            or (len(cont_refs) == 0) != (len(reply_refs) == 0)
             or marker.sender != BUILD_SENDER
         ):
             _refuse(
@@ -252,21 +452,40 @@ def derive_position(
                 "ledger_inconsistent",
                 f"build dispatch marker seq={marker.sequence} mismatches its stage",
             )
+        continuation: tuple[str, str] | None = None
+        if cont_refs:
+            if stage_refs[0] == "plan":
+                _refuse(
+                    "ledger_inconsistent",
+                    f"build dispatch marker seq={marker.sequence} carries "
+                    "continuation refs on a plan stage",
+                )
+            continuation = (cont_refs[0], reply_refs[0])
         if run_refs[0] in bound:
             _refuse(
                 "ledger_inconsistent",
                 f"run '{run_refs[0]}' carries two build dispatch markers",
             )
-        bound[run_refs[0]] = (stage_refs[0], marker.sequence or 0, attempt)
+        bound[run_refs[0]] = (
+            stage_refs[0],
+            marker.sequence or 0,
+            attempt,
+            continuation,
+        )
 
     delivered: set[str] = set()
+    delivery_runs_for_message: dict[str, list[str]] = {}
     for entry in store.all_models(
         EventLogEntry,
         "WHERE type = ? AND task_id = ?",
         [EventType.MESSAGE_DELIVERED.value, task.id],
         order_by="sequence ASC",
     ):
-        delivered.update(r[4:] for r in entry.references if r.startswith("run:"))
+        run_ids = [r[4:] for r in entry.references if r.startswith("run:")]
+        delivered.update(run_ids)
+        for ref in entry.references:
+            if ref.startswith("message:"):
+                delivery_runs_for_message.setdefault(ref[8:], []).extend(run_ids)
 
     task_runs = list(
         store.all_models(Run, "WHERE task_id = ?", [task.id], order_by="rowid ASC")
@@ -307,38 +526,250 @@ def derive_position(
             Artifact, "WHERE task_id = ? AND kind = ?", [task.id, ArtifactKind.PLAN.value]
         )
     )
-    if len(plans) > 1:
-        _refuse("ledger_inconsistent", f"task '{task.id}' has multiple plan artifacts")
-    plan_artifact = plans[0] if plans else None
-    plan_run: Run | None = None
-    if plan_artifact is not None:
-        if (
-            plan_artifact.run_id is None
-            or bound.get(plan_artifact.run_id, (None, 0, None))[0] != "plan"
-        ):
+
+    # --- plan revision chain (P6.4): supersession is append-only ---------
+    revisions: list[PlanRevisionPayload] = []
+    for artifact in store.all_models(
+        Artifact,
+        "WHERE task_id = ? AND kind = ?",
+        [task.id, ArtifactKind.REPORT.value],
+    ):
+        content = artifact.content or ""
+        if '"relay.plan_revision.v1"' not in content:
+            continue
+        try:
+            revision = PlanRevisionPayload.model_validate_json(content)
+        except pydantic.ValidationError:
             _refuse(
                 "ledger_inconsistent",
-                f"plan artifact '{plan_artifact.id}' is not bound to a build plan run",
+                f"plan revision record '{artifact.id}' is undecodable",
             )
-        plan_run = bound_runs[plan_artifact.run_id or ""]
+        if revision.task_id != task.id:
+            _refuse(
+                "ledger_inconsistent",
+                f"plan revision record '{artifact.id}' names a different task",
+            )
+        revisions.append(revision)
+
+    plan_artifact: Artifact | None = None
+    plan_run: Run | None = None
+    if plans:
+        # Exactly one ROOT plan — authored by a bound plan-stage run.
+        roots = [
+            p
+            for p in plans
+            if p.run_id is not None and bound.get(p.run_id, ("", 0, None, None))[0] == "plan"
+        ]
+        if len(roots) != 1:
+            _refuse(
+                "ledger_inconsistent",
+                f"task '{task.id}' has {len(roots)} root plan artifacts",
+            )
+        current = roots[0]
+        seen = {current.id}
+        while True:
+            successors = [
+                r for r in revisions if r.supersedes_plan_artifact_id == current.id
+            ]
+            if len(successors) > 1:
+                _refuse(
+                    "ledger_inconsistent",
+                    f"plan artifact '{current.id}' is superseded twice",
+                )
+            if not successors:
+                break
+            revision = successors[0]
+            tip = next((p for p in plans if p.id == revision.plan_artifact_id), None)
+            if tip is None or tip.id in seen:
+                _refuse(
+                    "ledger_inconsistent",
+                    f"plan revision '{revision.plan_artifact_id}' is missing or cyclic",
+                )
+            _validate_plan_revision(store, task.id, revision, tip)
+            current = tip
+            seen.add(current.id)
+        leftover = [p.id for p in plans if p.id not in seen]
+        if leftover:
+            _refuse(
+                "ledger_inconsistent",
+                f"task '{task.id}' has plan artifacts outside the revision "
+                f"chain: {', '.join(leftover)}",
+            )
+        plan_artifact = current
+        run = store.load_model(Run, plan_artifact.run_id or "")
+        if run is None:
+            _refuse(
+                "ledger_inconsistent",
+                f"plan artifact '{plan_artifact.id}' has no resolvable author run",
+            )
+        plan_run = run
 
     impl_markers = sorted(
         (
-            (seq, run_id, attempt)
-            for run_id, (stage, seq, attempt) in bound.items()
+            (seq, run_id, attempt, continuation)
+            for run_id, (stage, seq, attempt, continuation) in bound.items()
             if stage in _IMPL_STAGES
         ),
         key=lambda entry: entry[0],
     )
-    for index, (_seq, run_id, attempt) in enumerate(impl_markers, start=1):
-        if attempt != index:
+    impl_attempts_list: list[int] = []
+    for index, (_seq, run_id, attempt, continuation) in enumerate(impl_markers):
+        assert attempt is not None  # marker validation guarantees impl attempts
+        impl_attempts_list.append(attempt)
+        if index == 0:
+            if attempt != 1 or continuation is not None:
+                _refuse(
+                    "ledger_inconsistent",
+                    f"first build attempt marker for run '{run_id}' is "
+                    f"attempt {attempt} (expected 1, no continuation refs)",
+                )
+            continue
+        prev_attempt = impl_markers[index - 1][2]
+        assert prev_attempt is not None
+        if attempt == prev_attempt + 1:
+            if continuation is not None:
+                _refuse(
+                    "ledger_inconsistent",
+                    f"fresh attempt marker for run '{run_id}' carries "
+                    "continuation refs",
+                )
+        elif attempt == prev_attempt:
+            # P6.4 same-attempt continuation — the marker must name the
+            # previous run's blocking signal AND its canonical reply.
+            _validate_continuation(
+                store, task.id, continuation, impl_markers[index - 1][1]
+            )
+        else:
             _refuse(
                 "ledger_inconsistent",
                 f"build attempt marker for run '{run_id}' is out of order "
-                f"(expected {index}, found {attempt})",
+                f"(expected {prev_attempt} or {prev_attempt + 1}, found {attempt})",
             )
-    impl_runs = tuple(bound_runs[run_id] for _seq, run_id, _a in impl_markers)
-    impl_marker_seqs = [seq for seq, _run_id, _a in impl_markers]
+    impl_runs = tuple(bound_runs[run_id] for _seq, run_id, _a, _c in impl_markers)
+    impl_attempts = tuple(impl_attempts_list)
+    impl_marker_seqs = [seq for seq, _run_id, _a, _c in impl_markers]
+    # Index into impl_markers of the last run of each attempt group.
+    impl_group_ends = [
+        index
+        for index, (_s, _r, attempt, _c) in enumerate(impl_markers)
+        if index + 1 == len(impl_markers) or impl_markers[index + 1][2] != attempt
+    ]
+
+    # --- review-run streaks: repeats need continuation provenance --------
+    review_streak: list[tuple[str, tuple[str, str] | None]] = []
+    review_streaks: list[list[str]] = []
+    for run_id, (stage, _seq, _a, continuation) in sorted(
+        bound.items(), key=lambda pair: pair[1][1]
+    ):
+        if stage in _IMPL_STAGES:
+            if review_streak:
+                review_streaks.append([r for r, _c in review_streak])
+            review_streak = []
+            continue
+        if stage != "review":
+            continue
+        if review_streak:
+            # A repeated review run must continue from the previous review
+            # run's blocking signal — unless that run authored none, which
+            # makes it a legit retry of a failed/invalid review.
+            prev_run_id = review_streak[-1][0]
+            if continuation is None:
+                if blocking_messages_authored_by(store, task.id, prev_run_id):
+                    _refuse(
+                        "ledger_inconsistent",
+                        f"review run '{run_id}' repeats without continuation "
+                        "provenance although its predecessor authored a "
+                        "blocking signal",
+                    )
+            else:
+                _validate_continuation(store, task.id, continuation, prev_run_id)
+        elif continuation is not None:
+            _refuse(
+                "ledger_inconsistent",
+                f"first review run '{run_id}' carries continuation refs",
+            )
+        review_streak.append((run_id, continuation))
+    if review_streak:
+        review_streaks.append([r for r, _c in review_streak])
+
+    # --- signal/message consistency: authored messages imply signals -----
+    signal_runs = [
+        bound_runs[run_id]
+        for run_id, (stage, _s, _a, _c) in bound.items()
+        if stage in _IMPL_STAGES or stage == "review"
+    ]
+    for run in signal_runs:
+        authored = blocking_messages_authored_by(store, task.id, run.id)
+        if not authored:
+            continue
+        # A blocking message can only exist where a valid, legal, blocking
+        # signal output was persisted — anything else is corruption.
+        signal = signal_for_run_output(store, run)
+        if signal is None:
+            _refuse(
+                "ledger_inconsistent",
+                f"run '{run.id}' authored blocking messages without a "
+                "valid blocking stage signal",
+            )
+        try:
+            check_signal_legal(signal, run.role)
+        except SignalContractError as exc:
+            _refuse(
+                "ledger_inconsistent",
+                f"run '{run.id}' authored blocking messages but its signal "
+                f"is illegal: {exc.code}",
+            )
+        expected_type = signal_message_type(signal)
+        expected_role = signal.to_role
+        for index, message in enumerate(authored):
+            if (
+                message.type is not expected_type
+                or message.recipient_role != expected_role
+            ):
+                _refuse(
+                    "ledger_inconsistent",
+                    f"message '{message.id}' does not match its run's "
+                    f"signal output",
+                )
+            if index > 0 and f"message:{authored[index - 1].id}" not in (
+                message.references or []
+            ):
+                _refuse(
+                    "ledger_inconsistent",
+                    f"signal retry '{message.id}' does not reference the "
+                    "message it supersedes",
+                )
+        if not signal_is_blocking(signal):
+            _refuse(
+                "ledger_inconsistent",
+                f"run '{run.id}' authored blocking messages from a "
+                "non-blocking signal",
+            )
+        if store.artifacts_for_run(run.id, kind=ArtifactKind.DIFF):
+            _refuse(
+                "ledger_inconsistent",
+                f"signal run '{run.id}' also minted a DIFF artifact",
+            )
+
+    # P6.4: zombie delivery runs blocking an OPEN signal — only delivery
+    # runs serving an unanswered blocking signal authored by a bound run
+    # are build-relevant; any other in-flight delivery stays untouched.
+    open_signal_message_ids = [
+        message.id
+        for run in signal_runs
+        for message in blocking_messages_authored_by(store, task.id, run.id)
+        if not canonical_replies_for(store, message)
+    ]
+    in_flight_delivery_runs = tuple(
+        run
+        for run in task_runs
+        if run.status is RunStatus.RUNNING
+        and run.id in {
+            run_id
+            for message_id in open_signal_message_ids
+            for run_id in delivery_runs_for_message.get(message_id, [])
+        }
+    )
 
     if pin is None and impl_runs:
         _refuse(
@@ -478,13 +909,17 @@ def derive_position(
             fix_packet=packet_for.get(run.id),
         )
 
-    latest = attempt_records(len(impl_runs) - 1) if impl_runs else None
-    previous = attempt_records(len(impl_runs) - 2) if len(impl_runs) >= 2 else None
+    latest = attempt_records(impl_group_ends[-1]) if impl_group_ends else None
+    previous = (
+        attempt_records(impl_group_ends[-2]) if len(impl_group_ends) >= 2 else None
+    )
 
     # --- next action -----------------------------------------------------
     next_action: NextAction
     advance_target: TaskState | None = None
     pending: Artifact | None = None
+    pending_signal: OpenSignal | None = None
+    exchanges: tuple[tuple[Message, Message | None], ...] = ()
     state = task.state
 
     if state is TaskState.CREATED:
@@ -522,11 +957,40 @@ def derive_position(
             else:
                 next_action, advance_target = "advance", TaskState.IMPLEMENTED
         else:
-            # The latest dispatch minted nothing (failed/no-op): re-dispatch
-            # with whatever input it was fed — the PREVIOUS attempt's
-            # blocker, or the implement directive for attempt 1.
+            # The latest dispatch minted nothing. P6.4: it may carry an
+            # open blocking signal — resolve it, or (once answered)
+            # re-dispatch the SAME attempt with the exchange. A run with
+            # no valid signal is a consumed no-op: the next dispatch is a
+            # fresh attempt fed the previous attempt's blocker.
+            latest_run = impl_runs[-1]
             pending = _pending_input(previous)
-            next_action = "dispatch"
+            pending_signal = _open_signal_for_run(
+                store,
+                task,
+                latest_run,
+                stage=bound[latest_run.id][0],
+                attempt=impl_attempts[-1],
+            )
+            if pending_signal is not None:
+                group_start = (
+                    impl_group_ends[-2] + 1 if len(impl_group_ends) >= 2 else 0
+                )
+                exchanges = _exchanges_for_runs(
+                    store,
+                    task.id,
+                    [
+                        rid
+                        for _s, rid, _a, _c in impl_markers[
+                            group_start : impl_group_ends[-1] + 1
+                        ]
+                    ],
+                )
+                if pending_signal.reply is None:
+                    next_action = "resolve_signal"
+                else:
+                    next_action = "dispatch"
+            else:
+                next_action = "dispatch"
     elif state is TaskState.IMPLEMENTED:
         if latest is None or latest.diff_artifact is None or latest.implementation_produced is None:
             _refuse(
@@ -573,7 +1037,23 @@ def derive_position(
                 "ledger_inconsistent",
                 f"task '{task.id}' is REVIEWING without its full pinned input set",
             )
-        next_action = "review"
+        # P6.4: the latest review run may carry an open blocking signal.
+        streak = review_streaks[-1] if review_streaks else []
+        latest_review_id = streak[-1] if streak else None
+        if latest_review_id is not None:
+            pending_signal = _open_signal_for_run(
+                store,
+                task,
+                bound_runs[latest_review_id],
+                stage="review",
+                attempt=None,
+            )
+            if pending_signal is not None:
+                exchanges = _exchanges_for_runs(store, task.id, streak)
+        if pending_signal is not None and pending_signal.reply is None:
+            next_action = "resolve_signal"
+        else:
+            next_action = "review"
     else:  # APPROVAL_REQUIRED / DONE
         next_action = "stop"
 
@@ -611,9 +1091,13 @@ def derive_position(
         plan_artifact=plan_artifact,
         plan_run=plan_run,
         impl_runs=impl_runs,
+        impl_attempts=impl_attempts,
         latest_records=latest,
         pending_input=pending,
+        pending_signal=pending_signal,
+        exchanges=exchanges,
         in_flight_runs=in_flight_runs,
+        in_flight_delivery_runs=in_flight_delivery_runs,
         in_flight_tool_runs=in_flight_tool_runs,
         next_action=next_action,
         advance_target=advance_target,
@@ -629,12 +1113,12 @@ def settle_interrupted_runs(
 ) -> None:
     """Settle build-owned in-flight rows as CANCELLED in one transaction.
 
-    Only marker-bound runs and task-bound verification tool runs are
-    touched — P4 deliveries and unbound rows are never settled here.
+    Marker-bound runs, signal delivery runs (P6.4), and task-bound
+    verification tool runs are touched — unbound rows are never settled.
     """
     task = position.task
     with store.transaction():
-        for run in position.in_flight_runs:
+        for run in (*position.in_flight_runs, *position.in_flight_delivery_runs):
             store.update_model(
                 run.model_copy(
                     update={"status": RunStatus.CANCELLED, "ended_at": utcnow()}

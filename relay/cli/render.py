@@ -318,6 +318,12 @@ def build_result(*, task, outcome, view=None) -> None:
         _out().print(f"[dim]{detail}[/dim]")
     if outcome.stop is not None:
         _out().print(f"[dim]fix loop stopped: {outcome.stop.value}[/dim]")
+    if outcome.signal_escalation_id is not None:
+        _out().print(
+            f"[dim]communication record: artifact "
+            f"{outcome.signal_escalation_id[:8]}... — inspect with "
+            f"`relay inspect {task.id[:8]}...`; resume with `relay continue`[/dim]"
+        )
     _final_state_line(task, view)
 
 
