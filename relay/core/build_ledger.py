@@ -33,14 +33,18 @@ from typing import Literal, NoReturn
 
 import pydantic
 
+from relay.agents.base import AgentRole
 from relay.core.evidence import EvidenceKind, EvidenceStore
 from relay.core.reviews import ReviewContractError, decode_fix_packet
 from relay.core.stage_signals import (
+    InvalidSignal,
     OpenSignal,
     SignalContractError,
     blocking_messages_authored_by,
     canonical_replies_for,
     check_signal_legal,
+    invalid_signal_for_run_output,
+    signal_diagnostic_for_run,
     signal_for_run_output,
     signal_is_blocking,
     signal_message_type,
@@ -53,6 +57,7 @@ from relay.storage.models import (
     BuildBaselineRecordPayload,
     BuildRequestRecordPayload,
     Decision,
+    DecisionStatus,
     EventLogEntry,
     EventType,
     EvidenceRecord,
@@ -89,6 +94,7 @@ NextAction = Literal[
     "plan",
     "advance",
     "dispatch",
+    "recover_signal",
     "resolve_signal",
     "verify",
     "review",
@@ -187,6 +193,10 @@ class BuildPosition:
     #: has one — answered signals drive continuation dispatch, unanswered
     #: ones drive ``resolve_signal``.
     pending_signal: OpenSignal | None
+    #: The last bound run's intended-but-invalid signal state when its
+    #: diagnostic is missing — the crash-gap state ``recover_signal``
+    #: closes. Never a fresh attempt; never a diff/verdict.
+    invalid_signal: InvalidSignal | None
     #: Signal exchanges of the current attempt (or review streak), paired
     #: ``(signal message, canonical reply|None)`` — the continuation
     #: prompt's exchange history.
@@ -319,32 +329,102 @@ def _validate_continuation(
 
 def _validate_plan_revision(
     store: SqliteRelayStore,
+    evidence: EvidenceStore,
     task_id: str,
     revision: PlanRevisionPayload,
     tip: Artifact,
+    bound_run_ids: frozenset[str],
+    delivery_runs_for_message: dict[str, list[str]],
 ) -> None:
-    """Fail-closed check that a plan revision link is fully provenance-bound:
-    the reply must be the canonical answer to the named signal, and the new
-    plan artifact must be authored by that reply's delivery run."""
+    """Fail-closed check that a plan revision edge is fully provenance-bound.
+
+    The ledger is the source-of-truth reconstruction layer: it must reject
+    forged/corrupt/crash-partial records, not trust that normal writers
+    were correct. Every edge must bind the full causal chain —
+
+        signal -> delivery run -> canonical reply -> decision -> new PLAN
+        -> PLAN_PRODUCED evidence
+
+    — or refuse ``ledger_inconsistent``.
+    """
+
+    def _inconsistent(detail: str) -> NoReturn:
+        _refuse(
+            "ledger_inconsistent",
+            f"plan revision '{revision.plan_artifact_id}': {detail}",
+        )
 
     signal = store.load_model(Message, revision.signal_message_id)
     reply = store.load_model(Message, revision.reply_message_id)
     decision = store.load_model(Decision, revision.decision_id)
-    if (
-        signal is None
-        or signal.task_id != task_id
-        or reply is None
-        or reply.id not in {r.id for r in canonical_replies_for(store, signal)}
-        or decision is None
-        or decision.task_id != task_id
-        or revision.author_run_id != reply.run_id
-        or tip.run_id != reply.run_id
-        or reply.run_id is None
+
+    # --- the signal: a task-scoped blocking CHALLENGE/PROPOSAL to planner,
+    #     authored by a bound build-stage run ---
+    if signal is None or signal.task_id != task_id:
+        _inconsistent("signal missing or not task-scoped")
+    if signal.type not in (MessageType.CHALLENGE, MessageType.PROPOSAL):
+        _inconsistent(
+            f"signal type '{signal.type}' is not challenge/proposal"
+        )
+    if not signal.blocking:
+        _inconsistent("signal is not blocking")
+    if signal.recipient_role != AgentRole.PLANNER.value:
+        _inconsistent(
+            f"signal targets '{signal.recipient_role}', not planner"
+        )
+    if signal.run_id is None or signal.run_id not in bound_run_ids:
+        _inconsistent("signal author run is not a bound build-stage run")
+
+    # --- the reply: THE canonical FINAL_POSITION answer (exactly one —
+    #     a second canonical reply is corruption), authored by the run
+    #     that delivered the signal ---
+    canonical = canonical_replies_for(store, signal)
+    if reply is None or len(canonical) != 1 or canonical[0].id != reply.id:
+        _inconsistent("reply is not the canonical FINAL_POSITION answer")
+    if reply.type != MessageType.FINAL_POSITION:
+        _inconsistent(f"reply type '{reply.type}' is not final_position")
+    if reply.run_id is None:
+        _inconsistent("reply has no authoring run")
+    if reply.run_id not in set(
+        delivery_runs_for_message.get(signal.id, [])
     ):
-        _refuse(
-            "ledger_inconsistent",
-            f"plan revision '{revision.plan_artifact_id}' is not bound to "
-            "its decision/exchange provenance",
+        _inconsistent("reply author run did not deliver the signal")
+
+    # --- the decision: task-scoped, ACCEPTED, and bound to this exchange ---
+    if decision is None or decision.task_id != task_id:
+        _inconsistent("decision missing or not task-scoped")
+    if decision.status is not DecisionStatus.ACCEPTED:
+        _inconsistent(f"decision status '{decision.status}' is not accepted")
+    if decision.proposed_by != signal.sender:
+        _inconsistent(
+            f"decision.proposed_by '{decision.proposed_by}' != "
+            f"signal sender '{signal.sender}'"
+        )
+    if decision.accepted_by != reply.sender:
+        _inconsistent(
+            f"decision.accepted_by '{decision.accepted_by}' != "
+            f"reply sender '{reply.sender}'"
+        )
+
+    # --- the new plan: the exact artifact the revision names, authored by
+    #     the reply's delivery run ---
+    if revision.author_run_id != reply.run_id:
+        _inconsistent("author_run_id != reply.run_id")
+    if tip.id != revision.plan_artifact_id:
+        _inconsistent("plan_artifact_id does not name the traversed tip")
+    if tip.task_id != task_id:
+        _inconsistent("new plan artifact is not task-scoped")
+    if tip.run_id != reply.run_id:
+        _inconsistent("new plan artifact not authored by the reply run")
+
+    # --- the evidence: a matching PLAN_PRODUCED record ---
+    if not any(
+        rec.artifact_id == tip.id and rec.run_id == reply.run_id
+        for rec in evidence.records_for_task(task_id, EvidenceKind.PLAN_PRODUCED)
+    ):
+        _inconsistent(
+            f"no PLAN_PRODUCED evidence binds artifact '{tip.id}' to "
+            f"run '{reply.run_id}'"
         )
 
 
@@ -528,7 +608,9 @@ def derive_position(
     )
 
     # --- plan revision chain (P6.4): supersession is append-only ---------
-    revisions: list[PlanRevisionPayload] = []
+    # Each entry: (report artifact id, decoded payload) — every record must
+    # be consumed by exactly one valid chain edge.
+    revisions: list[tuple[str, PlanRevisionPayload]] = []
     for artifact in store.all_models(
         Artifact,
         "WHERE task_id = ? AND kind = ?",
@@ -549,7 +631,7 @@ def derive_position(
                 "ledger_inconsistent",
                 f"plan revision record '{artifact.id}' names a different task",
             )
-        revisions.append(revision)
+        revisions.append((artifact.id, revision))
 
     plan_artifact: Artifact | None = None
     plan_run: Run | None = None
@@ -567,9 +649,12 @@ def derive_position(
             )
         current = roots[0]
         seen = {current.id}
+        consumed: set[str] = set()
         while True:
             successors = [
-                r for r in revisions if r.supersedes_plan_artifact_id == current.id
+                (aid, r)
+                for aid, r in revisions
+                if r.supersedes_plan_artifact_id == current.id
             ]
             if len(successors) > 1:
                 _refuse(
@@ -578,14 +663,23 @@ def derive_position(
                 )
             if not successors:
                 break
-            revision = successors[0]
+            revision_id, revision = successors[0]
             tip = next((p for p in plans if p.id == revision.plan_artifact_id), None)
             if tip is None or tip.id in seen:
                 _refuse(
                     "ledger_inconsistent",
                     f"plan revision '{revision.plan_artifact_id}' is missing or cyclic",
                 )
-            _validate_plan_revision(store, task.id, revision, tip)
+            _validate_plan_revision(
+                store,
+                evidence,
+                task.id,
+                revision,
+                tip,
+                frozenset(bound),
+                delivery_runs_for_message,
+            )
+            consumed.add(revision_id)
             current = tip
             seen.add(current.id)
         leftover = [p.id for p in plans if p.id not in seen]
@@ -595,6 +689,13 @@ def derive_position(
                 f"task '{task.id}' has plan artifacts outside the revision "
                 f"chain: {', '.join(leftover)}",
             )
+        orphan_revisions = [aid for aid, _ in revisions if aid not in consumed]
+        if orphan_revisions:
+            _refuse(
+                "ledger_inconsistent",
+                f"task '{task.id}' has plan revision records outside the "
+                f"canonical chain: {', '.join(orphan_revisions)}",
+            )
         plan_artifact = current
         run = store.load_model(Run, plan_artifact.run_id or "")
         if run is None:
@@ -603,6 +704,11 @@ def derive_position(
                 f"plan artifact '{plan_artifact.id}' has no resolvable author run",
             )
         plan_run = run
+    elif revisions:
+        _refuse(
+            "ledger_inconsistent",
+            f"task '{task.id}' has plan revision records but no plan artifacts",
+        )
 
     impl_markers = sorted(
         (
@@ -698,7 +804,30 @@ def derive_position(
         for run_id, (stage, _s, _a, _c) in bound.items()
         if stage in _IMPL_STAGES or stage == "review"
     ]
+    # Crash-gap detection: an intended-but-invalid signal is derivable from
+    # the persisted RUN_OUTPUT even when its diagnostic artifact is missing.
+    # That gap is only legal for the LAST bound run (the run crashed mid-
+    # bookkeeping); anything earlier is corruption, anything resolved by a
+    # persisted diagnostic stays a consumed attempt.
+    last_bound_id: str | None = (
+        max(bound.items(), key=lambda kv: kv[1][1])[0] if bound else None
+    )
+    pending_invalid: InvalidSignal | None = None
     for run in signal_runs:
+        invalid_code = invalid_signal_for_run_output(store, run)
+        if invalid_code is not None and (
+            signal_diagnostic_for_run(store, task.id, run.id) is None
+        ):
+            if run.id != last_bound_id:
+                _refuse(
+                    "ledger_inconsistent",
+                    f"run '{run.id}' emitted an intended-invalid stage "
+                    "signal without a diagnostic and is not the last "
+                    "bound run",
+                )
+            pending_invalid = InvalidSignal(
+                run=run, stage=bound[run.id][0], code=invalid_code
+            )
         authored = blocking_messages_authored_by(store, task.id, run.id)
         if not authored:
             continue
@@ -919,6 +1048,7 @@ def derive_position(
     advance_target: TaskState | None = None
     pending: Artifact | None = None
     pending_signal: OpenSignal | None = None
+    invalid_signal: InvalidSignal | None = None
     exchanges: tuple[tuple[Message, Message | None], ...] = ()
     state = task.state
 
@@ -958,39 +1088,50 @@ def derive_position(
                 next_action, advance_target = "advance", TaskState.IMPLEMENTED
         else:
             # The latest dispatch minted nothing. P6.4: it may carry an
-            # open blocking signal — resolve it, or (once answered)
-            # re-dispatch the SAME attempt with the exchange. A run with
-            # no valid signal is a consumed no-op: the next dispatch is a
-            # fresh attempt fed the previous attempt's blocker.
+            # intended-invalid signal whose diagnostic was lost to a crash
+            # (recover, then park), an open blocking signal (resolve it,
+            # or once answered re-dispatch the SAME attempt with the
+            # exchange), or be a consumed no-op (fresh attempt fed the
+            # previous attempt's blocker).
             latest_run = impl_runs[-1]
-            pending = _pending_input(previous)
-            pending_signal = _open_signal_for_run(
-                store,
-                task,
-                latest_run,
-                stage=bound[latest_run.id][0],
-                attempt=impl_attempts[-1],
-            )
-            if pending_signal is not None:
-                group_start = (
-                    impl_group_ends[-2] + 1 if len(impl_group_ends) >= 2 else 0
-                )
-                exchanges = _exchanges_for_runs(
+            if pending_invalid is not None:
+                if pending_invalid.run.id != latest_run.id:
+                    _refuse(
+                        "ledger_inconsistent",
+                        f"invalid stage-signal run '{pending_invalid.run.id}' "
+                        "is not the latest impl run",
+                    )
+                invalid_signal = pending_invalid
+                next_action = "recover_signal"
+            else:
+                pending = _pending_input(previous)
+                pending_signal = _open_signal_for_run(
                     store,
-                    task.id,
-                    [
-                        rid
-                        for _s, rid, _a, _c in impl_markers[
-                            group_start : impl_group_ends[-1] + 1
-                        ]
-                    ],
+                    task,
+                    latest_run,
+                    stage=bound[latest_run.id][0],
+                    attempt=impl_attempts[-1],
                 )
-                if pending_signal.reply is None:
-                    next_action = "resolve_signal"
+                if pending_signal is not None:
+                    group_start = (
+                        impl_group_ends[-2] + 1 if len(impl_group_ends) >= 2 else 0
+                    )
+                    exchanges = _exchanges_for_runs(
+                        store,
+                        task.id,
+                        [
+                            rid
+                            for _s, rid, _a, _c in impl_markers[
+                                group_start : impl_group_ends[-1] + 1
+                            ]
+                        ],
+                    )
+                    if pending_signal.reply is None:
+                        next_action = "resolve_signal"
+                    else:
+                        next_action = "dispatch"
                 else:
                     next_action = "dispatch"
-            else:
-                next_action = "dispatch"
     elif state is TaskState.IMPLEMENTED:
         if latest is None or latest.diff_artifact is None or latest.implementation_produced is None:
             _refuse(
@@ -1050,12 +1191,31 @@ def derive_position(
             )
             if pending_signal is not None:
                 exchanges = _exchanges_for_runs(store, task.id, streak)
-        if pending_signal is not None and pending_signal.reply is None:
+        if pending_invalid is not None:
+            if pending_invalid.run.id != latest_review_id:
+                _refuse(
+                    "ledger_inconsistent",
+                    f"invalid stage-signal run '{pending_invalid.run.id}' "
+                    "is not the latest review run",
+                )
+            invalid_signal = pending_invalid
+            next_action = "recover_signal"
+        elif pending_signal is not None and pending_signal.reply is None:
             next_action = "resolve_signal"
         else:
             next_action = "review"
     else:  # APPROVAL_REQUIRED / DONE
         next_action = "stop"
+
+    # An intended-invalid signal survives ONLY as the recoverable last
+    # bound run inside IMPLEMENTING/REVIEWING; anywhere else is forged or
+    # crash-partial corruption.
+    if pending_invalid is not None and invalid_signal is None:
+        _refuse(
+            "ledger_inconsistent",
+            f"invalid stage-signal run '{pending_invalid.run.id}' has no "
+            f"recoverable position in state {state.value}",
+        )
 
     needs_baseline_capture = (
         next_action == "dispatch" and not impl_runs and pin is None
@@ -1095,6 +1255,7 @@ def derive_position(
         latest_records=latest,
         pending_input=pending,
         pending_signal=pending_signal,
+        invalid_signal=invalid_signal,
         exchanges=exchanges,
         in_flight_runs=in_flight_runs,
         in_flight_delivery_runs=in_flight_delivery_runs,

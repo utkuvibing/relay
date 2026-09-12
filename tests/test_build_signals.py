@@ -48,6 +48,7 @@ from relay.storage.models import (
     DecisionStatus,
     EventLogEntry,
     EventType,
+    EvidenceRecord,
     Message,
     MessageType,
     PlannerDecisionPayload,
@@ -219,6 +220,12 @@ def _signal_answerer(tmp_path, *argv_flags):
     )
 
     class _Answerer(_FakeImplementer):
+        seen_requests: ClassVar[list[AgentRequest]] = []
+
+        async def run(self, request):
+            type(self).seen_requests.append(request)
+            return await super().run(request)
+
         def invocation_argv(self, resolved):
             return (resolved.command, "-c", src, *argv_flags)
 
@@ -1855,7 +1862,7 @@ class TestInterruptedDelivery:
                 services,
                 task,
                 open_signal,
-                current_plan_artifact_id=None,
+                signal_context=None,
             )
         )
         assert resolution.status == "escalated"
@@ -2047,4 +2054,554 @@ class TestLedgerProvenanceRefusals:
             )
         )
         assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Crash-gap recovery: intended-invalid signals never fall through to normal
+# handling — including when the RUN_OUTPUT commit outlived the diagnostic.
+# ---------------------------------------------------------------------------
+
+
+def _delete_diagnostic(conn, store, task_id: str) -> str:
+    """Drop the persisted signal diagnostic — the crash-gap state where the
+    RUN_OUTPUT commit survived but the diagnostic's did not. The orphaned
+    ARTIFACT_CREATED event stays (the log is append-only); nothing resolves
+    diagnostic provenance through event refs."""
+    diagnostics = [
+        a
+        for a in store.all_models(Artifact)
+        if a.kind is ArtifactKind.REPORT
+        and a.task_id == task_id
+        and '"relay.build.signal.invalid.v1"' in (a.content or "")
+    ]
+    assert len(diagnostics) == 1
+    artifact_id = diagnostics[0].id
+    conn.execute("DELETE FROM artifacts WHERE id = ?", [artifact_id])
+    conn.commit()
+    return artifact_id
+
+
+class TestInvalidSignalCrashRecovery:
+    def test_impl_crash_gap_recovers_parks_then_resumes(self, build_workspace):
+        """RUN_OUTPUT committed, diagnostic absent: continue must re-derive
+        the invalid intent, persist the diagnostic, and park — never mint
+        a fresh attempt from that run."""
+        _signal_workspace(build_workspace)
+        signals = build_workspace / ".relay" / "impl-signals"
+        _write_slot(signals, 1, _signal_json("teleport", "planner", "x"))
+        impl = _signal_fake(build_workspace, "--impl-signal-dir", str(signals))
+        answerer = _signal_answerer(build_workspace)
+        with transient_adapters(
+            {"fake_implementer_build": impl, "fake_answerer": answerer}
+        ):
+            result = runner.invoke(
+                app, ["build", "write implemented.txt", "--agent", "impl"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "communication_blocked" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = _task(store)
+        assert [d.code for d in _diagnostics(store, task.id)] == ["invalid_signal"]
+        impl_markers = [m for m in _markers(conn, task.id) if _stage_of(m) == "implement"]
+        assert len(impl_markers) == 1
+
+        # The crash gap: drop the diagnostic commit, keep the RUN_OUTPUT.
+        _delete_diagnostic(conn, store, task.id)
+        assert _diagnostics(store, task.id) == []
+
+        # Resume: the ledger recovers the invalid intent — diagnostic is
+        # re-persisted and the build re-parks. NO new attempt, no DIFF.
+        with transient_adapters(
+            {"fake_implementer_build": impl, "fake_answerer": answerer}
+        ):
+            result = runner.invoke(app, ["continue"])
+        assert result.exit_code == 0, result.output
+        assert "communication_blocked" in result.output
+        diagnostics = _diagnostics(store, task.id)
+        assert [d.code for d in diagnostics] == ["invalid_signal"]
+        signal_run = next(r for r in store.all_models(Run) if r.role == "implementer")
+        assert diagnostics[0].run_id == signal_run.id
+        impl_markers = [m for m in _markers(conn, task.id) if _stage_of(m) == "implement"]
+        assert len(impl_markers) == 1  # no fresh attempt was dispatched
+        assert store.artifacts_for_run(signal_run.id, kind=ArtifactKind.DIFF) == []
+
+        # Idempotent: losing the diagnostic AGAIN recovers the same way —
+        # still exactly one diagnostic row, still parked, still no attempt.
+        _delete_diagnostic(conn, store, task.id)
+        with transient_adapters(
+            {"fake_implementer_build": impl, "fake_answerer": answerer}
+        ):
+            result = runner.invoke(app, ["continue"])
+        assert result.exit_code == 0, result.output
+        assert "communication_blocked" in result.output
+        assert len(_diagnostics(store, task.id)) == 1
+        impl_markers = [m for m in _markers(conn, task.id) if _stage_of(m) == "implement"]
+        assert len(impl_markers) == 1
+
+        # With the diagnostic durable, the run is a consumed no-op —
+        # continue dispatches a genuine fresh attempt.
+        with transient_adapters(
+            {"fake_implementer_build": impl, "fake_answerer": answerer}
+        ):
+            result = runner.invoke(app, ["continue"])
+        assert result.exit_code == 0, result.output
+        assert "pass_promoted" in result.output
+        impl_markers = [m for m in _markers(conn, task.id) if _stage_of(m) == "implement"]
+        assert [_refs(m, "build_attempt:") for m in impl_markers] == [["1"], ["2"]]
+        conn.close()
+
+    def test_review_crash_gap_recovers_parks_then_resumes(self, build_workspace):
+        """Reviewer invalid-signal output obeys the same fail-closed rule:
+        the missing diagnostic is recovered and the build re-parks."""
+        _signal_workspace(build_workspace)
+        signals = build_workspace / ".relay" / "review-signals"
+        _write_slot(signals, 1, _signal_json("note", "planner", "fyi"))
+        impl = _signal_fake(build_workspace, "--review-signal-dir", str(signals))
+        answerer = _signal_answerer(build_workspace)
+        with transient_adapters(
+            {"fake_implementer_build": impl, "fake_answerer": answerer}
+        ):
+            result = runner.invoke(
+                app, ["build", "write implemented.txt", "--agent", "impl"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "communication_blocked" in result.output
+
+        conn, store = _open_store(build_workspace)
+        task = _task(store)
+        assert task.state is TaskState.REVIEWING
+        assert [d.code for d in _diagnostics(store, task.id)] == ["kind_not_permitted"]
+        review_markers = [m for m in _markers(conn, task.id) if _stage_of(m) == "review"]
+        assert len(review_markers) == 1
+
+        _delete_diagnostic(conn, store, task.id)
+
+        with transient_adapters(
+            {"fake_implementer_build": impl, "fake_answerer": answerer}
+        ):
+            result = runner.invoke(app, ["continue"])
+        assert result.exit_code == 0, result.output
+        assert "communication_blocked" in result.output
+        assert [d.code for d in _diagnostics(store, task.id)] == ["kind_not_permitted"]
+        review_markers = [m for m in _markers(conn, task.id) if _stage_of(m) == "review"]
+        assert len(review_markers) == 1  # no new review run was dispatched
+        assert not [
+            a
+            for a in store.all_models(Artifact)
+            if a.kind is ArtifactKind.REVIEW_FINDING and a.task_id == task.id
+        ]
+
+        # Diagnostic durable → the review run is consumed → a legitimate
+        # review retry proceeds.
+        with transient_adapters(
+            {"fake_implementer_build": impl, "fake_answerer": answerer}
+        ):
+            result = runner.invoke(app, ["continue"])
+        assert result.exit_code == 0, result.output
+        assert "pass_promoted" in result.output
+        task = _task(store)
+        assert task.state is TaskState.APPROVAL_REQUIRED
+        conn.close()
+
+    def test_buried_invalid_run_without_diagnostic_refuses(self, build_workspace):
+        """An intended-invalid run that is NOT the last bound run and lacks
+        a diagnostic is unforgeable-by-crash — the ledger refuses it."""
+        _signal_workspace(build_workspace)
+        signals = build_workspace / ".relay" / "impl-signals"
+        _write_slot(signals, 1, _signal_json("teleport", "planner", "x"))
+        impl = _signal_fake(build_workspace, "--impl-signal-dir", str(signals))
+        answerer = _signal_answerer(build_workspace)
+        with transient_adapters(
+            {"fake_implementer_build": impl, "fake_answerer": answerer}
+        ):
+            result = runner.invoke(
+                app, ["build", "write implemented.txt", "--agent", "impl"]
+            )
+        assert result.exit_code == 0, result.output
+
+        conn, store = _open_store(build_workspace)
+        task = _task(store)
+        _delete_diagnostic(conn, store, task.id)
+        # Bury the invalid run: a later impl run binds after it.
+        later = _forge_run(store, task)
+        writer = EventLogWriter(conn)
+        _forge_marker(writer, task, later, "implement", attempt=2)
+        conn.commit()
+        assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Plan revision provenance: every revision edge must bind the full causal
+# chain (signal -> delivery run -> canonical reply -> ACCEPTED decision ->
+# new PLAN -> PLAN_PRODUCED evidence) or the ledger refuses.
+# ---------------------------------------------------------------------------
+
+
+def _superseded_plan_build(build_workspace):
+    """Drive the fixer->planner proposal->supersede e2e. Returns the open
+    (conn, store, task, answerer) — callers close the connection."""
+    _signal_workspace(build_workspace)
+    signals = build_workspace / ".relay" / "impl-signals"
+    _write_slot(
+        signals,
+        2,  # the FIX run (impl ordinal 2) emits the proposal
+        _signal_json("proposal", "planner", "adopt the simpler approach"),
+    )
+    decision = _write_file(
+        build_workspace / ".relay" / "planner-decision.txt",
+        _decision_json(
+            "accept",
+            "supersede",
+            "plan v2 is canonical",
+            rationale="the proposal is strictly better",
+            revised_plan="# Plan v2\n\nGoal: implement the task\n"
+            "Steps: write implemented.txt the simple way\n"
+            "Files: implemented.txt\nVerification: file exists",
+        ),
+    )
+    impl_answer = _write_file(build_workspace / ".relay" / "a.txt", "x")
+    impl = _signal_fake(
+        build_workspace,
+        "--impl-signal-dir",
+        str(signals),
+        "--review-verdicts",
+        "findings,pass",
+        "--answer-file",
+        str(impl_answer),
+    )
+    answerer = _signal_answerer(build_workspace, "--answer-file", str(decision))
+    with transient_adapters(
+        {"fake_implementer_build": impl, "fake_answerer": answerer}
+    ):
+        result = runner.invoke(
+            app, ["build", "write implemented.txt", "--agent", "impl"]
+        )
+    assert result.exit_code == 0, result.output
+    assert "pass_promoted" in result.output
+    conn, store = _open_store(build_workspace)
+    return conn, store, _task(store), answerer
+
+
+def _revision_parts(store, task):
+    """(report artifact, payload, decision, signal, reply, root, tip)."""
+    reports = [
+        a
+        for a in store.all_models(Artifact)
+        if a.task_id == task.id and '"relay.plan_revision.v1"' in (a.content or "")
+    ]
+    assert len(reports) == 1
+    revision = PlanRevisionPayload.model_validate_json(reports[0].content or "")
+    return (
+        reports[0],
+        revision,
+        store.load_model(Decision, revision.decision_id),
+        store.load_model(Message, revision.signal_message_id),
+        store.load_model(Message, revision.reply_message_id),
+        store.load_model(Artifact, revision.supersedes_plan_artifact_id),
+        store.load_model(Artifact, revision.plan_artifact_id),
+    )
+
+
+def _replace_revision(store, task: Task, **overrides) -> PlanRevisionPayload:
+    """Swap the real revision report for a forged variant (``artifacts`` is
+    mutable; ``messages``/``evidence_records`` are trigger-protected)."""
+    report, revision, *_ = _revision_parts(store, task)
+    store.delete_model(report)
+    forged = revision.model_copy(update=overrides)
+    store.save_model(
+        Artifact(
+            kind=ArtifactKind.REPORT,
+            task_id=task.id,
+            content=forged.model_dump_json(),
+        )
+    )
+    return forged
+
+
+class TestPlanRevisionProvenance:
+    def test_rejected_decision_refuses(self, build_workspace):
+        conn, store, task, _a = _superseded_plan_build(build_workspace)
+        _report, _rev, decision, _s, _r, _root, _tip = _revision_parts(store, task)
+        conn.execute(
+            "UPDATE decisions SET status = ? WHERE id = ?",
+            [DecisionStatus.REJECTED.value, decision.id],
+        )
+        conn.commit()
+        assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+    def test_decision_accepted_by_mismatch_refuses(self, build_workspace):
+        conn, store, task, _a = _superseded_plan_build(build_workspace)
+        _report, _rev, decision, _s, _r, _root, _tip = _revision_parts(store, task)
+        conn.execute(
+            "UPDATE decisions SET accepted_by = ? WHERE id = ?",
+            ["mallory", decision.id],
+        )
+        conn.commit()
+        assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+    def test_decision_proposed_by_mismatch_refuses(self, build_workspace):
+        conn, store, task, _a = _superseded_plan_build(build_workspace)
+        _report, _rev, decision, _s, _r, _root, _tip = _revision_parts(store, task)
+        conn.execute(
+            "UPDATE decisions SET proposed_by = ? WHERE id = ?",
+            ["mallory", decision.id],
+        )
+        conn.commit()
+        assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+    def test_clarification_signal_type_refuses(self, build_workspace):
+        """A revision edge bound to a clarification_request (not a
+        challenge/proposal) fails closed."""
+        conn, store, task, _a = _superseded_plan_build(build_workspace)
+        _report, _rev, _d, signal, _r, _root, _tip = _revision_parts(store, task)
+        forged_signal = store.save_model(
+            Message(
+                sender=signal.sender,
+                recipient=signal.recipient,
+                recipient_role=signal.recipient_role,
+                task_id=task.id,
+                type=MessageType.CLARIFICATION_REQUEST,
+                blocking=True,
+                run_id=signal.run_id,
+                content="forged clarification signal",
+            )
+        )
+        _replace_revision(store, task, signal_message_id=forged_signal.id)
+        assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+    def test_missing_plan_produced_evidence_refuses(self, build_workspace):
+        """A revision edge whose tip plan has no PLAN_PRODUCED evidence."""
+        conn, store, task, _a = _superseded_plan_build(build_workspace)
+        _report, _rev, _d, _s, reply, _root, _tip = _revision_parts(store, task)
+        forged_tip = store.save_model(
+            Artifact(
+                kind=ArtifactKind.PLAN,
+                task_id=task.id,
+                run_id=reply.run_id,
+                content="# forged tip",
+            )
+        )
+        _replace_revision(store, task, plan_artifact_id=forged_tip.id)
+        assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+    def test_plan_produced_wrong_run_refuses(self, build_workspace):
+        """PLAN_PRODUCED exists for the tip but names the wrong run."""
+        conn, store, task, _a = _superseded_plan_build(build_workspace)
+        _report, _rev, _d, _s, reply, _root, _tip = _revision_parts(store, task)
+        forged_tip = store.save_model(
+            Artifact(
+                kind=ArtifactKind.PLAN,
+                task_id=task.id,
+                run_id=reply.run_id,
+                content="# forged tip",
+            )
+        )
+        SqliteEvidenceStore(store).record(
+            EvidenceRecord(
+                kind=EvidenceKind.PLAN_PRODUCED,
+                task_id=task.id,
+                run_id="no-such-run",
+                artifact_id=forged_tip.id,
+                produced_by="agent:forged",
+            )
+        )
+        _replace_revision(store, task, plan_artifact_id=forged_tip.id)
+        assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+    def test_plan_produced_wrong_artifact_refuses(self, build_workspace):
+        """PLAN_PRODUCED exists for the reply run but names the wrong plan."""
+        conn, store, task, _a = _superseded_plan_build(build_workspace)
+        _report, _rev, _d, _s, reply, _root, _tip = _revision_parts(store, task)
+        forged_tip = store.save_model(
+            Artifact(
+                kind=ArtifactKind.PLAN,
+                task_id=task.id,
+                run_id=reply.run_id,
+                content="# forged tip",
+            )
+        )
+        SqliteEvidenceStore(store).record(
+            EvidenceRecord(
+                kind=EvidenceKind.PLAN_PRODUCED,
+                task_id=task.id,
+                run_id=reply.run_id,
+                artifact_id="no-such-artifact",
+                produced_by="agent:forged",
+            )
+        )
+        _replace_revision(store, task, plan_artifact_id=forged_tip.id)
+        assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+    def test_orphan_revision_record_refuses(self, build_workspace):
+        """A revision record superseding nothing reachable is corruption."""
+        conn, store, task, _a = _superseded_plan_build(build_workspace)
+        _report, revision, _d, _s, _r, _root, _tip = _revision_parts(store, task)
+        store.save_model(
+            Artifact(
+                kind=ArtifactKind.REPORT,
+                task_id=task.id,
+                content=revision.model_copy(
+                    update={"supersedes_plan_artifact_id": "no-such-plan"}
+                ).model_dump_json(),
+            )
+        )
+        assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+    def test_double_supersession_refuses(self, build_workspace):
+        """A second revision record superseding the SAME plan is a fork."""
+        conn, store, task, _a = _superseded_plan_build(build_workspace)
+        _report, revision, _d, _s, _r, _root, _tip = _revision_parts(store, task)
+        store.save_model(
+            Artifact(
+                kind=ArtifactKind.REPORT,
+                task_id=task.id,
+                content=revision.model_dump_json(),
+            )
+        )
+        assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+    def test_reply_not_from_delivery_run_refuses(self, build_workspace):
+        """The reply must be authored by the run that delivered the signal:
+        a forged exchange with a foreign reply run fails closed."""
+        conn, store, task, _a = _superseded_plan_build(build_workspace)
+        _report, _rev, _d, signal, reply, _root, _tip = _revision_parts(
+            store, task
+        )
+        forged_signal = store.save_model(
+            Message(
+                sender=signal.sender,
+                recipient=signal.recipient,
+                recipient_role=signal.recipient_role,
+                task_id=task.id,
+                type=MessageType.PROPOSAL,
+                blocking=True,
+                run_id=signal.run_id,
+                content="forged proposal signal",
+            )
+        )
+        forged_reply = store.save_model(
+            Message(
+                sender=signal.recipient,
+                recipient=signal.sender,
+                task_id=task.id,
+                type=MessageType.FINAL_POSITION,
+                reply_to_id=forged_signal.id,
+                run_id="no-such-run",
+                content="forged reply",
+            )
+        )
+        forged_tip = store.save_model(
+            Artifact(
+                kind=ArtifactKind.PLAN,
+                task_id=task.id,
+                run_id=reply.run_id,
+                content="# forged tip",
+            )
+        )
+        _replace_revision(
+            store,
+            task,
+            signal_message_id=forged_signal.id,
+            reply_message_id=forged_reply.id,
+            plan_artifact_id=forged_tip.id,
+            author_run_id=forged_reply.run_id,
+        )
+        assert _derive_refusal(store, task.id).code == "ledger_inconsistent"
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Bounded planner context: challenge/proposal deliveries carry the current
+# plan + original request inside the frozen envelope.
+# ---------------------------------------------------------------------------
+
+
+class TestSignalDeliveryContext:
+    def test_proposal_delivery_carries_plan_request_and_blocker(
+        self, build_workspace
+    ):
+        """The planner answers a superseding proposal with the canonical
+        plan in view — the context rides the message content and refs."""
+        conn, store, task, answerer = _superseded_plan_build(build_workspace)
+        _report, _rev, _d, signal, _r, root, _tip = _revision_parts(
+            store, task
+        )
+        packets = [
+            a
+            for a in store.all_models(Artifact)
+            if a.kind is ArtifactKind.FIX_PACKET and a.task_id == task.id
+        ]
+        assert len(packets) == 1
+
+        # The proposal message embeds the bounded context block BEFORE the
+        # reply contract — all inside the frozen D15 envelope.
+        assert signal.type is MessageType.PROPOSAL
+        content = signal.content
+        assert "ORIGINAL BUILD REQUEST:" in content
+        assert "write implemented.txt" in content
+        assert f"CURRENT CANONICAL PLAN (artifact:{root.id}):" in content
+        assert (root.content or "")[:200] in content
+        assert f"STAGE BLOCKER: artifact:{packets[0].id}" in content
+        assert "relay.planner_decision.v1" in content
+        assert content.index("CURRENT CANONICAL PLAN") < content.index(
+            "relay.planner_decision.v1"
+        )
+
+        # Provenance refs ride message.references -> context_refs.
+        assert f"artifact:{root.id}" in signal.references
+        assert f"artifact:{packets[0].id}" in signal.references
+        delivery_requests = [
+            r for r in answerer.seen_requests if "adopt the simpler approach" in r.prompt
+        ]
+        assert len(delivery_requests) == 1
+        request = delivery_requests[0]
+        assert f"artifact:{root.id}" in request.context_refs
+        assert f"artifact:{packets[0].id}" in request.context_refs
+
+        # The envelope itself is untouched: verbatim D15 prefix.
+        assert request.prompt.startswith(
+            "You received a message via the Relay conversation bus.\n"
+            "FROM: impl\nTYPE: proposal\nBLOCKING: true\n\nMESSAGE:\n"
+        )
+        conn.close()
+
+    def test_clarification_carries_no_decision_context(self, build_workspace):
+        """Only challenge/proposal get the context block — clarification
+        messages keep the pre-context shape."""
+        _signal_workspace(build_workspace)
+        signals = build_workspace / ".relay" / "impl-signals"
+        _write_slot(
+            signals, 1, _signal_json("clarification_request", "planner", "which file?")
+        )
+        answer = _write_file(build_workspace / ".relay" / "a.txt", "the file")
+        impl = _signal_fake(
+            build_workspace, "--impl-signal-dir", str(signals)
+        )
+        answerer = _signal_answerer(build_workspace, "--answer-file", str(answer))
+        with transient_adapters(
+            {"fake_implementer_build": impl, "fake_answerer": answerer}
+        ):
+            result = runner.invoke(
+                app, ["build", "write implemented.txt", "--agent", "impl"]
+            )
+        assert result.exit_code == 0, result.output
+        conn, store = _open_store(build_workspace)
+        task = _task(store)
+        message = _messages(store, task.id)[0]
+        assert message.type is MessageType.CLARIFICATION_REQUEST
+        assert "CURRENT CANONICAL PLAN" not in message.content
+        assert "ORIGINAL BUILD REQUEST" not in message.content
+        assert not [r for r in message.references if r.startswith("artifact:")]
         conn.close()

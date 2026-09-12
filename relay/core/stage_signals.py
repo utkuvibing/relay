@@ -67,8 +67,10 @@ __all__ = [
     "SIGNAL_MESSAGE_TYPES",
     "SIGNAL_SCHEMA",
     "SIGNAL_SENDER",
+    "InvalidSignal",
     "OpenSignal",
     "SignalContractError",
+    "SignalDeliveryContext",
     "SignalResolution",
     "SignalServices",
     "blocking_messages_authored_by",
@@ -77,6 +79,7 @@ __all__ = [
     "compose_signal_message",
     "escalation_exists",
     "exchange_appendix",
+    "invalid_signal_for_run_output",
     "notes_appendix",
     "parse_stage_signal",
     "persist_escalation",
@@ -84,6 +87,7 @@ __all__ = [
     "resolve_open_signal",
     "send_note_signal",
     "signal_appendix",
+    "signal_diagnostic_for_run",
     "signal_for_run_output",
     "signal_is_blocking",
     "signal_message_type",
@@ -313,6 +317,36 @@ def signal_for_run_output(store: SqliteRelayStore, run: Run) -> StageSignalPaylo
         return None
 
 
+def invalid_signal_for_run_output(store: SqliteRelayStore, run: Run) -> str | None:
+    """The contract-error code when the run's persisted RUN_OUTPUT is an
+    intended-but-invalid stage signal — else ``None``.
+
+    Intended-invalid means EITHER strict parse/schema failure OR a legal
+    parse that violates the run role's signal legality — exactly what the
+    stage functions diagnose at detection time. Derivation must never
+    collapse this to ordinary output: a crash between the RUN_OUTPUT commit
+    and the ``relay.build.signal.invalid.v1`` diagnostic persist would
+    otherwise let resume treat the run as a consumed no-op and mint a
+    fresh attempt — the fail-closed violation the ledger recovers from via
+    the ``recover_signal`` action.
+    """
+
+    outputs = store.artifacts_for_run(run.id, kind=ArtifactKind.RUN_OUTPUT)
+    if len(outputs) != 1:
+        return None
+    try:
+        signal = parse_stage_signal(outputs[0].content or "")
+    except SignalContractError as exc:
+        return exc.code
+    if signal is None:
+        return None
+    try:
+        check_signal_legal(signal, run.role)
+    except SignalContractError as exc:
+        return exc.code
+    return None
+
+
 def blocking_messages_authored_by(
     store: SqliteRelayStore, task_id: str, run_id: str
 ) -> list[Message]:
@@ -375,6 +409,38 @@ class OpenSignal:
 
 
 @dataclass(frozen=True)
+class InvalidSignal:
+    """A run whose RUN_OUTPUT is an intended-but-invalid stage signal.
+
+    Only derivable for the LAST bound run and only while its
+    ``relay.build.signal.invalid.v1`` diagnostic is missing — the crash gap
+    the driver closes by persisting the diagnostic and parking
+    COMMUNICATION_BLOCKED (never a fresh attempt, never a diff/verdict).
+    """
+
+    run: Run
+    stage: str
+    code: str
+
+
+@dataclass(frozen=True)
+class SignalDeliveryContext:
+    """Bounded durable context for decision-bearing signal deliveries.
+
+    The frozen D15 envelope cannot grow fields, so the CURRENT canonical
+    plan and the original build request ride inside the message content
+    (and as provenance ``references`` → ``AgentRequest.context_refs``) — a
+    planner asked to supersede the plan must never answer blind. All
+    fields are optional; absent pieces are simply omitted from the block.
+    """
+
+    plan_artifact_id: str | None
+    plan_content: str | None
+    request_prompt: str | None
+    blocker_artifact_id: str | None
+
+
+@dataclass(frozen=True)
 class SignalServices:
     """The P4/P5 communication seams the build driver consumes."""
 
@@ -393,25 +459,64 @@ class SignalResolution:
     decision: Decision | None = None
 
 
+_MAX_PLAN_CONTEXT_CHARS = 4_000
+_MAX_REQUEST_CONTEXT_CHARS = 1_000
+
+
+def _decision_context_block(context: SignalDeliveryContext) -> str:
+    """Bounded context embedded in a challenge/proposal message body so the
+    planner can answer (and possibly supersede the plan) without flying
+    blind. Rides INSIDE the frozen D15 envelope — no P4 surface change."""
+    parts = [
+        (
+            "\n\n---\n"
+            "[relay:stage-signal] CONTEXT (durable Relay records — "
+            "coordination input, not authority):"
+        )
+    ]
+    if context.request_prompt:
+        parts.append(
+            "ORIGINAL BUILD REQUEST:\n"
+            + context.request_prompt[:_MAX_REQUEST_CONTEXT_CHARS]
+        )
+    if context.plan_artifact_id and context.plan_content:
+        parts.append(
+            f"CURRENT CANONICAL PLAN (artifact:{context.plan_artifact_id}):\n"
+            + context.plan_content[:_MAX_PLAN_CONTEXT_CHARS]
+        )
+    if context.blocker_artifact_id:
+        parts.append(f"STAGE BLOCKER: artifact:{context.blocker_artifact_id}")
+    return "\n\n".join(parts)
+
+
 def compose_signal_message(
     task: Task,
     run: Run,
     signal: StageSignalPayload,
     *,
     retry_of: str | None = None,
+    context: SignalDeliveryContext | None = None,
 ) -> Message:
     """Translate a validated signal into a task-scoped bus message.
 
-    ``challenge``/``proposal`` bodies gain the ``relay:``-delimited reply
-    contract — the D15 delivery envelope is frozen, so content is the only
-    channel that can carry it. ``retry_of`` links a retry send to the
-    superseded message.
+    ``challenge``/``proposal`` bodies gain the bounded decision context
+    block (when supplied) and the ``relay:``-delimited reply contract —
+    the D15 delivery envelope is frozen, so content is the only channel
+    that can carry them. ``retry_of`` links a retry send to the superseded
+    message.
     """
 
     content = signal.body
     if signal.kind in ("challenge", "proposal"):
-        content = signal.body + _DECISION_REPLY_CONTRACT
+        if context is not None:
+            content += _decision_context_block(context)
+        content += _DECISION_REPLY_CONTRACT
     references = [ref[:_MAX_REF_CHARS] for ref in signal.references]
+    if context is not None and signal.kind in ("challenge", "proposal"):
+        if context.plan_artifact_id:
+            references.append(f"artifact:{context.plan_artifact_id}")
+        if context.blocker_artifact_id:
+            references.append(f"artifact:{context.blocker_artifact_id}")
     if retry_of is not None:
         references.append(f"message:{retry_of}")
     return Message(
@@ -521,6 +626,27 @@ def persist_escalation(
     return artifact
 
 
+def signal_diagnostic_for_run(
+    store: SqliteRelayStore, task_id: str, run_id: str
+) -> Artifact | None:
+    """The persisted ``relay.build.signal.invalid.v1`` diagnostic for a run."""
+    for artifact in store.all_models(
+        Artifact,
+        "WHERE task_id = ? AND kind = ?",
+        [task_id, ArtifactKind.REPORT.value],
+    ):
+        content = artifact.content or ""
+        if '"relay.build.signal.invalid.v1"' not in content:
+            continue
+        try:
+            payload = SignalInvalidPayload.model_validate_json(content)
+        except ValidationError:
+            continue
+        if payload.run_id == run_id:
+            return artifact
+    return None
+
+
 def persist_signal_diagnostic(
     store: SqliteRelayStore,
     writer: EventLogWriter,
@@ -531,8 +657,15 @@ def persist_signal_diagnostic(
     code: str,
 ) -> Artifact:
     """Persist ``relay.build.signal.invalid.v1`` for an intended-but-invalid
-    signal output — the run is consumed but the stage parks honestly."""
+    signal output — the run is consumed but the stage parks honestly.
 
+    Idempotent per (task, run): the crash-gap recovery path may observe a
+    diagnostic already committed before the process died.
+    """
+
+    existing = signal_diagnostic_for_run(store, task.id, run.id)
+    if existing is not None:
+        return existing
     outputs = store.artifacts_for_run(run.id, kind=ArtifactKind.RUN_OUTPUT)
     output_artifact_id = outputs[0].id if len(outputs) == 1 else None
     payload = SignalInvalidPayload(
@@ -771,7 +904,7 @@ async def resolve_open_signal(
     task: Task,
     open_signal: OpenSignal,
     *,
-    current_plan_artifact_id: str | None,
+    signal_context: SignalDeliveryContext | None = None,
 ) -> SignalResolution:
     """Advance one open blocking signal one step, resuming from ledger state.
 
@@ -784,6 +917,10 @@ async def resolve_open_signal(
     from relay.core.delivery import (  # lazy: delivery -> orchestrator -> this module
         DeliveryPendingRefusal,
         DeliveryRefusal,
+    )
+
+    current_plan_artifact_id = (
+        signal_context.plan_artifact_id if signal_context is not None else None
     )
 
     def escalate(
@@ -818,7 +955,13 @@ async def resolve_open_signal(
                 "self_send",
                 f"role '{open_signal.signal.to_role}' resolves to the emitting agent",
             )
-        message = compose_signal_message(task, open_signal.run, open_signal.signal, retry_of=retry_of)
+        message = compose_signal_message(
+            task,
+            open_signal.run,
+            open_signal.signal,
+            retry_of=retry_of,
+            context=signal_context,
+        )
         try:
             return services.bus.send(message)
         except BlockingBudgetExhausted as exc:

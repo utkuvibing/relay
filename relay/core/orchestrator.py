@@ -86,6 +86,7 @@ from relay.core.reviews import (
 )
 from relay.core.stage_signals import (
     SignalContractError,
+    SignalDeliveryContext,
     SignalServices,
     check_signal_legal,
     exchange_appendix,
@@ -1930,6 +1931,27 @@ async def _drive_build(
             stop = LoopStopReason.PASS_PROMOTED
             break
 
+        if action == "recover_signal":
+            # Crash-gap recovery: the last bound run's RUN_OUTPUT is an
+            # intended-invalid signal whose diagnostic was never persisted.
+            # Persist it (idempotently) and park — never a fresh attempt,
+            # never a diff/verdict from that run.
+            invalid = position.invalid_signal
+            if invalid is None:
+                stop = LoopStopReason.COMMUNICATION_BLOCKED
+                break
+            diagnostic = persist_signal_diagnostic(
+                store,
+                writer,
+                task,
+                invalid.run,
+                stage=invalid.stage,
+                code=invalid.code,
+            )
+            signal_escalation_id = diagnostic.id
+            stop = LoopStopReason.COMMUNICATION_BLOCKED
+            break
+
         if action == "resolve_signal":
             # P6.4: the latest stage run emitted a blocking signal whose
             # exchange is unresolved — send/deliver/promote from durable
@@ -1946,10 +1968,23 @@ async def _drive_build(
                 signals,
                 task,
                 open_signal,
-                current_plan_artifact_id=(
-                    position.plan_artifact.id
-                    if position.plan_artifact is not None
-                    else None
+                signal_context=SignalDeliveryContext(
+                    plan_artifact_id=(
+                        position.plan_artifact.id
+                        if position.plan_artifact is not None
+                        else None
+                    ),
+                    plan_content=(
+                        position.plan_artifact.content
+                        if position.plan_artifact is not None
+                        else None
+                    ),
+                    request_prompt=position.request.prompt,
+                    blocker_artifact_id=(
+                        position.pending_input.id
+                        if position.pending_input is not None
+                        else None
+                    ),
                 ),
             )
             if resolution.status == "escalated":
