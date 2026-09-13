@@ -21,6 +21,8 @@ from relay.core.policy import (
 from relay.core.protocol_encoding import ParticipantConfig, definition_bytes, definition_digest
 from relay.core.protocol_runner import ProtocolRunner, ProtocolSpec, ProtocolStopReason
 from relay.core.protocols import EvaluationStatus, ParticipantRequirement
+from relay.core.rooms import RoomLifecycle
+from relay.core.state_machine import TaskState
 from relay.harness.capabilities import HarnessCapability
 from relay.storage.db import _MIGRATIONS, connect, migrate
 from relay.storage.events import EventLogWriter
@@ -32,6 +34,8 @@ from relay.storage.models import (
     RoomStatus,
     Run,
     RunStatus,
+    Task,
+    Workspace,
 )
 from relay.storage.store import ImmutableHistoryError, SqliteRelayStore
 
@@ -200,6 +204,27 @@ async def test_closed_room_resume_refuses_without_outcome_or_agent(store):
     assert result.stop_reason is ProtocolStopReason.INPUT_REFUSED
     assert store.counts() == before
     assert factory.agent.requests == []
+
+
+async def test_room_resume_restores_protocol_traffic_without_changing_task(store):
+    workspace = store.save_model(Workspace(id="workspace", name="demo"))
+    room = store.load_model(Room, "room")
+    room = store.update_model(room.model_copy(update={"workspace_id": workspace.id}))
+    task = store.save_model(Task(title="preserved", room_id=room.id))
+    lifecycle = RoomLifecycle(store, EventLogWriter(store.conn))
+    closed = lifecycle.close(workspace, room)
+    factory = Factory()
+    service = runner(store, factory)
+
+    refused = await service.start(spec())
+    assert refused.stop_reason is ProtocolStopReason.INPUT_REFUSED
+    assert factory.agent.requests == []
+
+    lifecycle.resume(store.load_model(Workspace, workspace.id), closed)
+    completed = await service.start(spec())
+    assert completed.stop_reason is ProtocolStopReason.COMPLETE
+    assert factory.agent.requests
+    assert store.load_model(Task, task.id).state is TaskState.CREATED
 
 
 async def test_failed_and_cancelled_requests_are_never_retried(store):

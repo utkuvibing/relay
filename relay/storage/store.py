@@ -250,10 +250,14 @@ class SqliteRelayStore:
         if table in _APPEND_ONLY_TABLES:
             raise ImmutableHistoryError(f"'{table}' is append-only")
         codec = _codec(type(record))
-        assignments = ", ".join(f"{col} = ?" for _, col, _ in codec)
+        assignments = [f"{col} = ?" for _, col, _ in codec]
         values = [_encode_field(ann, getattr(record, fname)) for fname, _, ann in codec]
+        if type(record) is Room and record.workspace_id is not None:
+            assignments.append("name_key = ?")
+            values.append(room_name_key(record.name))
         cursor = self.conn.execute(
-            f"UPDATE {table} SET {assignments} WHERE {_pk_column(type(record))} = ?",
+            f"UPDATE {table} SET {', '.join(assignments)} "
+            f"WHERE {_pk_column(type(record))} = ?",
             [*values, getattr(record, _pk_column(type(record)))],
         )
         if cursor.rowcount == 0:

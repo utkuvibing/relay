@@ -64,6 +64,55 @@ def test_close_and_resume_preserve_task_and_history(room_store):
     assert store.load_model(Workspace, workspace.id).active_room_id == room.id
 
 
+def test_lifecycle_is_idempotent_and_persists_after_database_reopen(tmp_path):
+    path = tmp_path / "persistent.db"
+    conn = connect(path)
+    migrate(conn)
+    store = SqliteRelayStore(conn)
+    workspace = store.save_model(Workspace(id="workspace", name="demo"))
+    lifecycle = RoomLifecycle(store, EventLogWriter(conn))
+    room = lifecycle.create(workspace, "Persistent", {"planner": "gpt"}, {"gpt"})
+    workspace = store.load_model(Workspace, workspace.id)
+    counts = store.counts()
+    assert lifecycle.resume(workspace, room) == room
+    assert store.counts() == counts
+    closed = lifecycle.close(workspace, room)
+    counts = store.counts()
+    assert lifecycle.close(store.load_model(Workspace, workspace.id), closed) == closed
+    assert store.counts() == counts
+    conn.close()
+
+    reopened_conn = connect(path)
+    reopened_store = SqliteRelayStore(reopened_conn)
+    assert reopened_store.load_model(Room, room.id) == closed
+    assert reopened_store.load_model(Workspace, workspace.id).active_room_id is None
+    reopened_conn.close()
+
+
+def test_room_lookup_precedence_and_ambiguous_prefix(room_store):
+    store, workspace, lifecycle = room_store
+    first = lifecycle.create(
+        workspace,
+        "Alpha",
+        {"planner": "gpt"},
+        {"gpt"},
+        room_id="shared-one",
+    )
+    workspace = store.load_model(Workspace, workspace.id)
+    second = lifecycle.create(
+        workspace,
+        "Beta",
+        {"planner": "gpt"},
+        {"gpt"},
+        room_id="shared-two",
+    )
+    assert lifecycle.resolve(workspace.id, first.id) == first
+    assert lifecycle.resolve(workspace.id, "ALPHA") == first
+    assert lifecycle.resolve(workspace.id, "shared-t") == second
+    with pytest.raises(RoomError, match="ambiguous"):
+        lifecycle.resolve(workspace.id, "shared-")
+
+
 def test_bind_validates_role_and_agent_without_mutation(room_store):
     store, workspace, lifecycle = room_store
     room = lifecycle.create(workspace, "Team", {"planner": "gpt"}, {"gpt", "claude"})
@@ -197,3 +246,14 @@ def test_room_name_uniqueness_uses_unicode_casefold(room_store):
             {"planner": "gpt"},
             {"gpt"},
         )
+
+
+def test_typed_room_rename_recomputes_name_key_atomically(room_store):
+    store, workspace, lifecycle = room_store
+    lifecycle.create(workspace, "Straße", {"planner": "gpt"}, {"gpt"})
+    workspace = store.load_model(Workspace, workspace.id)
+    other = lifecycle.create(workspace, "Other", {"planner": "gpt"}, {"gpt"})
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.update_model(other.model_copy(update={"name": "STRASSE"}))
+    assert store.load_model(Room, other.id).name == "Other"
