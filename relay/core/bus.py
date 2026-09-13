@@ -55,6 +55,7 @@ from relay.core.policy import (
     reply_admission_reference,
 )
 from relay.core.protocols import ProtocolDefinition, StageContext
+from relay.core.rooms import RoomLookupError, require_open_room
 from relay.core.stage_policy import StageContextRefusal, stage_admission
 from relay.storage.events import EventLogWriter
 from relay.storage.models import EventLogEntry, EventType, Message, MessageType, Run
@@ -157,6 +158,17 @@ class ConversationBus:
         """
         validated = self._validate(message, max_thread_depth=max_thread_depth)
         with self._store.transaction():
+            # P7.1: this check is deliberately inside the same BEGIN IMMEDIATE
+            # transaction as both inserts. A concurrent close therefore
+            # serializes wholly before or wholly after this send.
+            if validated.room_id is not None:
+                try:
+                    require_open_room(self._store, validated.room_id)
+                except RoomLookupError:
+                    # Preserve the bus's existing storage-corruption contract:
+                    # a missing FK target is an unrelated IntegrityError from
+                    # the Message insert, not a lifecycle refusal.
+                    pass
             if (
                 self._policy is not None
                 and validated.blocking

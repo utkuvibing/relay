@@ -197,6 +197,60 @@ class TestCrashPath:
             conn.close()
 
 
+class TestRoomLifecycleCLI:
+    def _configure_roles(self, workspace: Path) -> None:
+        (workspace / "relay.yaml").write_text(
+            "agents:\n"
+            "  gpt: {backend: api, adapter: openai, model: offline}\n"
+            "roles:\n"
+            "  planner: gpt\n",
+            encoding="utf-8",
+        )
+
+    def test_room_commands_persist_roster_lifecycle_and_canonical_feed(self, workspace, db):
+        assert runner.invoke(app, ["init"]).exit_code == 0
+        self._configure_roles(workspace)
+
+        created = runner.invoke(app, ["room", "create", "Design"])
+        assert created.exit_code == 0, created.output
+        assert "planner -> gpt" in created.output
+        listed = runner.invoke(app, ["room", "list"])
+        assert listed.exit_code == 0 and "Design" in listed.output and "open" in listed.output
+
+        bound = runner.invoke(app, ["room", "bind", "design", "reviewer", "gpt"])
+        assert bound.exit_code == 0 and "reviewer -> gpt" in bound.output
+        assert runner.invoke(app, ["room", "close", "Design"]).exit_code == 0
+        resumed = runner.invoke(app, ["room", "resume", "Design"])
+        assert resumed.exit_code == 0, resumed.output
+        for event_name in ("room_created", "room_seat_bound", "room_closed", "room_resumed"):
+            assert event_name in resumed.output
+
+        conn, store = _open_store(db)
+        try:
+            workspace_row = next(store.all_models(Workspace))
+            assert workspace_row.active_room_id is not None
+        finally:
+            conn.close()
+
+    def test_room_bind_rejects_unknown_role_and_agent_without_mutation(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure_roles(workspace)
+        assert runner.invoke(app, ["room", "create", "Team"]).exit_code == 0
+        conn, store = _open_store(db)
+        try:
+            baseline = store.counts()
+        finally:
+            conn.close()
+
+        assert runner.invoke(app, ["room", "bind", "Team", "invented", "gpt"]).exit_code == 1
+        assert runner.invoke(app, ["room", "bind", "Team", "reviewer", "missing"]).exit_code == 1
+        conn, store = _open_store(db)
+        try:
+            assert store.counts() == baseline
+        finally:
+            conn.close()
+
+
 class TestInitIdempotenceCLI:
     def test_reinit_keeps_id_and_history(self, workspace, db):
         assert runner.invoke(app, ["init"]).exit_code == 0

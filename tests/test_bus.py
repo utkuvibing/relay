@@ -4,6 +4,8 @@ SPEC reference: §9, §27 Phase 4; App. D.5–D.8, D.11-P4; plan
 ``docs/plans/p4.1-conversation-bus-core-plan.md`` (frozen rev 2).
 """
 
+import threading
+
 import pytest
 
 from relay.core.bus import (
@@ -17,6 +19,7 @@ from relay.core.bus import (
 )
 from relay.core.evidence import EvidenceKind
 from relay.core.permissions import Action
+from relay.core.rooms import ClosedRoomError
 from relay.core.state_machine import TaskState
 from relay.storage.db import connect, migrate
 from relay.storage.events import EventLogWriter
@@ -24,11 +27,13 @@ from relay.storage.models import (
     Approval,
     ApprovalStatus,
     Decision,
+    EventLogEntry,
     EventType,
     EvidenceRecord,
     Message,
     MessageType,
     Room,
+    RoomStatus,
     Run,
     Task,
 )
@@ -130,6 +135,60 @@ def _message(**overrides) -> Message:
         # P4.2 D1: auto-wire authorship provenance for bare agent senders.
         base["run_id"] = _RUN_IDS.get(sender)
     return Message(**base)
+
+
+def test_closed_room_fence_serializes_close_before_send(store, db, scope):
+    """A sender blocked behind the close transaction must observe CLOSED."""
+    database_path = db.execute("PRAGMA database_list").fetchone()[2]
+    db.execute("BEGIN IMMEDIATE")
+    db.execute("UPDATE rooms SET status = 'closed' WHERE id = 'room-1'")
+    entered = threading.Event()
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def send_after_close() -> None:
+        conn = connect(database_path)
+        try:
+            thread_store = SqliteRelayStore(conn)
+            entered.set()
+            ConversationBus(thread_store, EventLogWriter(conn)).send(_message())
+        except BaseException as exc:  # noqa: BLE001 - assertion captures thread outcome
+            errors.append(exc)
+        finally:
+            conn.close()
+            finished.set()
+
+    thread = threading.Thread(target=send_after_close)
+    thread.start()
+    assert entered.wait(2)
+    assert not finished.wait(0.05)
+    db.execute("COMMIT")
+    thread.join(2)
+
+    assert len(errors) == 1 and isinstance(errors[0], ClosedRoomError)
+    assert not list(store.all_models(Message, "WHERE room_id = ?", ["room-1"]))
+    assert not [event for event in EventLogWriter(db).all() if event.type is EventType.MESSAGE_SENT]
+
+
+def test_send_committed_before_close_is_ordered_before_close_event(store, db, scope, bus):
+    bus.send(_message())
+    room = store.load_model(Room, "room-1")
+    workspace_room = room.model_copy(update={"status": RoomStatus.OPEN})
+    # The fixture Room is workspace-less, so use a direct atomic close/event to
+    # exercise the ordering half of the transaction contract.
+    with store.transaction():
+        store.update_model(workspace_room.model_copy(update={"status": RoomStatus.CLOSED}))
+        EventLogWriter(db).record(
+            EventLogEntry(
+                room_id="room-1",
+                type=EventType.ROOM_CLOSED,
+                content="room closed",
+            )
+        )
+    events = EventLogWriter(db).all()
+    marker = next(event for event in events if event.type is EventType.MESSAGE_SENT)
+    closed = next(event for event in events if event.type is EventType.ROOM_CLOSED)
+    assert marker.sequence < closed.sequence
 
 
 # --------------------------------------------------------------------------

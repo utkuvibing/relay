@@ -24,7 +24,15 @@ from relay.core.protocols import EvaluationStatus, ParticipantRequirement
 from relay.harness.capabilities import HarnessCapability
 from relay.storage.db import _MIGRATIONS, connect, migrate
 from relay.storage.events import EventLogWriter
-from relay.storage.models import Message, MessageType, ProtocolExecution, Room, Run, RunStatus
+from relay.storage.models import (
+    Message,
+    MessageType,
+    ProtocolExecution,
+    Room,
+    RoomStatus,
+    Run,
+    RunStatus,
+)
 from relay.storage.store import ImmutableHistoryError, SqliteRelayStore
 
 
@@ -162,6 +170,36 @@ async def test_conflicting_inputs_and_drift_only_record_outcome(store):
     ).stop_reason is ProtocolStopReason.INPUT_REFUSED
     assert store.counts() == {**counts, "event_log": counts["event_log"] + 1}
     assert len(factory.agent.requests) == 10
+
+
+async def test_closed_room_start_refuses_with_zero_persistence(store):
+    room = store.load_model(Room, "room")
+    store.update_model(room.model_copy(update={"status": RoomStatus.CLOSED}))
+    factory = Factory()
+    service = runner(store, factory)
+    before = store.counts()
+
+    result = await service.start(spec())
+
+    assert result.stop_reason is ProtocolStopReason.INPUT_REFUSED
+    assert store.counts() == before
+    assert factory.agent.requests == []
+
+
+async def test_closed_room_resume_refuses_without_outcome_or_agent(store):
+    factory = Factory()
+    service = runner(store, factory)
+    execution = service.prepare(spec())
+    store.save_model(execution)
+    room = store.load_model(Room, "room")
+    store.update_model(room.model_copy(update={"status": RoomStatus.CLOSED}))
+    before = store.counts()
+
+    result = await service.resume(execution.id)
+
+    assert result.stop_reason is ProtocolStopReason.INPUT_REFUSED
+    assert store.counts() == before
+    assert factory.agent.requests == []
 
 
 async def test_failed_and_cancelled_requests_are_never_retried(store):
@@ -340,7 +378,10 @@ def test_populated_v6_migration(tmp_path):
             conn.execute(sql)
     conn.execute("PRAGMA user_version = 6")
     store = SqliteRelayStore(conn)
-    store.save_model(Room(id="legacy", name="Legacy"))
+    conn.execute(
+        "INSERT INTO rooms (id, name, members_json, created_at) VALUES (?, ?, '[]', ?)",
+        ["legacy", "Legacy", "2025-01-01T00:00:00+00:00"],
+    )
     legacy = Message(
         sender="relay:legacy",
         recipient="agent",
@@ -351,10 +392,10 @@ def test_populated_v6_migration(tmp_path):
     )
     store.save_model(legacy)
     before = list(conn.execute("SELECT * FROM rooms"))
-    assert migrate(conn) == 7
-    assert list(conn.execute("SELECT * FROM rooms")) == before
+    assert migrate(conn) == 8
+    assert [tuple(row)[:6] for row in conn.execute("SELECT * FROM rooms")] == [tuple(before[0])]
     assert store.load_model(Message, legacy.id) == legacy
-    assert migrate(conn) == 7
+    assert migrate(conn) == 8
     store.save_model(execution(room_id="legacy"))
     indexes = conn.execute("PRAGMA index_list(protocol_executions)").fetchall()
     assert sum(row[2] == 1 and row[4] == 1 for row in indexes) == 3

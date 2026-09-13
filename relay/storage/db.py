@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _APPEND_ONLY_TABLES = ("event_log", "evidence_records")
 
@@ -278,6 +278,54 @@ _MIGRATIONS[7] = (
 )
 
 
+_MIGRATIONS[8] = (
+    "ALTER TABLE workspaces ADD COLUMN active_room_id TEXT REFERENCES rooms(id)",
+    "ALTER TABLE rooms ADD COLUMN status TEXT NOT NULL DEFAULT 'open'",
+    "ALTER TABLE rooms ADD COLUMN updated_at TEXT",
+    "ALTER TABLE rooms ADD COLUMN closed_at TEXT",
+    "UPDATE rooms SET updated_at = created_at WHERE updated_at IS NULL",
+    "CREATE INDEX idx_rooms_workspace_status ON rooms(workspace_id, status)",
+)
+
+
+def _finalize_v8(conn: sqlite3.Connection) -> None:
+    """Repair legacy names before installing workspace-local uniqueness."""
+    rows = conn.execute(
+        "SELECT id, workspace_id, name, created_at FROM rooms "
+        "WHERE workspace_id IS NOT NULL ORDER BY workspace_id, created_at, id"
+    ).fetchall()
+    reserved: dict[str, set[str]] = {}
+    for row in rows:
+        reserved.setdefault(str(row["workspace_id"]), set()).add(str(row["name"]).lower())
+
+    seen: dict[str, set[str]] = {}
+    for row in rows:
+        workspace_id = str(row["workspace_id"])
+        used = seen.setdefault(workspace_id, set())
+        name = str(row["name"])
+        folded = name.lower()
+        if folded not in used:
+            used.add(folded)
+            continue
+        suffix = 2
+        while True:
+            candidate = f"{name} ({suffix})"
+            candidate_folded = candidate.lower()
+            if candidate_folded not in reserved[workspace_id] and candidate_folded not in used:
+                break
+            suffix += 1
+        conn.execute("UPDATE rooms SET name = ? WHERE id = ?", [candidate, row["id"]])
+        used.add(candidate_folded)
+
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_rooms_workspace_name_nocase "
+        "ON rooms(workspace_id, name COLLATE NOCASE) WHERE workspace_id IS NOT NULL"
+    )
+
+
+_MIGRATION_FINALIZERS = {8: _finalize_v8}
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -299,6 +347,9 @@ def migrate(conn: sqlite3.Connection) -> int:
             conn.execute("BEGIN IMMEDIATE")
             for statement in _MIGRATIONS[version]:
                 conn.execute(statement)
+            finalizer = _MIGRATION_FINALIZERS.get(version)
+            if finalizer is not None:
+                finalizer(conn)
             conn.execute(f"PRAGMA user_version = {version}")
             conn.execute("COMMIT")
         except Exception:

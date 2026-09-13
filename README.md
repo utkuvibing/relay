@@ -99,6 +99,25 @@ Rounds and message budgets are enforced. Semantic detection of repeated argument
 or lack of new evidence remains deferred; protocol completion does not establish
 consensus, task completion, or human approval.
 
+### Persistent Rooms
+
+Rooms keep a stable role roster and one canonical event-sequence feed across CLI
+sessions. A closed Room preserves its tasks and history while fencing new Room
+messages and protocol activity until it is resumed.
+
+```bash
+relay room create "My project"
+relay room list
+relay room bind "My project" reviewer gpt
+relay room close "My project"
+relay room resume "My project"
+```
+
+Room creation snapshots the configured `roles:` bindings. Resume only reopens and
+renders persisted state; it does not invoke an agent. Feed projection verifies the
+one-to-one relationship between Room Messages and their `MESSAGE_SENT` markers
+before displaying any history.
+
 ### Adapters and authentication
 
 The current adapter registry includes OpenAI-compatible API adapters and harness adapters for Codex CLI, Claude Code, and Antigravity CLI. API keys stay in environment variables. Harnesses own their login and session authentication.
@@ -108,15 +127,18 @@ The current adapter registry includes OpenAI-compatible API adapters and harness
 These are roadmap items, not current capabilities:
 
 - P5 remaining: semantic loop/convergence detection; discussion CLI, bounded protocols, policy, budgets, and stored escalation notices are available;
-- P6 remaining: bounded micro-interactions inside stages; structured findings, deterministic fix packets, the bounded fix loop (attempt-scoped cumulative diffs, per-attempt re-verification and re-review), and `relay continue` resume for parked builds are available;
-- P7: persistent Rooms, seats, and long-lived participant context;
+- P6 remaining: semantic loop/convergence detection; bounded micro-interactions inside stages, structured findings, deterministic fix packets, the bounded fix loop (attempt-scoped cumulative diffs, per-attempt re-verification and re-review), and `relay continue` resume for parked builds are available;
+- P7 remaining: targeted Room chat, participant context reconstruction,
+  plan/decision/finding graphs, and external-session continuation; persistent
+  Room lifecycle, stable seats, traffic fencing, and the canonical feed are available;
 - P8: decision provenance;
 - P9: Relay server;
 - P10: MCP and chat interface integration;
 - P11: adapter ecosystem and certification;
 - P12: TUI.
 
-The current message bus and bounded driver are the foundation for these features. They do not provide persistent Room UX or unrestricted autonomous agent chat.
+The current Room and message surfaces remain bounded orchestration primitives;
+they do not provide unrestricted autonomous agent chat.
 
 ## Quick start
 

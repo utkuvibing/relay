@@ -45,6 +45,7 @@ from relay.core.protocols import (
     protocol_schedule,
 )
 from relay.core.resolver import ConfigRoleResolver
+from relay.core.rooms import ClosedRoomError, require_open_room
 from relay.core.stage_facts import collect_stage_facts
 from relay.core.stage_policy import StageAdmission
 from relay.storage.events import EventLogWriter
@@ -182,6 +183,8 @@ class ProtocolRunner:
         try:
             candidate = self.prepare(spec)
             with self._store.transaction():
+                if spec.room_id is not None:
+                    require_open_room(self._store, spec.room_id)
                 existing = next(
                     self._store.all_models(
                         ProtocolExecution,
@@ -204,7 +207,20 @@ class ProtocolRunner:
         return await self.resume(execution.id)
 
     async def resume(self, execution_id: str) -> ProtocolResult:
+        execution = self._store.load_model(ProtocolExecution, execution_id)
+        if execution is not None and execution.room_id is not None:
+            try:
+                require_open_room(self._store, execution.room_id)
+            except ClosedRoomError as exc:
+                # A closed Room is a traffic fence, not a protocol outcome.
+                # Refusal therefore creates no new Room-scoped persistence.
+                return self._refused(execution_id, exc)
         result = await self._resume(execution_id)
+        if execution is not None and execution.room_id is not None:
+            try:
+                require_open_room(self._store, execution.room_id)
+            except ClosedRoomError as exc:
+                return self._refused(execution_id, exc)
         record_outcome(self._store, self._writer, result)
         return result
 
