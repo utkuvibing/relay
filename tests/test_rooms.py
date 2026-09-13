@@ -8,7 +8,14 @@ from relay.core.rooms import RoomError, RoomLifecycle
 from relay.core.state_machine import TaskState
 from relay.storage.db import _MIGRATIONS, connect, migrate
 from relay.storage.events import EventLogWriter
-from relay.storage.models import EventType, Room, RoomStatus, Task, Workspace
+from relay.storage.models import (
+    EventType,
+    Room,
+    RoomStatus,
+    Task,
+    Workspace,
+    room_name_key,
+)
 from relay.storage.store import SqliteRelayStore
 
 
@@ -109,6 +116,35 @@ def test_create_rolls_back_room_workspace_and_event_together(room_store):
     assert store.load_model(Workspace, workspace.id).active_room_id is None
 
 
+def test_close_resume_and_bind_roll_back_with_their_event(room_store):
+    store, workspace, lifecycle = room_store
+    room = lifecycle.create(workspace, "Atomic lifecycle", {"planner": "gpt"}, {"gpt"})
+
+    class FailingWriter:
+        def record(self, entry):
+            raise RuntimeError("injected event failure")
+
+    failing = RoomLifecycle(store, FailingWriter())
+    workspace = store.load_model(Workspace, workspace.id)
+    baseline = store.counts()
+    with pytest.raises(RuntimeError, match="injected"):
+        failing.bind(room, "reviewer", "gpt", {"gpt"})
+    with pytest.raises(RuntimeError, match="injected"):
+        failing.close(workspace, room)
+    assert store.load_model(Room, room.id) == room
+    assert store.load_model(Workspace, workspace.id) == workspace
+    assert store.counts() == baseline
+
+    closed = lifecycle.close(workspace, room)
+    closed_workspace = store.load_model(Workspace, workspace.id)
+    baseline = store.counts()
+    with pytest.raises(RuntimeError, match="injected"):
+        failing.resume(closed_workspace, closed)
+    assert store.load_model(Room, room.id) == closed
+    assert store.load_model(Workspace, workspace.id) == closed_workspace
+    assert store.counts() == baseline
+
+
 def test_v8_migration_disambiguates_legacy_names_without_changing_ids(tmp_path):
     conn = connect(tmp_path / "legacy.db")
     for version in range(1, 8):
@@ -140,8 +176,24 @@ def test_v8_migration_disambiguates_legacy_names_without_changing_ids(tmp_path):
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
             "INSERT INTO rooms "
-            "(id, name, workspace_id, members_json, status, updated_at, created_at) "
-            "VALUES ('d', 'DESIGN', 'w', '[]', 'open', ?, ?)",
-            ["2025-01-04T00:00:00+00:00", "2025-01-04T00:00:00+00:00"],
+            "(id, name, workspace_id, members_json, status, updated_at, created_at, name_key) "
+            "VALUES ('d', 'DESIGN', 'w', '[]', 'open', ?, ?, ?)",
+            [
+                "2025-01-04T00:00:00+00:00",
+                "2025-01-04T00:00:00+00:00",
+                room_name_key("DESIGN"),
+            ],
         )
     conn.close()
+
+
+def test_room_name_uniqueness_uses_unicode_casefold(room_store):
+    store, workspace, lifecycle = room_store
+    lifecycle.create(workspace, "Straße", {"planner": "gpt"}, {"gpt"})
+    with pytest.raises(RoomError, match="already exists"):
+        lifecycle.create(
+            store.load_model(Workspace, workspace.id),
+            "STRASSE",
+            {"planner": "gpt"},
+            {"gpt"},
+        )

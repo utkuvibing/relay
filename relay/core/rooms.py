@@ -5,18 +5,18 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Collection, Mapping
 
-from pydantic import BaseModel
-
 from relay.agents.base import AgentRole
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     EventLogEntry,
     EventType,
+    ProtocolExecution,
     Room,
     RoomMember,
     RoomStatus,
     Workspace,
     new_id,
+    room_name_key,
     utcnow,
 )
 from relay.storage.store import SqliteRelayStore
@@ -74,7 +74,8 @@ class RoomLifecycle:
         exact_id = next((room for room in rooms if room.id == selector), None)
         if exact_id is not None:
             return exact_id
-        name_matches = [room for room in rooms if room.name.lower() == selector.lower()]
+        selector_key = room_name_key(selector)
+        name_matches = [room for room in rooms if room_name_key(room.name) == selector_key]
         if len(name_matches) == 1:
             return name_matches[0]
         prefix_matches = [room for room in rooms if room.id.startswith(selector)]
@@ -95,7 +96,7 @@ class RoomLifecycle:
         *,
         disambiguate_name: bool = False,
         room_id: str | None = None,
-        attached_records: Collection[BaseModel] = (),
+        attached_execution: ProtocolExecution | None = None,
     ) -> Room:
         clean_name = name.strip()
         if not clean_name:
@@ -106,7 +107,7 @@ class RoomLifecycle:
         if disambiguate_name:
             clean_name = self._available_name(workspace.id, clean_name)
         elif any(
-            room.name.lower() == clean_name.lower()
+            room_name_key(room.name) == room_name_key(clean_name)
             for room in self.list_for_workspace(workspace.id)
         ):
             raise RoomError(f"room name '{clean_name}' already exists in this workspace")
@@ -126,8 +127,8 @@ class RoomLifecycle:
                 self._store.save_model(room)
                 self._store.update_model(current)
                 self._writer.record(self._event(room, EventType.ROOM_CREATED, "room created"))
-                for record in attached_records:
-                    self._store.save_model(record)
+                if attached_execution is not None:
+                    self._store.save_model(attached_execution)
         except sqlite3.IntegrityError as exc:
             raise RoomError(f"room name '{clean_name}' already exists in this workspace") from exc
         return room
@@ -226,11 +227,11 @@ class RoomLifecycle:
         return workspace
 
     def _available_name(self, workspace_id: str, requested: str) -> str:
-        used = {room.name.lower() for room in self.list_for_workspace(workspace_id)}
-        if requested.lower() not in used:
+        used = {room_name_key(room.name) for room in self.list_for_workspace(workspace_id)}
+        if room_name_key(requested) not in used:
             return requested
         suffix = 2
-        while f"{requested} ({suffix})".lower() in used:
+        while room_name_key(f"{requested} ({suffix})") in used:
             suffix += 1
         return f"{requested} ({suffix})"
 

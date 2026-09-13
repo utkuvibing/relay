@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import re
+import unicodedata
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Literal
@@ -38,6 +39,11 @@ def new_id() -> str:
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def room_name_key(name: str) -> str:
+    """Unicode-stable workspace-local key for case-insensitive Room names."""
+    return unicodedata.normalize("NFKC", name).casefold()
 
 
 class WorkspaceKind(str, enum.Enum):

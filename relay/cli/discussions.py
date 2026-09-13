@@ -165,7 +165,7 @@ def discuss(
                 config.agents.keys(),
                 disambiguate_name=True,
                 room_id=room_id,
-                attached_records=[execution],
+                attached_execution=execution,
             )
         result = asyncio.run(service.resume(execution.id))
         view = build_discussion_view(store, execution)

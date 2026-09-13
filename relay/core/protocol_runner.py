@@ -216,11 +216,6 @@ class ProtocolRunner:
                 # Refusal therefore creates no new Room-scoped persistence.
                 return self._refused(execution_id, exc)
         result = await self._resume(execution_id)
-        if execution is not None and execution.room_id is not None:
-            try:
-                require_open_room(self._store, execution.room_id)
-            except ClosedRoomError as exc:
-                return self._refused(execution_id, exc)
         record_outcome(self._store, self._writer, result)
         return result
 

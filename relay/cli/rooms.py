@@ -84,7 +84,7 @@ def list_rooms() -> None:
     for room in rooms:
         table.add_row(
             "*" if workspace.active_room_id == room.id else "",
-            room.id[:8],
+            room.id,
             room.name,
             room.status.value,
             str(len(room.members)),
