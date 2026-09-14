@@ -25,7 +25,8 @@ Frozen contracts implemented here (plan rev 3):
 * **D10 — binding marker:** ``MESSAGE_DELIVERED`` commits atomically inside
   the delivery run's pre-provider Tx1 (same transaction as ``Run(RUNNING)`` +
   ``run_input`` + ``AGENT_RUN_STARTED``); it asserts a BINDING, never
-  success; failed/timeout runs retain it.
+  success; failed/timeout runs retain it. Room-scoped deliveries re-check the
+  persisted Room's OPEN fence in that transaction before the binding commits.
 * **D13 — at-most-once initiation, unconditional:** the duplicate check and
   the marker insert share the single Tx1 ``BEGIN IMMEDIATE`` boundary, so
   every re-initiation attempt for a delivered Message is a typed refusal with
@@ -66,6 +67,7 @@ from relay.core.policy import (
     reply_admission_reference,
 )
 from relay.core.protocols import ProtocolDefinition, StageContext
+from relay.core.rooms import require_open_room
 from relay.core.stage_policy import StageContextRefusal, stage_admission
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
@@ -172,6 +174,7 @@ class MessageDelivery:
         self._store = store
         self._writer = writer
         self._factory = factory
+        self._prepared_recipients: dict[str, tuple[Agent, str | None]] = {}
         self._bus = bus if bus is not None else ConversationBus(
             store, writer, policy=policy, stage_context=stage_context, protocol=protocol
         )
@@ -187,6 +190,10 @@ class MessageDelivery:
             raise StageContextRefusal("delivery and bus must share stage context, definition, gate")
 
     # -- public path ---------------------------------------------------------
+
+    def prepare_recipient(self, recipient: str) -> None:
+        """Construct and retain the exact read-only agent used by the next delivery."""
+        self._prepared_recipients[recipient] = self._construct_recipient(recipient)
 
     async def deliver(self, message_id: str) -> DeliveryOutcome:
         """Bind ``message_id`` to a fresh recipient run and execute it.
@@ -224,14 +231,8 @@ class MessageDelivery:
             )
         role = self._role_for(message)
 
-        try:
-            agent = self._factory.build(recipient)
-        except Exception as exc:
-            raise DeliveryRefusal(
-                f"recipient '{recipient}' cannot be built: {_refusal_reason(exc)}"
-            ) from exc
-
-        model = self._factory.model_of(recipient)
+        prepared = self._prepared_recipients.pop(recipient, None)
+        agent, model = prepared if prepared is not None else self._construct_recipient(recipient)
         request = AgentRequest(
             prompt=self._envelope(message),
             role=role,
@@ -245,13 +246,23 @@ class MessageDelivery:
         ask = await run_ask(
             self._store,
             self._writer,
-            self._read_only_variant(agent),
+            agent,
             request,
             model=model,
             agent_name=recipient,
             pre_provider=self._binding_hook(message, admitted_reply_type),
         )
         return DeliveryOutcome(message=message, ask=ask)
+
+    def _construct_recipient(self, recipient: str) -> tuple[Agent, str | None]:
+        try:
+            agent = self._read_only_variant(self._factory.build(recipient))
+            model = self._factory.model_of(recipient)
+        except Exception as exc:
+            raise DeliveryRefusal(
+                f"recipient '{recipient}' cannot be built: {_refusal_reason(exc)}"
+            ) from exc
+        return agent, model
 
     async def deliver_and_reply(
         self,
@@ -671,15 +682,18 @@ class MessageDelivery:
         message: Message,
         admitted_reply_type: MessageType | None,
     ) -> Callable[[Run, Artifact], Iterable[EventLogEntry]]:
-        """D10/D13/D14 Tx1 hook: bind atomically, veto duplicates.
+        """D10/D13/D14/P7.2 Tx1 hook: fence and bind atomically.
 
         Runs INSIDE the delivery run's pre-provider Tx1 (single
-        ``BEGIN IMMEDIATE`` boundary): the duplicate check observes every
-        committed marker, and the new marker commits with the run row —
-        concurrent initiations are serialized by the SQLite write lock.
+        ``BEGIN IMMEDIATE`` boundary): the Room OPEN check and duplicate check
+        observe committed state, and the new marker commits with the run row.
+        Concurrent closes and delivery initiations serialize on the SQLite
+        write lock; a refusal rolls back the entire staged run.
         """
 
         def bind(run: Run, _input_artifact: object) -> Iterable[EventLogEntry]:
+            if message.room_id is not None:
+                require_open_room(self._store, message.room_id)
             if self.deliveries_for_message(message.id):
                 raise DuplicateDeliveryRefusal(
                     f"message '{message.id}' is already bound to a run — "

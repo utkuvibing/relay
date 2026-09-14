@@ -109,6 +109,8 @@ messages and protocol activity until it is resumed.
 relay room create "My project"
 relay room list
 relay room bind "My project" reviewer gpt
+relay room ask @reviewer "Is this a blocker?" --by utku
+relay room ask @reviewer "Check this other room" --by utku --room "My project"
 relay room close "My project"
 relay room resume "My project"
 ```
@@ -116,7 +118,10 @@ relay room resume "My project"
 Room creation snapshots the configured `roles:` bindings. Resume only reopens and
 renders persisted state; it does not invoke an agent. Feed projection verifies the
 one-to-one relationship between Room Messages and their `MESSAGE_SENT` markers
-before displaying any history.
+before displaying any history. `room ask` resolves `@role` from the selected Room's
+persisted seat snapshot, records the human request, invokes that agent once with
+read-only authority, and records a canonical reply. It defaults to the active Room;
+`--room` selects another open Room without changing which Room is active.
 
 ### Adapters and authentication
 
@@ -128,9 +133,9 @@ These are roadmap items, not current capabilities:
 
 - P5 remaining: semantic loop/convergence detection; discussion CLI, bounded protocols, policy, budgets, and stored escalation notices are available;
 - P6 remaining: semantic loop/convergence detection; bounded micro-interactions inside stages, structured findings, deterministic fix packets, the bounded fix loop (attempt-scoped cumulative diffs, per-attempt re-verification and re-review), and `relay continue` resume for parked builds are available;
-- P7 remaining: targeted Room chat, participant context reconstruction,
-  plan/decision/finding graphs, and external-session continuation; persistent
-  Room lifecycle, stable seats, traffic fencing, and the canonical feed are available;
+- P7 remaining: participant context reconstruction, plan/decision/finding graphs,
+  and external-session continuation; persistent Room lifecycle, stable seats,
+  targeted Room chat, traffic fencing, and the canonical feed are available;
 - P8: decision provenance;
 - P9: Relay server;
 - P10: MCP and chat interface integration;

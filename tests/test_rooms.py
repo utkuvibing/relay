@@ -4,12 +4,15 @@ import sqlite3
 
 import pytest
 
-from relay.core.rooms import RoomError, RoomLifecycle
+from relay.core.bus import ConversationBus
+from relay.core.rooms import RoomError, RoomLifecycle, RoomSeatResolver
 from relay.core.state_machine import TaskState
 from relay.storage.db import _MIGRATIONS, connect, migrate
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     EventType,
+    Message,
+    MessageType,
     Room,
     RoomStatus,
     Task,
@@ -45,6 +48,45 @@ def test_create_snapshots_roles_and_becomes_current(room_store):
     assert store.load_model(Workspace, workspace.id).active_room_id == room.id
     events = EventLogWriter(store.conn).all()
     assert [event.type for event in events] == [EventType.ROOM_CREATED]
+
+
+def test_room_seat_resolver_snapshots_binding_for_one_exchange(room_store):
+    store, workspace, lifecycle = room_store
+    room = lifecycle.create(
+        workspace,
+        "Review",
+        {"reviewer": "claude"},
+        {"claude", "gpt"},
+    )
+    resolver = RoomSeatResolver(room)
+
+    rebound = lifecycle.bind(room, "reviewer", "gpt", {"claude", "gpt"})
+    old_exchange = ConversationBus(store, EventLogWriter(store.conn), resolver).send(
+        Message(
+            sender="human:utku",
+            recipient_role="reviewer",
+            room_id=room.id,
+            type=MessageType.CLARIFICATION_REQUEST,
+            content="Is this a blocker?",
+        )
+    )
+    new_exchange = ConversationBus(
+        store,
+        EventLogWriter(store.conn),
+        RoomSeatResolver(rebound),
+    ).send(
+        Message(
+            sender="human:utku",
+            recipient_role="reviewer",
+            room_id=room.id,
+            type=MessageType.CLARIFICATION_REQUEST,
+            content="What changed?",
+        )
+    )
+
+    assert old_exchange.recipient == "claude"
+    assert old_exchange.recipient_role == "reviewer"
+    assert new_exchange.recipient == "gpt"
 
 
 def test_close_and_resume_preserve_task_and_history(room_store):
