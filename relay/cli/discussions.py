@@ -25,8 +25,9 @@ from relay.core.policy import (
     policy_from_config,
 )
 from relay.core.protocol_runner import ProtocolRunner, ProtocolSpec
+from relay.core.rooms import RoomLifecycle
 from relay.storage.events import EventLogWriter
-from relay.storage.models import Room, RoomMember, new_id
+from relay.storage.models import new_id
 from relay.storage.store import SqliteRelayStore
 
 try:  # Newer Typer vendors Click; older supported releases depend on it.
@@ -145,25 +146,27 @@ def discuss(
             workspace = store.workspace_for_identity(identity_key(root))
             if workspace is None:
                 _error("Workspace not initialized; run relay init first.", json_output)
-            room = Room(
-                name=topic[:200],
-                workspace_id=workspace.id,
-                members=[
-                    RoomMember(agent=config.roles[p.role.value], role=p.role.value)
-                    for p in definition.participants
-                ],
-            )
+            participant_bindings = {
+                p.role.value: config.roles[p.role.value] for p in definition.participants
+            }
+            room_id = new_id()
             execution = service.prepare(
                 ProtocolSpec(
                     definition,
                     new_id(),
                     topic,
-                    room_id=room.id,
+                    room_id=room_id,
                 )
             )
-            with store.transaction():
-                store.save_model(room)
-                store.save_model(execution)
+            RoomLifecycle(store, EventLogWriter(conn)).create(
+                workspace,
+                topic[:200],
+                participant_bindings,
+                config.agents.keys(),
+                disambiguate_name=True,
+                room_id=room_id,
+                attached_execution=execution,
+            )
         result = asyncio.run(service.resume(execution.id))
         view = build_discussion_view(store, execution)
     except DiscussionLookupError as exc:

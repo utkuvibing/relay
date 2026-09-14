@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import re
+import unicodedata
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Literal
@@ -40,6 +41,11 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def room_name_key(name: str) -> str:
+    """Unicode-stable workspace-local key for case-insensitive Room names."""
+    return unicodedata.normalize("NFKC", name).casefold()
+
+
 class WorkspaceKind(str, enum.Enum):
     GIT_REPO = "git_repo"
     FOLDER = "folder"
@@ -52,6 +58,7 @@ class Workspace(BaseModel):
     name: str
     path: str | None = None
     kind: WorkspaceKind = WorkspaceKind.CONVERSATION
+    active_room_id: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -62,6 +69,11 @@ class RoomMember(BaseModel):
     role: str
 
 
+class RoomStatus(str, enum.Enum):
+    OPEN = "open"
+    CLOSED = "closed"
+
+
 class Room(BaseModel):
     """Long-lived shared AI work area; survives days of inactivity (SPEC §5)."""
 
@@ -70,6 +82,9 @@ class Room(BaseModel):
     workspace_id: str | None = None
     members: list[RoomMember] = Field(default_factory=lambda: list[RoomMember]())
     active_task_id: str | None = None
+    status: RoomStatus = RoomStatus.OPEN
+    updated_at: datetime = Field(default_factory=utcnow)
+    closed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -792,6 +807,10 @@ class EventType(str, enum.Enum):
     #: never ``task_id + role``, which P4 delivery also produces.
     BUILD_RUN_DISPATCHED = "build_run_dispatched"
     PROTOCOL_OUTCOME_RECORDED = "protocol_outcome_recorded"
+    ROOM_CREATED = "room_created"
+    ROOM_RESUMED = "room_resumed"
+    ROOM_CLOSED = "room_closed"
+    ROOM_SEAT_BOUND = "room_seat_bound"
 
 
 class EvidenceRecord(BaseModel):

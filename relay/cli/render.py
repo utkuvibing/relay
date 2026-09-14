@@ -89,12 +89,18 @@ def status(
     key_states: dict[str, bool],
     tasks: list[Any] | None = None,
     active_view: Any | None = None,
+    current_room: Any | None = None,
 ) -> None:
     """Workspace summary; gains the P3.4 task table + active-task panel."""
     if workspace is None:
         _out().print("[yellow]not initialized - run 'relay init' first[/yellow]")
         return
     _out().print(f"Relay status - [bold]{workspace.name}[/bold]")
+    if current_room is not None:
+        _out().print(
+            f"Current Room: [bold]{current_room.name}[/bold] "
+            f"({current_room.id[:8]}..., {current_room.status.value})"
+        )
     _out().print(_agent_table(config, key_states))
     if tasks:
         _out().print(task_table(tasks))

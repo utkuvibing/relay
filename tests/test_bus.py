@@ -4,6 +4,8 @@ SPEC reference: §9, §27 Phase 4; App. D.5–D.8, D.11-P4; plan
 ``docs/plans/p4.1-conversation-bus-core-plan.md`` (frozen rev 2).
 """
 
+import threading
+
 import pytest
 
 from relay.core.bus import (
@@ -17,6 +19,7 @@ from relay.core.bus import (
 )
 from relay.core.evidence import EvidenceKind
 from relay.core.permissions import Action
+from relay.core.rooms import ClosedRoomError
 from relay.core.state_machine import TaskState
 from relay.storage.db import connect, migrate
 from relay.storage.events import EventLogWriter
@@ -24,11 +27,13 @@ from relay.storage.models import (
     Approval,
     ApprovalStatus,
     Decision,
+    EventLogEntry,
     EventType,
     EvidenceRecord,
     Message,
     MessageType,
     Room,
+    RoomStatus,
     Run,
     Task,
 )
@@ -130,6 +135,103 @@ def _message(**overrides) -> Message:
         # P4.2 D1: auto-wire authorship provenance for bare agent senders.
         base["run_id"] = _RUN_IDS.get(sender)
     return Message(**base)
+
+
+def test_closed_room_fence_serializes_close_before_send(store, db, scope):
+    """A sender blocked behind the close transaction must observe CLOSED."""
+    database_path = db.execute("PRAGMA database_list").fetchone()[2]
+    db.execute("BEGIN IMMEDIATE")
+    db.execute("UPDATE rooms SET status = 'closed' WHERE id = 'room-1'")
+    entered = threading.Event()
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def send_after_close() -> None:
+        conn = connect(database_path)
+        try:
+            thread_store = SqliteRelayStore(conn)
+            entered.set()
+            ConversationBus(thread_store, EventLogWriter(conn)).send(_message())
+        except BaseException as exc:  # noqa: BLE001 - assertion captures thread outcome
+            errors.append(exc)
+        finally:
+            conn.close()
+            finished.set()
+
+    thread = threading.Thread(target=send_after_close)
+    thread.start()
+    assert entered.wait(2)
+    assert not finished.wait(0.05)
+    db.execute("COMMIT")
+    thread.join(2)
+
+    assert len(errors) == 1 and isinstance(errors[0], ClosedRoomError)
+    assert not list(store.all_models(Message, "WHERE room_id = ?", ["room-1"]))
+    assert not [event for event in EventLogWriter(db).all() if event.type is EventType.MESSAGE_SENT]
+
+
+def test_send_first_transaction_serializes_close_after_marker(store, db, scope):
+    database_path = db.execute("PRAGMA database_list").fetchone()[2]
+    send_holds_lock = threading.Event()
+    release_send = threading.Event()
+    close_entered = threading.Event()
+    close_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    class HoldingStore(SqliteRelayStore):
+        def save_model(self, record):
+            if isinstance(record, Message):
+                send_holds_lock.set()
+                assert release_send.wait(2)
+            return super().save_model(record)
+
+    def send_first() -> None:
+        conn = connect(database_path)
+        try:
+            ConversationBus(HoldingStore(conn), EventLogWriter(conn)).send(_message())
+        except BaseException as exc:  # noqa: BLE001 - assertion captures thread outcome
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    def close_second() -> None:
+        conn = connect(database_path)
+        try:
+            close_entered.set()
+            thread_store = SqliteRelayStore(conn)
+            with thread_store.transaction():
+                room = thread_store.load_model(Room, "room-1")
+                thread_store.update_model(room.model_copy(update={"status": RoomStatus.CLOSED}))
+                EventLogWriter(conn).record(
+                    EventLogEntry(
+                        room_id="room-1",
+                        type=EventType.ROOM_CLOSED,
+                        content="room closed",
+                    )
+                )
+        except BaseException as exc:  # noqa: BLE001 - assertion captures thread outcome
+            errors.append(exc)
+        finally:
+            conn.close()
+            close_finished.set()
+
+    sender = threading.Thread(target=send_first)
+    closer = threading.Thread(target=close_second)
+    sender.start()
+    assert send_holds_lock.wait(2)
+    closer.start()
+    assert close_entered.wait(2)
+    assert not close_finished.wait(0.05)
+    release_send.set()
+    sender.join(2)
+    closer.join(2)
+
+    assert errors == []
+    events = EventLogWriter(db).all()
+    marker = next(event for event in events if event.type is EventType.MESSAGE_SENT)
+    closed = next(event for event in events if event.type is EventType.ROOM_CLOSED)
+    assert marker.sequence < closed.sequence
+    assert store.load_model(Room, "room-1").status is RoomStatus.CLOSED
 
 
 # --------------------------------------------------------------------------

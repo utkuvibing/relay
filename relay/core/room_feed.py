@@ -6,17 +6,12 @@ surface arrives later (P7). This is a READ-MODEL concern, deliberately
 outside :mod:`relay.storage`: the store exposes raw scoped records; this
 module owns the "what constitutes the feed" semantics.
 
-Composition contract (P4.1 plan D8):
+Composition contract (P7.1):
 
-* Message rows scoped to the room + EventLogEntry rows scoped to the room;
-* MESSAGE_SENT markers are excluded when the corresponding Message is
-  already represented (the marker is provenance, not a second feed item).
-  Defensive fallback: a marker whose Message row is absent renders as a
-  system entry rather than silently vanishing;
-* deterministic ordering with an explicit stable tie-breaker:
-  ``(timestamp, origin rank, entry id)`` — messages precede events at
-  identical timestamps, then the stable ``message:<id>`` /
-  ``event:<sequence>`` string breaks remaining ties;
+* every Room Message maps one-to-one to a same-Room MESSAGE_SENT marker;
+* the marker's event sequence orders the item, while the canonical Message
+  supplies the rendered payload;
+* every other Room-scoped system/lifecycle event renders at its sequence;
 * zero mutations, no derived state persisted, fully offline-testable.
 """
 
@@ -34,6 +29,7 @@ class FeedEntry:
     """One rendered Room-history item."""
 
     at: datetime
+    sequence: int
     origin: str  # "message" | "event"
     source: str  # "agent" | "human" | "relay" | "system"
     kind: str  # MessageType value or EventType value
@@ -46,8 +42,8 @@ class FeedEntry:
     reply_to_id: str | None = None
 
 
-_MESSAGE_ORIGIN_RANK = 0
-_EVENT_ORIGIN_RANK = 1
+class RoomFeedIntegrityError(RuntimeError):
+    """Persisted Room messages and MESSAGE_SENT markers do not correspond."""
 
 
 def _message_source(sender: str) -> str:
@@ -59,9 +55,12 @@ def _message_source(sender: str) -> str:
     return "agent"
 
 
-def _from_message(message: Message) -> FeedEntry:
+def _from_message(message: Message, marker: EventLogEntry) -> FeedEntry:
+    if marker.sequence is None:
+        raise RoomFeedIntegrityError("MESSAGE_SENT marker has no persisted sequence")
     return FeedEntry(
         at=message.created_at,
+        sequence=marker.sequence,
         origin="message",
         source=_message_source(message.sender),
         kind=message.type.value,
@@ -75,8 +74,11 @@ def _from_message(message: Message) -> FeedEntry:
 
 
 def _from_event(event: EventLogEntry) -> FeedEntry:
+    if event.sequence is None:
+        raise RoomFeedIntegrityError("Room event has no persisted sequence")
     return FeedEntry(
         at=event.created_at,
+        sequence=event.sequence,
         origin="event",
         source="system",
         kind=event.type.value,
@@ -89,8 +91,8 @@ def _from_event(event: EventLogEntry) -> FeedEntry:
 
 
 def build_room_feed(store: SqliteRelayStore, room_id: str) -> list[FeedEntry]:
-    """Compose the chronological feed for one room; pure read-only."""
-    messages = list(
+    """Validate and compose the canonical event-sequence Room feed."""
+    room_messages = list(
         store.all_models(
             Message,
             "WHERE room_id = ?",
@@ -107,19 +109,50 @@ def build_room_feed(store: SqliteRelayStore, room_id: str) -> list[FeedEntry]:
         )
     )
 
-    represented = {f"message:{message.id}" for message in messages}
+    markers = [event for event in events if event.type is EventType.MESSAGE_SENT]
+    messages_by_id = {message.id: message for message in room_messages}
+    marker_by_message: dict[str, EventLogEntry] = {}
 
-    entries = [_from_message(message) for message in messages]
+    for marker in markers:
+        refs = [ref for ref in marker.references if ref.startswith("message:")]
+        if len(refs) != 1:
+            raise RoomFeedIntegrityError(
+                f"MESSAGE_SENT marker {marker.sequence!r} must reference exactly one Message"
+            )
+        message_id = refs[0].removeprefix("message:")
+        room_refs = [ref for ref in marker.references if ref.startswith("room:")]
+        if room_refs != [f"room:{room_id}"]:
+            raise RoomFeedIntegrityError(
+                f"MESSAGE_SENT marker {marker.sequence!r} has contradictory Room references"
+            )
+        message = store.load_model(Message, message_id)
+        if message is None:
+            raise RoomFeedIntegrityError(
+                f"MESSAGE_SENT marker {marker.sequence!r} references missing Message '{message_id}'"
+            )
+        if message.room_id != room_id or marker.room_id != room_id:
+            raise RoomFeedIntegrityError(
+                f"MESSAGE_SENT marker {marker.sequence!r} has contradictory Room scope"
+            )
+        if message_id in marker_by_message:
+            raise RoomFeedIntegrityError(f"Message '{message_id}' has duplicate MESSAGE_SENT markers")
+        marker_by_message[message_id] = marker
+
+    orphan_ids = sorted(set(messages_by_id) - set(marker_by_message))
+    if orphan_ids:
+        raise RoomFeedIntegrityError(
+            f"Room Message '{orphan_ids[0]}' has no same-Room MESSAGE_SENT marker"
+        )
+    if set(marker_by_message) != set(messages_by_id):
+        raise RoomFeedIntegrityError("Room MESSAGE_SENT marker mapping is not one-to-one")
+
+    entries: list[FeedEntry] = []
     for event in events:
-        if event.type is EventType.MESSAGE_SENT and any(
-            reference in represented for reference in event.references
-        ):
-            continue  # the Message itself already represents this item
-        entries.append(_from_event(event))
-
-    entries.sort(key=lambda entry: (entry.at, _origin_rank(entry), entry.entry_id))
+        if event.type is EventType.MESSAGE_SENT:
+            ref = next(ref for ref in event.references if ref.startswith("message:"))
+            message = messages_by_id[ref.removeprefix("message:")]
+            entries.append(_from_message(message, event))
+        else:
+            entries.append(_from_event(event))
+    entries.sort(key=lambda entry: entry.sequence)
     return entries
-
-
-def _origin_rank(entry: FeedEntry) -> int:
-    return _MESSAGE_ORIGIN_RANK if entry.origin == "message" else _EVENT_ORIGIN_RANK

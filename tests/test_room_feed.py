@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from relay.core.bus import ConversationBus
-from relay.core.room_feed import FeedEntry, build_room_feed
+from relay.core.room_feed import FeedEntry, RoomFeedIntegrityError, build_room_feed
 from relay.storage.db import connect, migrate
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
@@ -119,21 +119,57 @@ class TestFeedComposition:
         assert feed[0].origin == "message"
         assert feed[0].text == "only once"
 
-    def test_orphan_marker_falls_back_to_system_entry(self, store, db):
-        """Defensive: a marker whose Message row is absent still renders."""
+    def test_orphan_marker_is_an_integrity_failure(self, store, db):
         writer = EventLogWriter(db)
         writer.record(
             _event(
                 type=EventType.MESSAGE_SENT,
                 content="opinion from ghost to room",
-                references=["message:does-not-exist"],
+                references=["message:does-not-exist", "room:room-1"],
             )
         )
 
-        feed = build_room_feed(store, "room-1")
-        assert len(feed) == 1
-        assert feed[0].origin == "event"
-        assert feed[0].source == "system"
+        with pytest.raises(RoomFeedIntegrityError, match="missing Message"):
+            build_room_feed(store, "room-1")
+
+    def test_orphan_message_is_an_integrity_failure(self, store, scope):
+        store.save_model(_msg(content="unmarked"))
+        with pytest.raises(RoomFeedIntegrityError, match="no same-Room"):
+            build_room_feed(store, "room-1")
+
+    def test_cross_room_marker_is_an_integrity_failure(self, store, db, scope):
+        other = store.save_model(_msg(room_id="room-2", content="other"))
+        EventLogWriter(db).record(
+            _event(
+                type=EventType.MESSAGE_SENT,
+                references=[f"message:{other.id}", "room:room-1"],
+            )
+        )
+        with pytest.raises(RoomFeedIntegrityError, match="contradictory Room scope"):
+            build_room_feed(store, "room-1")
+
+    def test_duplicate_marker_is_an_integrity_failure(self, store, bus, db):
+        message = bus.send(_msg(content="once"))
+        EventLogWriter(db).record(
+            _event(
+                type=EventType.MESSAGE_SENT,
+                references=[f"message:{message.id}", "room:room-1"],
+            )
+        )
+        with pytest.raises(RoomFeedIntegrityError, match="duplicate"):
+            build_room_feed(store, "room-1")
+
+    def test_marker_with_multiple_message_refs_is_an_integrity_failure(self, store, db, scope):
+        first = store.save_model(_msg(content="first"))
+        second = store.save_model(_msg(content="second"))
+        EventLogWriter(db).record(
+            _event(
+                type=EventType.MESSAGE_SENT,
+                references=[f"message:{first.id}", f"message:{second.id}", "room:room-1"],
+            )
+        )
+        with pytest.raises(RoomFeedIntegrityError, match="exactly one"):
+            build_room_feed(store, "room-1")
 
     def test_scoped_to_one_room(self, store, bus):
         bus.send(_msg(room_id="room-2", content="other room"))
@@ -171,60 +207,31 @@ class TestFeedComposition:
 
 
 class TestFeedDeterminism:
-    def test_identical_timestamps_use_the_stable_tie_breaker(self, store, bus, db):
-        """Plan D8: (timestamp, origin rank, entry id) — messages before
-        events at equal timestamps, then the stable entry-id string."""
+    def test_event_sequence_is_authoritative_for_identical_timestamps(self, store, bus, db):
         stamp = datetime.now(UTC)
-        same_time_messages = [
-            Message(
-                sender="claude",
-                room_id="room-1",
-                type=MessageType.NOTE,
-                content=f"m{i}",
-                created_at=stamp,
-            )
-            for i in range(3)
-        ]
-        with store.transaction():
-            for message in same_time_messages:
-                store.save_model(message)
-            EventLogWriter(db).record(_event(content="event at same time", created_at=stamp))
+        for i in range(3):
+            bus.send(_msg(content=f"m{i}", created_at=stamp))
+        EventLogWriter(db).record(_event(content="event at same time", created_at=stamp))
 
         first = build_room_feed(store, "room-1")
         second = build_room_feed(store, "room-1")
 
         assert first == second  # pure and deterministic across calls
-        # Message ids are random, so the id tie-break order within a rank is
-        # arbitrary but STABLE — the contract is sort-key correctness, not m0 first.
         texts = [entry.text for entry in first]
-        assert set(texts) == {"m0", "m1", "m2", "event at same time"}
-        assert first[-1].text == "event at same time"  # rank: messages precede the event
-        assert first[0].at == first[-1].at  # tie actually exercised
-        message_entry_ids = [entry.entry_id for entry in first if entry.origin == "message"]
-        assert message_entry_ids == sorted(message_entry_ids)
+        assert texts == ["m0", "m1", "m2", "event at same time"]
+        assert [entry.sequence for entry in first] == sorted(entry.sequence for entry in first)
 
-    def test_reordered_insertion_does_not_change_output_order(self, store, bus, db):
-        early = datetime.now(UTC) - timedelta(hours=1)
-        late_message = _msg(content="late message")
-        with store.transaction():
-            store.save_model(
-                Message(
-                    sender="claude",
-                    room_id="room-1",
-                    type=MessageType.NOTE,
-                    content="early message",
-                    created_at=early,
-                )
+    def test_timestamps_do_not_override_event_sequence(self, store, bus, db):
+        bus.send(_msg(content="first by sequence", created_at=datetime.now(UTC)))
+        EventLogWriter(db).record(
+            _event(
+                content="second by sequence",
+                created_at=datetime.now(UTC) - timedelta(hours=1),
             )
-        EventLogWriter(db).record(_event(content="late event", created_at=datetime.now(UTC)))
-        bus.send(late_message)
+        )
 
         feed = build_room_feed(store, "room-1")
-        assert [entry.text for entry in feed] == [
-            "early message",
-            "late message",
-            "late event",
-        ]
+        assert [entry.text for entry in feed] == ["first by sequence", "second by sequence"]
 
 
 class TestFeedIsPure:
