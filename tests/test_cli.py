@@ -31,11 +31,15 @@ from typer.testing import CliRunner
 import relay.agents.openai as openai_mod
 from relay.agents import transient_adapters
 from relay.cli.main import app
+from relay.core.room_feed import build_room_feed
 from relay.storage import connect
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     ArtifactKind,
     EventType,
+    Message,
+    MessageType,
+    Room,
     Run,
     RunStatus,
     Workspace,
@@ -250,6 +254,309 @@ class TestRoomLifecycleCLI:
         finally:
             conn.close()
 
+    def test_room_ask_persists_targeted_exchange_from_active_room(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure_roles(workspace)
+        assert runner.invoke(app, ["room", "create", "Design"]).exit_code == 0
+
+        result = _patched_invoke(
+            ["room", "ask", "@planner", "Is this ready?", "--by", "utku"],
+            lambda request: httpx.Response(200, json=_completion("It is ready.")),
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Room " in result.output and " - Design" in result.output
+        assert "Seat @planner -> gpt" in result.output
+        assert "human:utku: Is this ready?" in result.output
+        assert "gpt: It is ready." in result.output
+        assert "room_created" not in result.output
+
+        conn, store = _open_store(db)
+        try:
+            messages = list(store.all_models(Message))
+            assert len(messages) == 2
+            request, reply = messages
+            assert request.sender == "human:utku"
+            assert request.recipient == "gpt"
+            assert request.recipient_role == "planner"
+            assert request.room_id is not None and request.task_id is None
+            assert request.type is MessageType.CLARIFICATION_REQUEST
+            assert request.blocking is False
+            assert reply.reply_to_id == request.id
+            assert reply.sender == "gpt"
+            assert reply.recipient == "human:utku"
+            assert reply.room_id == request.room_id and reply.task_id is None
+            assert reply.type is MessageType.CLARIFICATION_RESPONSE
+            runs = list(store.all_models(Run))
+            assert len(runs) == 1 and runs[0].agent == "gpt"
+            assert reply.run_id == runs[0].id
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize("selector_kind", ["name", "full_id", "unique_prefix"])
+    def test_room_ask_override_uses_persisted_seat_without_changing_active_room(
+        self, workspace, db, selector_kind
+    ):
+        runner.invoke(app, ["init"])
+        config_path = workspace / "relay.yaml"
+        config_path.write_text(
+            "agents:\n"
+            "  gpt: {backend: api, adapter: openai, model: offline}\n"
+            "  other: {backend: api, adapter: openai, model: offline}\n"
+            "roles:\n"
+            "  planner: gpt\n",
+            encoding="utf-8",
+        )
+        assert runner.invoke(app, ["room", "create", "First"]).exit_code == 0
+        config_path.write_text(
+            "agents:\n"
+            "  gpt: {backend: api, adapter: openai, model: offline}\n"
+            "  other: {backend: api, adapter: openai, model: offline}\n"
+            "roles:\n"
+            "  planner: other\n",
+            encoding="utf-8",
+        )
+        assert runner.invoke(app, ["room", "create", "Second"]).exit_code == 0
+
+        conn, store = _open_store(db)
+        try:
+            rooms = {room.name: room for room in store.all_models(Room)}
+            first = rooms["First"]
+            second = rooms["Second"]
+        finally:
+            conn.close()
+        if selector_kind == "name":
+            selector = first.name
+        elif selector_kind == "full_id":
+            selector = first.id
+        else:
+            selector = next(
+                first.id[:width]
+                for width in range(1, len(first.id) + 1)
+                if not second.id.startswith(first.id[:width])
+            )
+
+        result = _patched_invoke(
+            [
+                "room",
+                "ask",
+                "@planner",
+                "Use the original seat",
+                "--by",
+                "utku",
+                "--room",
+                selector,
+            ],
+            lambda request: httpx.Response(200, json=_completion("original seat used")),
+        )
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.strip().splitlines()
+        assert lines[0].startswith("Room ") and lines[0].endswith(" - First")
+        assert lines[1:] == [
+            "Seat @planner -> gpt",
+            "human:utku: Use the original seat",
+            "gpt: original seat used",
+        ]
+        conn, store = _open_store(db)
+        try:
+            rooms = {room.name: room for room in store.all_models(Room)}
+            workspace_row = next(store.all_models(Workspace))
+            assert workspace_row.active_room_id == rooms["Second"].id
+            request = next(store.all_models(Message))
+            assert request.room_id == rooms["First"].id
+            assert request.recipient == "gpt"
+            feed = build_room_feed(store, rooms["First"].id)
+            exchange_entries = [
+                entry
+                for entry in feed
+                if entry.kind
+                in {
+                    MessageType.CLARIFICATION_REQUEST.value,
+                    MessageType.CLARIFICATION_RESPONSE.value,
+                }
+            ]
+            assert [(entry.sender, entry.text) for entry in exchange_entries] == [
+                ("human:utku", "Use the original seat"),
+                ("gpt", "original seat used"),
+            ]
+        finally:
+            conn.close()
+
+    def test_room_ask_refusals_before_request_leave_store_unchanged(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure_roles(workspace)
+
+        conn, store = _open_store(db)
+        try:
+            no_room_baseline = store.counts()
+        finally:
+            conn.close()
+        no_room = runner.invoke(
+            app, ["room", "ask", "@planner", "question", "--by", "utku"]
+        )
+        assert no_room.exit_code == 1 and "no active Room" in no_room.output
+        conn, store = _open_store(db)
+        try:
+            assert store.counts() == no_room_baseline
+        finally:
+            conn.close()
+
+        assert runner.invoke(app, ["room", "create", "Guarded"]).exit_code == 0
+        conn, store = _open_store(db)
+        try:
+            baseline = store.counts()
+        finally:
+            conn.close()
+        invalid_cases = [
+            ["room", "ask", "planner", "q", "--by", "utku"],
+            ["room", "ask", "@missing", "q", "--by", "utku"],
+            ["room", "ask", "@planner", "q", "--by", ""],
+            ["room", "ask", "@planner", "q", "--by", "two words"],
+            ["room", "ask", "@planner", "q", "--by", "human:utku"],
+        ]
+        for args in invalid_cases:
+            assert runner.invoke(app, args).exit_code == 1
+        conn, store = _open_store(db)
+        try:
+            assert store.counts() == baseline
+        finally:
+            conn.close()
+
+        assert runner.invoke(app, ["room", "close", "Guarded"]).exit_code == 0
+        conn, store = _open_store(db)
+        try:
+            closed_baseline = store.counts()
+        finally:
+            conn.close()
+        closed = runner.invoke(
+            app,
+            ["room", "ask", "@planner", "q", "--by", "utku", "--room", "Guarded"],
+        )
+        assert closed.exit_code == 1 and "is closed" in closed.output
+        conn, store = _open_store(db)
+        try:
+            assert store.counts() == closed_baseline
+        finally:
+            conn.close()
+
+    def test_room_ask_adapter_construction_refuses_before_request(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure_roles(workspace)
+        assert runner.invoke(app, ["room", "create", "Config"]).exit_code == 0
+        (workspace / "relay.yaml").write_text(
+            "agents:\n"
+            "  other: {backend: api, adapter: openai, model: offline}\n"
+            "roles:\n"
+            "  planner: other\n",
+            encoding="utf-8",
+        )
+        conn, store = _open_store(db)
+        try:
+            baseline = store.counts()
+        finally:
+            conn.close()
+        unknown_agent = runner.invoke(
+            app, ["room", "ask", "@planner", "q", "--by", "utku"]
+        )
+        assert unknown_agent.exit_code == 1 and "unknown agent 'gpt'" in unknown_agent.output
+
+        (workspace / "relay.yaml").write_text(
+            "agents:\n"
+            "  gpt: {backend: api, adapter: missing_adapter, model: offline}\n"
+            "roles:\n"
+            "  planner: gpt\n",
+            encoding="utf-8",
+        )
+        conn, store = _open_store(db)
+        try:
+            assert store.counts() == baseline
+        finally:
+            conn.close()
+
+        result = runner.invoke(
+            app, ["room", "ask", "@planner", "q", "--by", "utku"]
+        )
+
+        assert result.exit_code == 1
+        conn, store = _open_store(db)
+        try:
+            assert store.counts() == baseline
+        finally:
+            conn.close()
+
+    def test_room_ask_runtime_failure_keeps_request_and_failed_delivery(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure_roles(workspace)
+        assert runner.invoke(app, ["room", "create", "Failure"]).exit_code == 0
+
+        def timeout(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("provider hung", request=request)
+
+        result = _patched_invoke(
+            ["room", "ask", "@planner", "fragile", "--by", "utku"], timeout
+        )
+
+        assert result.exit_code == 1
+        assert "incomplete Room exchange" in result.output
+        conn, store = _open_store(db)
+        try:
+            messages = list(store.all_models(Message))
+            assert len(messages) == 1
+            assert messages[0].sender == "human:utku"
+            runs = list(store.all_models(Run))
+            assert len(runs) == 1 and runs[0].status is RunStatus.FAILED
+            events = EventLogWriter(conn).all()
+            assert len(
+                [event for event in events if event.type is EventType.MESSAGE_DELIVERED]
+            ) == 1
+        finally:
+            conn.close()
+
+    def test_room_ask_close_after_start_reports_incomplete_without_reply(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure_roles(workspace)
+        assert runner.invoke(app, ["room", "create", "Closing"]).exit_code == 0
+        calls = 0
+
+        def close_room(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            conn, store = _open_store(db)
+            try:
+                workspace_row = next(store.all_models(Workspace))
+                room = next(store.all_models(Room))
+                from relay.core.rooms import RoomLifecycle
+
+                RoomLifecycle(store, EventLogWriter(conn)).close(workspace_row, room)
+            finally:
+                conn.close()
+            return httpx.Response(200, json=_completion("finished after close"))
+
+        result = _patched_invoke(
+            ["room", "ask", "@planner", "close during run", "--by", "utku"],
+            close_room,
+        )
+
+        assert result.exit_code == 1
+        assert "incomplete Room exchange" in result.output
+        assert calls == 1
+        conn, store = _open_store(db)
+        try:
+            messages = list(store.all_models(Message))
+            assert len(messages) == 1
+            runs = list(store.all_models(Run))
+            assert len(runs) == 1 and runs[0].status is RunStatus.SUCCEEDED
+            assert [artifact.kind for artifact in store.artifacts_for_run(runs[0].id)] == [
+                ArtifactKind.RUN_INPUT,
+                ArtifactKind.RUN_OUTPUT,
+            ]
+            events = EventLogWriter(conn).all()
+            assert any(event.type is EventType.MESSAGE_DELIVERED for event in events)
+            assert any(event.type is EventType.ROOM_CLOSED for event in events)
+        finally:
+            conn.close()
+
 
 class TestInitIdempotenceCLI:
     def test_reinit_keeps_id_and_history(self, workspace, db):
@@ -355,6 +662,52 @@ class TestHarnessRefusal:
             result = runner.invoke(app, ["ask", "echoh", "ping-marker"])
         assert result.exit_code == 0, result.output
         assert "c7echo:ping-marker" in result.output
+
+    def test_room_ask_harness_runtime_probe_happens_after_request_persistence(
+        self, workspace, db
+    ):
+        from relay.harness.capabilities import HarnessCapability
+        from relay.harness.runtime import HarnessAgent as _HarnessAgent
+
+        missing = (workspace / "definitely-missing-relay-harness.exe").as_posix()
+        (workspace / "relay.yaml").write_text(
+            "agents:\n"
+            f"  echoh: {{backend: harness, adapter: c7_echo, "
+            f"harness: {{executable_path: '{missing}', timeout_seconds: 20}}}}\n"
+            "roles:\n"
+            "  planner: echoh\n",
+            encoding="utf-8",
+        )
+        runner.invoke(app, ["init"])
+        assert runner.invoke(app, ["room", "create", "Harness"]).exit_code == 0
+
+        class _C7Echo(_HarnessAgent):
+            name = "c7_echo"
+            capabilities = frozenset({HarnessCapability.READ_ONLY_ACCESS})
+
+            def invocation_argv(self, resolved):
+                return (resolved.command, "--unused")
+
+        with transient_adapters({"c7_echo": _C7Echo}):
+            result = runner.invoke(
+                app,
+                ["room", "ask", "@planner", "probe at runtime", "--by", "utku"],
+            )
+
+        assert result.exit_code == 1
+        assert "incomplete Room exchange" in result.output
+        conn, store = _open_store(db)
+        try:
+            messages = list(store.all_models(Message))
+            assert len(messages) == 1 and messages[0].recipient == "echoh"
+            runs = list(store.all_models(Run))
+            assert len(runs) == 1 and runs[0].status is RunStatus.FAILED
+            assert any(
+                event.type is EventType.MESSAGE_DELIVERED
+                for event in EventLogWriter(conn).all()
+            )
+        finally:
+            conn.close()
 
     def test_unknown_agent_lists_knowns(self, workspace):
         runner.invoke(app, ["init"])

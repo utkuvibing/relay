@@ -21,6 +21,7 @@ from relay.agents.base import (
 from relay.agents.config import AgentSettings
 from relay.agents.errors import AgentError
 from relay.context.config import ConfigError, HarnessAgentConfig
+from relay.core.bus import ConversationBus
 from relay.core.delivery import (
     DELIVERY_SENDER,
     DeliveryOutcome,
@@ -34,6 +35,7 @@ from relay.core.delivery import (
 )
 from relay.core.evidence import EvidenceKind
 from relay.core.permissions import Action
+from relay.core.rooms import ClosedRoomError
 from relay.core.state_machine import TaskState
 from relay.harness.errors import UnsupportedCapability
 from relay.harness.runtime import HarnessAgent
@@ -52,6 +54,7 @@ from relay.storage.models import (
     Message,
     MessageType,
     Room,
+    RoomStatus,
     Run,
     RunStatus,
     Task,
@@ -203,6 +206,29 @@ def _markers(db, kind: EventType) -> list:
 
 
 class TestDeliveryBinding:
+    async def test_prepared_recipient_is_not_reconstructed_after_message_persistence(
+        self, store, writer, scope, api_agent
+    ):
+        class CountingFactory(FakeFactory):
+            builds = 0
+
+            def build(self, name: str) -> Agent:
+                self.builds += 1
+                return super().build(name)
+
+        factory = CountingFactory({"fixer": api_agent})
+        bus = ConversationBus(store, writer)
+        delivery = MessageDelivery(store, writer, factory, bus)
+        delivery.prepare_recipient("fixer")
+        parent = bus.send(
+            _message(recipient="fixer", type=MessageType.CLARIFICATION_REQUEST)
+        )
+
+        outcome = await delivery.deliver_and_reply(parent.id)
+
+        assert outcome.reply is not None
+        assert factory.builds == 1
+
     async def test_successful_delivery_persists_binding_marker(self, delivery, store, db):
         saved = store.save_model(_message())
 
@@ -224,6 +250,231 @@ class TestDeliveryBinding:
         # D10: the marker asserts a BINDING, never success.
         assert "bound to run" in marker.content
         assert outcome.ask.run.id in marker.content
+
+    async def test_closed_room_refuses_delivery_before_run_binding(
+        self, delivery, store, db, api_agent
+    ):
+        saved = ConversationBus(store, EventLogWriter(db)).send(
+            _message(recipient="fixer", type=MessageType.CLARIFICATION_REQUEST)
+        )
+        room = store.load_model(Room, "room-1")
+        assert room is not None
+        store.update_model(room.model_copy(update={"status": RoomStatus.CLOSED}))
+        baseline = store.counts()
+
+        with pytest.raises(ClosedRoomError, match="is closed"):
+            await delivery.deliver_and_reply(saved.id)
+
+        assert store.counts() == baseline
+        assert store.load_model(Message, saved.id) == saved
+        assert api_agent.received == []
+        assert delivery.deliveries_for_message(saved.id) == ()
+        assert len(_markers(db, EventType.MESSAGE_SENT)) == 1
+
+    def test_room_close_and_delivery_binding_serialize_both_lock_orders(self, tmp_path):
+        import concurrent.futures
+        import threading
+        import time
+
+        def seed(path):
+            conn = connect(path)
+            migrate(conn)
+            store = SqliteRelayStore(conn)
+            store.save_model(Room(id="room-1", name="race-room"))
+            parent = ConversationBus(store, EventLogWriter(conn)).send(
+                Message(
+                    sender="human:utku",
+                    recipient="fixer",
+                    room_id="room-1",
+                    type=MessageType.CLARIFICATION_REQUEST,
+                    content="race the close",
+                )
+            )
+            conn.close()
+            return parent
+
+        close_first_path = tmp_path / "close-first.sqlite3"
+        close_first_parent = seed(close_first_path)
+        close_has_lock = threading.Event()
+        release_close = threading.Event()
+        delivery_attempting = threading.Event()
+        close_first_agent = RecordingAPIAgent()
+
+        def hold_close_transaction():
+            conn = connect(close_first_path)
+            try:
+                store = SqliteRelayStore(conn)
+                with store.transaction():
+                    room = store.load_model(Room, "room-1")
+                    assert room is not None
+                    store.update_model(room.model_copy(update={"status": RoomStatus.CLOSED}))
+                    close_has_lock.set()
+                    assert release_close.wait(timeout=5)
+            finally:
+                conn.close()
+
+        def deliver_after_close_lock():
+            conn = connect(close_first_path)
+            try:
+                store = SqliteRelayStore(conn)
+                delivery = MessageDelivery(
+                    store,
+                    EventLogWriter(conn),
+                    FakeFactory({"fixer": close_first_agent}),
+                )
+                delivery_attempting.set()
+                return asyncio.run(delivery.deliver_and_reply(close_first_parent.id))
+            finally:
+                conn.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            close_future = executor.submit(hold_close_transaction)
+            assert close_has_lock.wait(timeout=5)
+            delivery_future = executor.submit(deliver_after_close_lock)
+            assert delivery_attempting.wait(timeout=5)
+            time.sleep(0.05)
+            release_close.set()
+            close_future.result(timeout=5)
+            with pytest.raises(ClosedRoomError, match="is closed"):
+                delivery_future.result(timeout=5)
+
+        conn = connect(close_first_path)
+        try:
+            store = SqliteRelayStore(conn)
+            assert list(store.all_models(Run)) == []
+            assert list(store.all_models(Artifact)) == []
+            assert [event.type for event in EventLogWriter(conn).all()] == [
+                EventType.MESSAGE_SENT
+            ]
+            assert close_first_agent.received == []
+        finally:
+            conn.close()
+
+        delivery_first_path = tmp_path / "delivery-first.sqlite3"
+        delivery_first_parent = seed(delivery_first_path)
+        invoked = threading.Event()
+        allow_finish = threading.Event()
+
+        class PausingAgent(Agent):
+            name = "pausing"
+            backend = BackendType.API
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def run(self, request: AgentRequest) -> AgentResponse:
+                self.calls += 1
+                invoked.set()
+                assert allow_finish.wait(timeout=5)
+                return AgentResponse(agent=self.name, role=request.role, output="finished")
+
+        delivery_first_agent = PausingAgent()
+
+        def deliver_before_close():
+            conn = connect(delivery_first_path)
+            try:
+                store = SqliteRelayStore(conn)
+                delivery = MessageDelivery(
+                    store,
+                    EventLogWriter(conn),
+                    FakeFactory({"fixer": delivery_first_agent}),
+                )
+                return asyncio.run(delivery.deliver_and_reply(delivery_first_parent.id))
+            finally:
+                conn.close()
+
+        def close_after_binding():
+            conn = connect(delivery_first_path)
+            try:
+                store = SqliteRelayStore(conn)
+                with store.transaction():
+                    room = store.load_model(Room, "room-1")
+                    assert room is not None
+                    store.update_model(room.model_copy(update={"status": RoomStatus.CLOSED}))
+            finally:
+                conn.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            delivery_future = executor.submit(deliver_before_close)
+            assert invoked.wait(timeout=5)
+            close_future = executor.submit(close_after_binding)
+            close_future.result(timeout=5)
+            allow_finish.set()
+            with pytest.raises(ClosedRoomError, match="is closed"):
+                delivery_future.result(timeout=5)
+
+        conn = connect(delivery_first_path)
+        try:
+            store = SqliteRelayStore(conn)
+            runs = list(store.all_models(Run))
+            assert len(runs) == 1 and runs[0].status is RunStatus.SUCCEEDED
+            assert len(list(store.all_models(Message))) == 1
+            assert any(
+                event.type is EventType.MESSAGE_DELIVERED
+                for event in EventLogWriter(conn).all()
+            )
+            assert delivery_first_agent.calls == 1
+        finally:
+            conn.close()
+
+    async def test_room_close_after_delivery_start_preserves_run_but_blocks_reply_and_reuse(
+        self, store, writer, scope
+    ):
+        class ClosingAgent(Agent):
+            name = "closing"
+            backend = BackendType.API
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def run(self, request: AgentRequest) -> AgentResponse:
+                self.calls += 1
+                room = store.load_model(Room, "room-1")
+                assert room is not None
+                with store.transaction():
+                    store.update_model(room.model_copy(update={"status": RoomStatus.CLOSED}))
+                return AgentResponse(agent=self.name, role=request.role, output="finished")
+
+        agent = ClosingAgent()
+        bus = ConversationBus(store, writer)
+        delivery = MessageDelivery(store, writer, FakeFactory({"closing": agent}), bus)
+        parent = bus.send(
+            _message(
+                sender="human:utku",
+                recipient="closing",
+                run_id=None,
+                type=MessageType.CLARIFICATION_REQUEST,
+            )
+        )
+
+        with pytest.raises(ClosedRoomError, match="is closed"):
+            await delivery.deliver_and_reply(parent.id)
+
+        runs = [run for run in store.all_models(Run) if run.agent == "closing"]
+        assert len(runs) == 1 and runs[0].status is RunStatus.SUCCEEDED
+        assert [artifact.kind for artifact in store.artifacts_for_run(runs[0].id)] == [
+            ArtifactKind.RUN_INPUT,
+            ArtifactKind.RUN_OUTPUT,
+        ]
+        assert bus.replies_for(parent.id) == []
+        assert agent.calls == 1
+        baseline = store.counts()
+
+        with pytest.raises(ClosedRoomError, match="is closed"):
+            await delivery.deliver_and_reply(parent.id)
+
+        assert agent.calls == 1
+        assert store.counts() == baseline
+
+        closed_room = store.load_model(Room, "room-1")
+        assert closed_room is not None
+        store.update_model(closed_room.model_copy(update={"status": RoomStatus.OPEN}))
+        recovered = await delivery.deliver_and_reply(parent.id)
+
+        assert recovered.ask.run.id == runs[0].id
+        assert recovered.reply is not None
+        assert recovered.reply.content == "finished"
+        assert agent.calls == 1
 
     async def test_binding_marker_commits_with_tx1_not_the_outcome(
         self, delivery, store, db

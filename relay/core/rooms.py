@@ -26,6 +26,7 @@ __all__ = [
     "RoomError",
     "RoomLifecycle",
     "RoomLookupError",
+    "RoomSeatResolver",
     "require_open_room",
 ]
 
@@ -40,6 +41,20 @@ class RoomLookupError(RoomError):
 
 class ClosedRoomError(RoomError):
     """A Room-scoped write was attempted while the Room was closed."""
+
+
+class RoomSeatResolver:
+    """Immutable role-to-agent snapshot for one Room exchange."""
+
+    def __init__(self, room: Room) -> None:
+        self._bindings = {member.role: member.agent for member in room.members}
+        self._agents = frozenset(self._bindings.values())
+
+    def resolve_role(self, role: str) -> str | None:
+        return self._bindings.get(role)
+
+    def knows_agent(self, name: str) -> bool:
+        return name in self._agents
 
 
 def require_open_room(store: SqliteRelayStore, room_id: str) -> Room:
