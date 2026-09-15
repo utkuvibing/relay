@@ -7,7 +7,7 @@ import pytest
 from relay.core.bus import ConversationBus
 from relay.core.rooms import RoomError, RoomLifecycle, RoomSeatResolver
 from relay.core.state_machine import TaskState
-from relay.storage.db import _MIGRATIONS, connect, migrate
+from relay.storage.db import _MIGRATIONS, SCHEMA_VERSION, connect, migrate
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     EventType,
@@ -257,7 +257,7 @@ def test_v8_migration_disambiguates_legacy_names_without_changing_ids(tmp_path):
             [room_id, name, created],
         )
 
-    assert migrate(conn) == 8
+    assert migrate(conn) == SCHEMA_VERSION
     rows = conn.execute("SELECT id, name, status FROM rooms ORDER BY id").fetchall()
     assert [tuple(row) for row in rows] == [
         ("a", "Design", "open"),

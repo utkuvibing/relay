@@ -45,6 +45,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import pydantic
+
 from relay.agents.base import (
     Agent,
     AgentRequest,
@@ -84,6 +86,7 @@ from relay.core.reviews import (
     encode_review_record,
     parse_review,
 )
+from relay.core.room_records import build_review_findings
 from relay.core.stage_signals import (
     SignalContractError,
     SignalDeliveryContext,
@@ -485,6 +488,7 @@ def advance_task(
     evidence_records: tuple[EvidenceRecord, ...] = (),
     artifacts: tuple[Artifact, ...] = (),
     events: tuple[EventLogEntry, ...] = (),
+    models: tuple[pydantic.BaseModel, ...] = (),
 ) -> Task:
     """One persisted lifecycle transition — validate, then persist ATOMICALLY.
 
@@ -498,34 +502,120 @@ def advance_task(
     the machine validates, inside the transaction, so gates that demand
     the very evidence the boundary is minting (e.g. ``APPROVAL_GRANTED``
     on the ``APPROVAL_REQUIRED -> DONE`` edge) validate against it.
-    No caller-supplied enum ever carries transition authority (App. A.1).
+    ``models`` carries extra canonical rows a boundary mints (P7.3 Room
+    findings) into the same transaction. No caller-supplied enum ever
+    carries transition authority (App. A.1).
     """
     if evidence_records and evidence_store is None:
         raise ValueError("evidence_records require evidence_store")
     with store.transaction():
-        if created_approval is not None:
-            store.save_model(created_approval)
-        if updated_approval is not None:
-            store.update_model(updated_approval)
-        for artifact in artifacts:
-            store.save_model(artifact)
-        if evidence_store is not None and evidence_records:
-            for record in evidence_records:
-                evidence_store.record(record)
-        previous = machine.state
-        machine.transition(target)
-        updated = task.model_copy(update={"state": target})
-        store.update_model(updated)
-        for entry in events:
-            writer.record(entry)
-        writer.record(
-            EventLogEntry(
-                type=EventType.STATE_TRANSITIONED,
-                content=f"task state: {previous.value} -> {target.value}",
-                references=[f"task:{task.id}"],
-            )
+        return advance_locked(
+            machine,
+            store,
+            writer,
+            task,
+            target,
+            evidence_store=evidence_store,
+            created_approval=created_approval,
+            updated_approval=updated_approval,
+            evidence_records=evidence_records,
+            artifacts=artifacts,
+            events=events,
+            models=models,
         )
+
+
+def advance_locked(
+    machine: TaskStateMachine,
+    store: SqliteRelayStore,
+    writer: EventLogWriter,
+    task: Task,
+    target: TaskState,
+    *,
+    evidence_store: EvidenceStore | None = None,
+    created_approval: Approval | None = None,
+    updated_approval: Approval | None = None,
+    evidence_records: tuple[EvidenceRecord, ...] = (),
+    artifacts: tuple[Artifact, ...] = (),
+    events: tuple[EventLogEntry, ...] = (),
+    models: tuple[pydantic.BaseModel, ...] = (),
+) -> Task:
+    """``advance_task`` body — the CALLER owns an open transaction (P7.3)."""
+    if created_approval is not None:
+        store.save_model(created_approval)
+    if updated_approval is not None:
+        store.update_model(updated_approval)
+    for artifact in artifacts:
+        store.save_model(artifact)
+    for model in models:
+        store.save_model(model)
+    if evidence_store is not None and evidence_records:
+        for record in evidence_records:
+            evidence_store.record(record)
+    previous = machine.state
+    machine.transition(target)
+    updated = task.model_copy(update={"state": target})
+    store.update_model(updated)
+    for entry in events:
+        writer.record(entry)
+    writer.record(
+        EventLogEntry(
+            type=EventType.STATE_TRANSITIONED,
+            content=f"task state: {previous.value} -> {target.value}",
+            references=[f"task:{task.id}"],
+        )
+    )
     return updated
+
+
+def _context_brief(workspace_root: Path) -> str:
+    """Relay-discovered workspace context as a bounded brief (SPEC §13 profile)."""
+    from relay.context.workspace import discover_profile
+
+    profile = discover_profile(workspace_root)
+    return (
+        "# Workspace context (relay:core)\n\n"
+        f"- languages: {', '.join(profile.languages) or '(none detected)'}\n"
+        f"- frameworks: {', '.join(profile.frameworks) or '(none detected)'}\n"
+        f"- package managers: {', '.join(profile.package_managers) or '(none detected)'}\n"
+        f"- instruction files: {', '.join(profile.instructions) or '(none)'}\n"
+        f"- test suites: {json.dumps(profile.tests, sort_keys=True) if profile.tests else '(none detected)'}\n"
+        f"- default branch: {profile.default_branch}\n"
+    )
+
+
+def mint_context_locked(
+    store: SqliteRelayStore,
+    writer: EventLogWriter,
+    evidence: EvidenceStore,
+    task: Task,
+    workspace_root: Path,
+) -> Task:
+    """Persist the workspace brief + ``CONTEXT_COLLECTED`` evidence (P7.3).
+
+    The CALLER owns an open transaction — the P7.3 Room freeze composes this
+    inside its single all-or-nothing ``BEGIN IMMEDIATE``.
+    """
+    brief = _context_brief(workspace_root)
+    artifact = store.save_model(
+        Artifact(kind=ArtifactKind.REPORT, task_id=task.id, content=brief)
+    )
+    evidence.record(
+        EvidenceRecord(
+            kind=EvidenceKind.CONTEXT_COLLECTED,
+            task_id=task.id,
+            produced_by="relay:core",
+            artifact_id=artifact.id,
+        )
+    )
+    writer.record(
+        EventLogEntry(
+            type=EventType.EVIDENCE_RECORDED,
+            content=f"{EvidenceKind.CONTEXT_COLLECTED.value} recorded for task",
+            references=[f"task:{task.id}", f"artifact:{artifact.id}"],
+        )
+    )
+    return task
 
 
 def _collect_context(
@@ -538,41 +628,11 @@ def _collect_context(
     """Relay-collected workspace context backing ``CREATED→CONTEXT_READY``.
 
     The brief is real discovered repository fact (SPEC §13 profile: languages,
-    frameworks, instruction files, test suites) persisted as a RESEARCH
+    frameworks, instruction files, test suites) persisted as a REPORT
     artifact the evidence record points at — never a caller-supplied claim.
     """
-    from relay.context.workspace import discover_profile
-
-    profile = discover_profile(workspace_root)
-    brief = (
-        "# Workspace context (relay:core)\n\n"
-        f"- languages: {', '.join(profile.languages) or '(none detected)'}\n"
-        f"- frameworks: {', '.join(profile.frameworks) or '(none detected)'}\n"
-        f"- package managers: {', '.join(profile.package_managers) or '(none detected)'}\n"
-        f"- instruction files: {', '.join(profile.instructions) or '(none)'}\n"
-        f"- test suites: {json.dumps(profile.tests, sort_keys=True) if profile.tests else '(none detected)'}\n"
-        f"- default branch: {profile.default_branch}\n"
-    )
     with store.transaction():
-        artifact = store.save_model(
-            Artifact(kind=ArtifactKind.REPORT, task_id=task.id, content=brief)
-        )
-        evidence.record(
-            EvidenceRecord(
-                kind=EvidenceKind.CONTEXT_COLLECTED,
-                task_id=task.id,
-                produced_by="relay:core",
-                artifact_id=artifact.id,
-            )
-        )
-        writer.record(
-            EventLogEntry(
-                type=EventType.EVIDENCE_RECORDED,
-                content=f"{EvidenceKind.CONTEXT_COLLECTED.value} recorded for task",
-                references=[f"task:{task.id}", f"artifact:{artifact.id}"],
-            )
-        )
-    return task
+        return mint_context_locked(store, writer, evidence, task, workspace_root)
 
 
 def _freeze_plan(
@@ -1002,7 +1062,7 @@ async def _run_review(
     (SIGNAL_INVALID), never a review verdict.
     """
 
-    subject = build_review_subject(inputs)
+    subject = build_review_subject(inputs, store=store)
     review_request = request.model_copy(
         update={
             "role": AgentRole.REVIEWER,
@@ -1165,6 +1225,7 @@ async def _run_review(
             inputs,
             review_run_outcome.run,
             output_artifact,
+            store=store,
         )
         packet_artifact = Artifact(
             kind=ArtifactKind.FIX_PACKET,
@@ -1181,6 +1242,12 @@ async def _run_review(
                 f"artifact:{packet_artifact.id}",
             ],
         )
+        # P7.3 (App. D.3): a Room-bound task's findings become canonical,
+        # individually addressable Room records in the SAME transaction as the
+        # review artifacts; a standalone build mints nothing.
+        room_findings, finding_events = build_review_findings(
+            store, task, review_artifact, review_run_outcome.run, report
+        )
         updated = advance_task(
             machine,
             store,
@@ -1188,7 +1255,8 @@ async def _run_review(
             task,
             TaskState.IMPLEMENTING,
             artifacts=(review_artifact, packet_artifact),
-            events=(review_event, packet_event),
+            events=(review_event, packet_event, *finding_events),
+            models=room_findings,
         )
         return ReviewStageOutcome(
             task=updated,
@@ -1681,7 +1749,7 @@ async def run_build(
     )
 
 
-def _persist_build_request(
+def persist_build_request_locked(
     store: SqliteRelayStore,
     writer: EventLogWriter,
     task: Task,
@@ -1690,7 +1758,7 @@ def _persist_build_request(
     implementer: str,
     model: str | None,
 ) -> Artifact:
-    """Persist the ``relay.build.request.v1`` record — resume's entry point."""
+    """``relay.build.request.v1`` write — the CALLER owns a transaction (P7.3)."""
     payload = BuildRequestRecordPayload(
         schema_version="relay.build.request.v1",
         task_id=task.id,
@@ -1701,16 +1769,31 @@ def _persist_build_request(
     artifact = Artifact(
         kind=ArtifactKind.REPORT, task_id=task.id, content=canonical_json(payload)
     )
-    with store.transaction():
-        store.save_model(artifact)
-        writer.record(
-            EventLogEntry(
-                type=EventType.ARTIFACT_CREATED,
-                content="build request persisted for resume",
-                references=[f"task:{task.id}", f"artifact:{artifact.id}"],
-            )
+    store.save_model(artifact)
+    writer.record(
+        EventLogEntry(
+            type=EventType.ARTIFACT_CREATED,
+            content="build request persisted for resume",
+            references=[f"task:{task.id}", f"artifact:{artifact.id}"],
         )
+    )
     return artifact
+
+
+def _persist_build_request(
+    store: SqliteRelayStore,
+    writer: EventLogWriter,
+    task: Task,
+    request: AgentRequest,
+    *,
+    implementer: str,
+    model: str | None,
+) -> Artifact:
+    """Persist the ``relay.build.request.v1`` record — resume's entry point."""
+    with store.transaction():
+        return persist_build_request_locked(
+            store, writer, task, request, implementer=implementer, model=model
+        )
 
 
 def _persist_baseline_pin(
@@ -1860,7 +1943,7 @@ async def _drive_build(
                 test_result_artifact=records.test_result_artifact,
             )
             try:
-                build_review_subject(review_inputs)
+                build_review_subject(review_inputs, store=store)
             except ReviewContractError as exc:
                 diagnostic = _persist_review_diagnostic(store, writer, task, exc.code)
                 review_result = ReviewResult(

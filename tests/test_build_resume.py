@@ -25,7 +25,7 @@ from test_build_flow import (
 from typer.testing import CliRunner
 
 from relay.agents.base import Agent, AgentRequest, AgentRole
-from relay.agents.config import AgentSettings
+from relay.agents.config import AgentSettings, CliOverrides, resolve_settings
 from relay.agents.registry import transient_adapters
 from relay.cli.main import app
 from relay.context.config import HarnessAgentConfig
@@ -48,6 +48,7 @@ from relay.storage.models import (
     ArtifactKind,
     EventLogEntry,
     EventType,
+    Finding,
     Message,
     MessageType,
     Run,
@@ -979,3 +980,187 @@ class TestDerivePosition:
         assert position.request.implementer == "impl"
         assert _counts(conn) == before  # read-only
         conn.close()
+
+
+class TestFrozenRoomPlanExecution:
+    """P7.3 E2E: a human freeze + `relay continue` implements the frozen plan
+    with NO planner stage run (App. D.3)."""
+
+    def _configure_room(self, workspace) -> None:
+        """Room-aware config: planner seat, implementer seat, reviewer, verification."""
+        executable = json.dumps(sys.executable)
+        (workspace / "relay.yaml").write_text(
+            "agents:\n"
+            "  impl:\n"
+            "    backend: harness\n"
+            "    adapter: fake_implementer_build\n"
+            "    harness:\n"
+            f"      executable_path: {executable}\n"
+            "      grant: workspace_write\n"
+            "      timeout_seconds: 60\n"
+            "  gpt: {backend: api, adapter: openai, model: offline}\n"
+            "roles:\n"
+            "  planner: gpt\n"
+            "  implementer: impl\n"
+            "reviewer: impl\n"
+            "verification:\n"
+            f"  program: {executable}\n"
+            "  args: [\"-c\", \"print('tests ok')\"]\n",
+            encoding="utf-8",
+        )
+
+    def _room_and_freeze(self, workspace, store, writer):
+        from relay.context.config import load_config
+        from relay.core.room_freeze import freeze_room_plan
+        from relay.core.rooms import RoomLifecycle, RoomSeatResolver
+        from relay.storage.models import Workspace
+
+        config = load_config(workspace)
+        workspace_row = next(store.all_models(Workspace))
+        lifecycle = RoomLifecycle(store, writer)
+        room = lifecycle.create(
+            workspace_row,
+            "Design",
+            {"planner": "gpt", "implementer": "impl"},
+            config.agents.keys(),
+        )
+
+        # A canonical planner discussion reply with delivery provenance
+        # (no provider call: the exchange is minted as persisted records).
+        from relay.agents.base import AgentRole
+        from relay.core.bus import ConversationBus
+        from relay.storage.models import Message, MessageType, Run, RunStatus
+
+        bus = ConversationBus(store, writer, RoomSeatResolver(room))
+        parent = bus.send(
+            Message(
+                sender="human:utku",
+                recipient_role=AgentRole.PLANNER.value,
+                room_id=room.id,
+                type=MessageType.CLARIFICATION_REQUEST,
+                content="Draft the implementation plan",
+            )
+        )
+        plan_run = store.save_model(
+            Run(agent="gpt", role=AgentRole.PLANNER.value, status=RunStatus.SUCCEEDED)
+        )
+        reply = bus.send(
+            Message(
+                sender="gpt",
+                recipient=parent.sender,
+                reply_to_id=parent.id,
+                run_id=plan_run.id,
+                room_id=room.id,
+                type=MessageType.CLARIFICATION_RESPONSE,
+                content="# Plan\n\nGoal: implement the task\nSteps: write implemented.txt",
+            )
+        )
+        writer.record(
+            EventLogEntry(
+                type=EventType.MESSAGE_DELIVERED,
+                room_id=room.id,
+                sender="relay:delivery",
+                content="planner request delivered",
+                references=[
+                    f"message:{parent.id}",
+                    f"run:{plan_run.id}",
+                    f"room:{room.id}",
+                ],
+            )
+        )
+        outcome = freeze_room_plan(
+            store,
+            writer,
+            SqliteEvidenceStore(store),
+            config,
+            store.load_model(type(room), room.id),
+            source_message_id=reply.id,
+            frozen_by="human:utku",
+            workspace_root=workspace,
+            implementer_model=resolve_settings(
+                cli=CliOverrides(), yaml_agent=config.agents["impl"]
+            ).model,
+        )
+        return room, outcome
+
+    def test_continue_implements_the_frozen_plan_without_a_plan_stage(self, build_workspace):
+        self._configure_room(build_workspace)
+
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        room, outcome = self._room_and_freeze(build_workspace, store, writer)
+        task_id = outcome.task.id
+        plan_id = outcome.plan_artifact.id
+        conn.close()
+
+        with transient_adapters({"fake_implementer_build": _FakeImplementer}):
+            result = runner.invoke(app, ["continue", task_id])
+        assert result.exit_code == 0, result.output
+
+        conn, store = _open_store(build_workspace)
+        try:
+            task = store.load_model(Task, task_id)
+            assert task.state is TaskState.APPROVAL_REQUIRED
+            # The ONLY planner run is the Room discussion run that authored the
+            # frozen plan — no build plan-stage run was dispatched.
+            planner_runs = [run for run in store.all_models(Run) if run.role == "planner"]
+            assert [run.id for run in planner_runs] == [outcome.source.run.id]
+            assert "implementer" in [run.role for run in store.all_models(Run)]
+            plans = [
+                artifact
+                for artifact in store.all_models(Artifact)
+                if artifact.kind is ArtifactKind.PLAN
+            ]
+            assert [artifact.id for artifact in plans] == [plan_id]
+            markers = [
+                event
+                for event in EventLogWriter(conn).all()
+                if event.type is EventType.BUILD_RUN_DISPATCHED
+                and "build_stage:plan" in event.references
+            ]
+            assert markers == []
+            # The review pinned the frozen plan as its subject.
+            review = next(
+                artifact
+                for artifact in store.all_models(Artifact)
+                if artifact.kind is ArtifactKind.REVIEW_FINDING
+            )
+            assert plan_id in (review.content or "")
+            assert room.id in [artifact.room_id for artifact in plans]
+        finally:
+            conn.close()
+
+    def test_continue_mints_canonical_room_findings(self, build_workspace):
+        """A review with findings becomes canonical Room FINDING records."""
+        self._configure_room(build_workspace)
+        # The fixture harness answers reviews with findings for this run.
+        loop_impl = _loop_implementer(build_workspace, "--review-verdicts", "findings")
+
+        conn, store = _open_store(build_workspace)
+        writer = EventLogWriter(conn)
+        _room, outcome = self._room_and_freeze(build_workspace, store, writer)
+        task_id = outcome.task.id
+        conn.close()
+
+        with transient_adapters({"fake_implementer_build": loop_impl}):
+            result = runner.invoke(app, ["continue", task_id])
+        assert result.exit_code == 0, result.output
+
+        conn, store = _open_store(build_workspace)
+        try:
+            findings = list(store.all_models(Finding))
+            assert findings, result.output
+            assert all(finding.room_id == outcome.room.id for finding in findings)
+            assert all(finding.task_id == task_id for finding in findings)
+            markers = [
+                event
+                for event in EventLogWriter(conn).all()
+                if event.type is EventType.FINDING_RECORDED
+            ]
+            assert len(markers) == len(findings)
+            for finding in findings:
+                assert any(
+                    f"finding:{finding.id}" in marker.references for marker in markers
+                )
+        finally:
+            conn.close()

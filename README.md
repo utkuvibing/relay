@@ -111,6 +111,9 @@ relay room list
 relay room bind "My project" reviewer gpt
 relay room ask @reviewer "Is this a blocker?" --by utku
 relay room ask @reviewer "Check this other room" --by utku --room "My project"
+relay room decide @planner "Should we adopt design B?" --by utku
+relay room freeze "My project" --by utku --from-message <planner-reply>
+relay room graph "My project" --json
 relay room close "My project"
 relay room resume "My project"
 ```
@@ -123,6 +126,23 @@ persisted seat snapshot, records the human request, invokes that agent once with
 read-only authority, and records a canonical reply. It defaults to the active Room;
 `--room` selects another open Room without changing which Room is active.
 
+Room state also carries the canonical plan/decision/finding graph. `room decide`
+runs one explicit consequential exchange (PROPOSAL → FINAL_POSITION) and promotes a
+valid `relay.room_decision.v1` reply into a canonical decision; ordinary
+`room ask` discussion is untouched and can never be frozen. `room freeze` is the
+human acceptance of a planner-authored plan: it mints the canonical Room plan, the
+durable build request, and a Room-scoped task at `implementing`, so
+`relay continue <task>` implements the frozen plan with **no planner stage run**.
+A `--supersedes` freeze advances the canonical plan tip on the same task, but only
+at a quiescent ledger position (no in-flight build/delivery/tool runs, no open
+blocking signal). P6.4 plan-changing decisions inside a Room-bound task inherit the
+Room scope, so the graph shows one chain of frozen and revised plans; reviews of
+Room-bound tasks mint individually addressable Room findings, and `room graph`
+renders all of it (human table or versioned `relay.room.graph.v1` JSON). Room-bound
+build micro-interactions resolve roles through the Room's persisted seats, and a
+closed Room parks them with a durable `room_closed` escalation until the Room is
+resumed.
+
 ### Adapters and authentication
 
 The current adapter registry includes OpenAI-compatible API adapters and harness adapters for Codex CLI, Claude Code, and Antigravity CLI. API keys stay in environment variables. Harnesses own their login and session authentication.
@@ -133,9 +153,12 @@ These are roadmap items, not current capabilities:
 
 - P5 remaining: semantic loop/convergence detection; discussion CLI, bounded protocols, policy, budgets, and stored escalation notices are available;
 - P6 remaining: semantic loop/convergence detection; bounded micro-interactions inside stages, structured findings, deterministic fix packets, the bounded fix loop (attempt-scoped cumulative diffs, per-attempt re-verification and re-review), and `relay continue` resume for parked builds are available;
-- P7 remaining: participant context reconstruction, plan/decision/finding graphs,
-  and external-session continuation; persistent Room lifecycle, stable seats,
-  targeted Room chat, traffic fencing, and the canonical feed are available;
+- P7 remaining: participant context reconstruction and external-session
+  continuation; persistent Room lifecycle, stable seats, targeted Room chat,
+  traffic fencing, the canonical feed, the canonical plan/decision/finding graph
+  (human freeze with execution binding, P6.4 plan revisions as Room history,
+  promoted decisions, canonical findings, `relay room graph`), and seat-routed
+  Room-bound micro-interactions are available;
 - P8: decision provenance;
 - P9: Relay server;
 - P10: MCP and chat interface integration;

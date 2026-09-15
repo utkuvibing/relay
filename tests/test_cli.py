@@ -35,13 +35,17 @@ from relay.core.room_feed import build_room_feed
 from relay.storage import connect
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
+    Artifact,
     ArtifactKind,
+    Decision,
     EventType,
     Message,
     MessageType,
     Room,
     Run,
     RunStatus,
+    Task,
+    TaskState,
     Workspace,
 )
 from relay.storage.store import SqliteRelayStore
@@ -791,3 +795,242 @@ class TestTaskObservability:
         unknown = runner.invoke(app, ["inspect", "nope"])
         assert unknown.exit_code == 1
         assert "does not exist" in unknown.output
+
+
+class TestRoomCanonicalGraphCLI:
+    """P7.3 CLI: human freeze, explicit decision exchange, graph read surface."""
+
+    def _configure(self, workspace: Path) -> None:
+        (workspace / "relay.yaml").write_text(
+            "agents:\n"
+            "  gpt: {backend: api, adapter: openai, model: offline}\n"
+            "  impl:\n"
+            "    backend: harness\n"
+            "    adapter: claude_code\n"
+            "    model: offline\n"
+            "    harness:\n"
+            "      executable_path: python\n"
+            "      grant: workspace_write\n"
+            "      timeout_seconds: 30\n"
+            "roles:\n"
+            "  planner: gpt\n"
+            "  implementer: impl\n",
+            encoding="utf-8",
+        )
+
+    def _ask_planner(self, prompt: str = "Draft the implementation plan") -> Any:
+        return _patched_invoke(
+            ["room", "ask", "@planner", prompt, "--by", "utku"],
+            lambda request: httpx.Response(200, json=_completion("# Plan\n\nStep 1: ship it")),
+        )
+
+    def _planner_reply(self, db) -> Message:
+        conn, store = _open_store(db)
+        try:
+            return next(
+                message
+                for message in store.all_models(Message)
+                if message.type is MessageType.CLARIFICATION_RESPONSE
+            )
+        finally:
+            conn.close()
+
+    def test_freeze_binds_a_room_task_and_the_graph_renders_it(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure(workspace)
+        assert runner.invoke(app, ["room", "create", "Design"]).exit_code == 0
+        asked = self._ask_planner()
+        assert asked.exit_code == 0, asked.output
+        reply = self._planner_reply(db)
+
+        frozen = runner.invoke(
+            app, ["room", "freeze", "Design", "--by", "utku", "--from-message", reply.id]
+        )
+        assert frozen.exit_code == 0, frozen.output
+        assert "Frozen plan" in frozen.output
+        assert "Next: relay continue" in frozen.output
+
+        conn, store = _open_store(db)
+        try:
+            task = next(iter(store.all_models(Task)))
+            assert task.state is TaskState.IMPLEMENTING
+            assert task.room_id is not None
+            plan = next(
+                artifact
+                for artifact in store.all_models(Artifact)
+                if artifact.kind is ArtifactKind.PLAN
+            )
+            assert plan.room_id == task.room_id and plan.task_id == task.id
+        finally:
+            conn.close()
+
+        graph = runner.invoke(app, ["room", "graph", "Design"])
+        assert graph.exit_code == 0, graph.output
+        assert "Plan chain" in graph.output
+        assert "frozen by human:utku" in graph.output
+
+        as_json = runner.invoke(app, ["room", "graph", "Design", "--json"])
+        assert as_json.exit_code == 0, as_json.output
+        payload = json.loads(as_json.output)
+        assert payload["version"] == "relay.room.graph.v1"
+        assert payload["plans"][0]["nodes"][0]["edge"] == "frozen"
+        assert payload["plans"][0]["tip"] == plan.id
+
+    def test_freeze_refuses_a_second_freeze_of_the_same_reply(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure(workspace)
+        assert runner.invoke(app, ["room", "create", "Design"]).exit_code == 0
+        assert self._ask_planner().exit_code == 0
+        reply = self._planner_reply(db)
+        first = runner.invoke(
+            app, ["room", "freeze", "Design", "--by", "utku", "--from-message", reply.id]
+        )
+        assert first.exit_code == 0, first.output
+        conn, store = _open_store(db)
+        try:
+            baseline = store.counts()
+        finally:
+            conn.close()
+        again = runner.invoke(
+            app, ["room", "freeze", "Design", "--by", "utku", "--from-message", reply.id]
+        )
+        assert again.exit_code == 1
+        assert "already frozen" in again.output
+        conn, store = _open_store(db)
+        try:
+            assert store.counts() == baseline
+        finally:
+            conn.close()
+
+    def test_decide_promotes_a_canonical_decision(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure(workspace)
+        assert runner.invoke(app, ["room", "create", "Design"]).exit_code == 0
+        payload = (
+            '{"schema_version":"relay.room_decision.v1","outcome":"accept",'
+            '"statement":"adopt bundle registries","rationale":null,"references":[],'
+            '"supersedes_decision_id":null}'
+        )
+        result = _patched_invoke(
+            ["room", "decide", "@planner", "Should we adopt design B?", "--by", "utku"],
+            lambda request: httpx.Response(200, json=_completion(payload)),
+        )
+        assert result.exit_code == 0, result.output
+        assert "Decision " in result.output and "[accepted]" in result.output
+
+        conn, store = _open_store(db)
+        try:
+            decision = next(iter(store.all_models(Decision)))
+            assert decision.room_id is not None
+            assert decision.task_id is None
+            assert decision.accepted_by == "gpt"
+            assert decision.source_reply_id is not None
+            proposal = next(
+                message
+                for message in store.all_models(Message)
+                if message.type is MessageType.PROPOSAL
+            )
+            assert proposal.recipient_role == "planner"
+        finally:
+            conn.close()
+
+    def test_decide_promotes_nothing_on_ordinary_prose(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure(workspace)
+        assert runner.invoke(app, ["room", "create", "Design"]).exit_code == 0
+        result = _patched_invoke(
+            ["room", "decide", "@planner", "Should we adopt design B?", "--by", "utku"],
+            lambda request: httpx.Response(200, json=_completion("Sure, sounds fine.")),
+        )
+        assert result.exit_code == 1
+        assert "no canonical decision promoted" in result.output
+        conn, store = _open_store(db)
+        try:
+            assert not list(store.all_models(Decision))
+            assert len(list(store.all_models(Message))) == 2
+        finally:
+            conn.close()
+
+    def test_decide_output_is_never_freezable(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure(workspace)
+        assert runner.invoke(app, ["room", "create", "Design"]).exit_code == 0
+        payload = (
+            '{"schema_version":"relay.room_decision.v1","outcome":"accept",'
+            '"statement":"adopt it","rationale":null,"references":[],'
+            '"supersedes_decision_id":null}'
+        )
+        decided = _patched_invoke(
+            ["room", "decide", "@planner", "Decide", "--by", "utku"],
+            lambda request: httpx.Response(200, json=_completion(payload)),
+        )
+        assert decided.exit_code == 0, decided.output
+        conn, store = _open_store(db)
+        try:
+            reply = next(
+                message
+                for message in store.all_models(Message)
+                if message.type is MessageType.FINAL_POSITION
+            )
+        finally:
+            conn.close()
+        frozen = runner.invoke(
+            app, ["room", "freeze", "Design", "--by", "utku", "--from-message", reply.id]
+        )
+        assert frozen.exit_code == 1
+        assert "clarification_request" in frozen.output
+
+    def test_freeze_refuses_without_an_implementer_seat(self, workspace, db):
+        runner.invoke(app, ["init"])
+        (workspace / "relay.yaml").write_text(
+            "agents:\n"
+            "  gpt: {backend: api, adapter: openai, model: offline}\n"
+            "roles:\n"
+            "  planner: gpt\n",
+            encoding="utf-8",
+        )
+        assert runner.invoke(app, ["room", "create", "Design"]).exit_code == 0
+        assert self._ask_planner().exit_code == 0
+        reply = self._planner_reply(db)
+        conn, store = _open_store(db)
+        try:
+            baseline = store.counts()
+        finally:
+            conn.close()
+        result = runner.invoke(
+            app, ["room", "freeze", "Design", "--by", "utku", "--from-message", reply.id]
+        )
+        assert result.exit_code == 1
+        assert "implementer" in result.output
+        conn, store = _open_store(db)
+        try:
+            assert store.counts() == baseline
+        finally:
+            conn.close()
+
+    def test_graph_refuses_when_the_chain_is_discontinuous(self, workspace, db):
+        runner.invoke(app, ["init"])
+        self._configure(workspace)
+        assert runner.invoke(app, ["room", "create", "Design"]).exit_code == 0
+        assert self._ask_planner().exit_code == 0
+        reply = self._planner_reply(db)
+        frozen = runner.invoke(
+            app, ["room", "freeze", "Design", "--by", "utku", "--from-message", reply.id]
+        )
+        assert frozen.exit_code == 0, frozen.output
+        conn, store = _open_store(db)
+        try:
+            task = next(iter(store.all_models(Task)))
+            store.save_model(
+                Artifact(
+                    kind=ArtifactKind.PLAN,
+                    room_id=task.room_id,
+                    task_id=task.id,
+                    content="# Orphan plan",
+                )
+            )
+        finally:
+            conn.close()
+        result = runner.invoke(app, ["room", "graph", "Design"])
+        assert result.exit_code == 1
+        assert "outside the chain" in result.output

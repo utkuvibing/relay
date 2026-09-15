@@ -174,6 +174,9 @@ EscalationReason = Literal[
     "delivery_failed",
     "delivery_pending",
     "turn_budget_exhausted",
+    #: P7.3: a Room-bound task's micro-exchange hit the Room's OPEN fence
+    #: (P7.1 traffic fence) — the task parks until the human resumes the Room.
+    "room_closed",
 ]
 
 
@@ -234,6 +237,15 @@ def _loads_strict(text: str) -> object:
         raise SignalContractError("malformed") from exc
     _json_depth(value)
     return value
+
+
+def parse_strict_json(text: str) -> object:
+    """Strict JSON decode for canonical reply contracts (P7.3).
+
+    Duplicate keys, non-finite constants and over-deep documents are refused;
+    malformed input raises :class:`SignalContractError`.
+    """
+    return _loads_strict(text)
 
 
 def parse_stage_signal(text: str) -> StageSignalPayload | None:
@@ -522,6 +534,11 @@ def compose_signal_message(
     return Message(
         sender=run.agent,
         run_id=run.id,
+        #: P7.3 (App. D.3): a Room-bound task's micro-exchange is Room state —
+        #: the Room scope makes the signal/reply visible in the canonical Room
+        #: feed and routes it through the Room's OPEN fence. Standalone builds
+        #: stay ``room_id=None`` (byte-identical).
+        room_id=task.room_id,
         task_id=task.id,
         recipient_role=signal.to_role,
         type=_KIND_MESSAGE_TYPE[signal.kind],
@@ -810,6 +827,10 @@ def _promote_planner_decision(
         proposed_by=message.sender,
         accepted_by=reply.sender if accepted else None,
         status=DecisionStatus.ACCEPTED if accepted else DecisionStatus.REJECTED,
+        #: P7.3 (App. D.3): a Room-bound task's promoted decision is Room state,
+        #: with durable promotion provenance. Standalone builds keep both unset.
+        room_id=task.room_id,
+        source_reply_id=reply.id,
         task_id=task.id,
     )
     exchange_refs = [
@@ -818,11 +839,14 @@ def _promote_planner_decision(
         f"message:{message.id}",
         f"message:{reply.id}",
     ]
+    if task.room_id is not None:
+        exchange_refs.insert(0, f"room:{task.room_id}")
     with store.transaction():
         store.save_model(decision)
         writer.record(
             EventLogEntry(
                 type=EventType.DECISION_PROPOSED,
+                room_id=task.room_id,
                 task_id=task.id,
                 sender=message.sender,
                 recipient=reply.sender,
@@ -835,6 +859,7 @@ def _promote_planner_decision(
                 type=(
                     EventType.DECISION_ACCEPTED if accepted else EventType.DECISION_REJECTED
                 ),
+                room_id=task.room_id,
                 task_id=task.id,
                 sender=reply.sender,
                 recipient=message.sender,
@@ -850,6 +875,7 @@ def _promote_planner_decision(
             plan_artifact = store.save_model(
                 Artifact(
                     kind=ArtifactKind.PLAN,
+                    room_id=task.room_id,
                     task_id=task.id,
                     run_id=reply.run_id,
                     content=payload.revised_plan,
@@ -858,6 +884,7 @@ def _promote_planner_decision(
             revision = store.save_model(
                 Artifact(
                     kind=ArtifactKind.REPORT,
+                    room_id=task.room_id,
                     task_id=task.id,
                     run_id=reply.run_id,
                     content=canonical_json(
@@ -887,13 +914,56 @@ def _promote_planner_decision(
                 writer.record(
                     EventLogEntry(
                         type=EventType.ARTIFACT_CREATED,
+                        room_id=task.room_id,
                         task_id=task.id,
                         sender=SIGNAL_SENDER,
                         content=f"plan revision minted via {message.type.value}",
                         references=[f"task:{task.id}", f"artifact:{artifact.id}"],
                     )
                 )
+            if task.room_id is not None:
+                #: P7.3: a Room-bound task's revised plan becomes the Room's
+                #: canonical tip — the feed's entry marker for the new plan.
+                #: The human-freeze marker (ROOM_PLAN_FROZEN) is never reused.
+                writer.record(
+                    EventLogEntry(
+                        type=EventType.ROOM_PLAN_REVISED,
+                        room_id=task.room_id,
+                        task_id=task.id,
+                        sender=SIGNAL_SENDER,
+                        content=(
+                            "plan revised by decision "
+                            f"{decision.id}: {_first_line(payload.revised_plan)}"
+                        ),
+                        references=[
+                            f"room:{task.room_id}",
+                            f"task:{task.id}",
+                            f"plan:{plan_artifact.id}",
+                            f"supersedes_plan:{current_plan_artifact_id}",
+                            f"decision:{decision.id}",
+                            f"message:{message.id}",
+                            f"message:{reply.id}",
+                        ],
+                    )
+                )
     return decision
+
+
+def _first_line(content: str, limit: int = 200) -> str:
+    """The plan's first non-empty line, bounded — feed display text."""
+    for line in content.splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        if stripped:
+            return stripped[:limit]
+    return "(empty plan)"
+
+
+def _room_closed_detail(task: Task, exc: Exception) -> str:
+    """Human-actionable detail for a Room-fence refusal (P7.3)."""
+    return (
+        f"Room traffic for task '{task.id}' is fenced: {exc} — resume the Room "
+        "(relay room resume <room>) and run 'relay continue' again"
+    )
 
 
 async def resolve_open_signal(
@@ -918,6 +988,7 @@ async def resolve_open_signal(
         DeliveryPendingRefusal,
         DeliveryRefusal,
     )
+    from relay.core.rooms import ClosedRoomError
 
     current_plan_artifact_id = (
         signal_context.plan_artifact_id if signal_context is not None else None
@@ -964,6 +1035,11 @@ async def resolve_open_signal(
         )
         try:
             return services.bus.send(message)
+        except ClosedRoomError as exc:
+            # P7.3: the Room's OPEN fence refused the traffic. ``bus.send``
+            # validates and fences inside its own transaction, so nothing was
+            # persisted — park with a durable, human-actionable escalation.
+            return escalate("room_closed", _room_closed_detail(task, exc))
         except BlockingBudgetExhausted as exc:
             return escalate("budget_exhausted", str(exc))
         except TurnBudgetExhausted as exc:
@@ -1036,6 +1112,12 @@ async def resolve_open_signal(
             )
         except DeliveryPendingRefusal as exc:
             return escalate("delivery_pending", str(exc), message_id=message.id)
+        except ClosedRoomError as exc:
+            # P7.3: the delivery Tx1 fence refused the staged run — no Run, no
+            # artifacts, no MESSAGE_DELIVERED marker survive the rollback.
+            return escalate(
+                "room_closed", _room_closed_detail(task, exc), message_id=message.id
+            )
         except BlockingBudgetExhausted as exc:
             return escalate("budget_exhausted", str(exc), message_id=message.id)
         except TurnBudgetExhausted as exc:

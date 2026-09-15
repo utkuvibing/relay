@@ -249,3 +249,126 @@ class TestFeedIsPure:
 
     def test_empty_room_yields_empty_feed(self, store):
         assert build_room_feed(store, "missing-room") == []
+
+
+class TestCanonicalRecordProjection:
+    """P7.3 (App. D.3): canonical Room records render at their marker sequence."""
+
+    def _freeze(self, tmp_path, db, store):
+        from tests.room_helpers import (
+            freeze,
+            room_config,
+            room_store,
+        )
+
+        fixture = room_store(tmp_path)
+        outcome = freeze(fixture, room_config(), workspace_root=tmp_path)
+        return fixture, outcome
+
+    def test_frozen_plan_renders_once_at_its_marker(self, tmp_path):
+        fixture, outcome = self._freeze(tmp_path, None, None)
+        feed = build_room_feed(fixture.store, fixture.room.id)
+        records = [entry for entry in feed if entry.origin == "record"]
+        assert [entry.kind for entry in records] == ["plan_frozen"]
+        entry = records[0]
+        assert entry.text == "plan frozen: Plan"
+        assert f"plan:{outcome.plan_artifact.id}" in entry.references
+        assert entry.entry_id == f"record:{entry.sequence}"
+        assert build_room_feed(fixture.store, fixture.room.id) == feed
+
+    def test_decision_entries_keep_their_historical_state(self, tmp_path):
+        from relay.agents.base import AgentRole
+        from relay.core.room_records import promote_room_decision
+        from relay.core.rooms import RoomSeatResolver
+        from relay.storage.models import RoomDecisionPayload
+
+        fixture, _outcome = self._freeze(tmp_path, None, None)
+        store, writer, room = fixture.store, fixture.writer, fixture.room
+        bus = ConversationBus(store, writer, RoomSeatResolver(room))
+
+        def promote(payload: RoomDecisionPayload):
+            parent = bus.send(
+                Message(
+                    sender="human:utku",
+                    recipient_role=AgentRole.PLANNER.value,
+                    room_id=room.id,
+                    type=MessageType.PROPOSAL,
+                    content="decide",
+                )
+            )
+            run = store.save_model(
+                Run(agent="gpt", role=AgentRole.PLANNER.value, status="succeeded")
+            )
+            reply = bus.send(
+                Message(
+                    sender="gpt",
+                    recipient=parent.sender,
+                    reply_to_id=parent.id,
+                    run_id=run.id,
+                    room_id=room.id,
+                    type=MessageType.FINAL_POSITION,
+                    content=payload.model_dump_json(),
+                )
+            )
+            return promote_room_decision(store, writer, room, parent, reply)
+
+        first = promote(
+            RoomDecisionPayload(
+                schema_version="relay.room_decision.v1", outcome="accept", statement="design A"
+            )
+        )
+        assert first is not None
+        second = promote(
+            RoomDecisionPayload(
+                schema_version="relay.room_decision.v1",
+                outcome="accept",
+                statement="design B",
+                supersedes_decision_id=first.id,
+            )
+        )
+        assert second is not None
+
+        feed = build_room_feed(store, room.id)
+        records = [entry for entry in feed if entry.origin == "record"]
+        kinds = [entry.kind for entry in records]
+        assert kinds == ["plan_frozen", "decision_accepted", "decision_accepted", "decision_superseded"]
+        # The earlier acceptance keeps rendering its own state even though the
+        # row is now SUPERSEDED.
+        assert records[1].text == "accepted: design A"
+        assert records[2].text == "accepted: design B"
+        assert records[3].text == f"superseded by {second.id}"
+
+    def test_orphan_room_plan_without_marker_fails_closed(self, tmp_path):
+        from relay.storage.models import Artifact, ArtifactKind
+
+        fixture, outcome = self._freeze(tmp_path, None, None)
+        fixture.store.save_model(
+            Artifact(
+                kind=ArtifactKind.PLAN,
+                room_id=fixture.room.id,
+                task_id=outcome.task.id,
+                content="# Orphan",
+            )
+        )
+        with pytest.raises(RoomFeedIntegrityError, match="no ROOM_PLAN_FROZEN"):
+            build_room_feed(fixture.store, fixture.room.id)
+
+    def test_marker_without_decision_record_fails_closed(self, tmp_path):
+        fixture, _outcome = self._freeze(tmp_path, None, None)
+        fixture.writer.record(
+            EventLogEntry(
+                type=EventType.DECISION_ACCEPTED,
+                room_id=fixture.room.id,
+                sender="claude",
+                content="forged",
+                references=[f"room:{fixture.room.id}", "decision:ghost"],
+            )
+        )
+        with pytest.raises(RoomFeedIntegrityError, match="foreign decision"):
+            build_room_feed(fixture.store, fixture.room.id)
+
+    def test_record_free_rooms_render_unchanged(self, store, bus):
+        bus.send(_msg())
+        feed = build_room_feed(store, "room-1")
+        assert [entry.origin for entry in feed] == ["message"]
+        assert all(entry.origin != "record" for entry in feed)

@@ -10,7 +10,8 @@ datetimes as ISO-8601 strings.
 Immutability policy: ``event_log``, ``evidence_records`` and (P4.1)
 ``messages`` reject UPDATE/DELETE twice — here in Python (defense-in-depth,
 mirroring ``relay.core.state_machine``'s client-side filter) and at the
-database level via triggers installed by :mod:`relay.storage.db`. Rows
+database level via triggers installed by :mod:`relay.storage.db`. P5.3
+``protocol_executions`` and P7.3 ``findings`` join the same family. Rows
 elsewhere (state-bearing records such as Run, Task, Approval) mutate
 legitimately.
 """
@@ -37,6 +38,7 @@ from relay.storage.models import (
     Decision,
     EventLogEntry,
     EvidenceRecord,
+    Finding,
     Message,
     ProtocolExecution,
     Room,
@@ -67,13 +69,16 @@ MODEL_TABLES: dict[type[pydantic.BaseModel], str] = {
     ProtocolExecution: "protocol_executions",
     Artifact: "artifacts",
     Decision: "decisions",
+    Finding: "findings",
     Approval: "approvals",
     ToolRun: "tool_runs",
     EvidenceRecord: "evidence_records",
     EventLogEntry: "event_log",
 }
 
-_APPEND_ONLY_TABLES = frozenset({"event_log", "evidence_records", "messages", "protocol_executions"})
+_APPEND_ONLY_TABLES = frozenset(
+    {"event_log", "evidence_records", "messages", "protocol_executions", "findings"}
+)
 
 _PRIMITIVES = (str, int, float, bool)
 
