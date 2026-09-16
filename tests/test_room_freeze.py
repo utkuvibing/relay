@@ -406,6 +406,121 @@ class TestFreezeTransactionRechecks:
         finally:
             conn2.close()
 
+    def test_implementer_rebind_between_check_and_lock_refuses(
+        self, fixture, tmp_path, monkeypatch
+    ):
+        """A seat rebind serialized before the write lock must not be adopted:
+        the grant/model preflight ran against the ORIGINAL implementer — even
+        when the new seat is itself a valid harness implementer."""
+        from relay.context.config import AgentConfig, BackendType, HarnessAgentConfig
+        from relay.core.rooms import RoomLifecycle
+
+        _parent, reply, _run = planner_exchange(fixture)
+        # 'impl2' is a VALID harness implementer — the refusal must come from
+        # the seat-change guard, not a backend/grant failure.
+        config = room_config(
+            extra_agents={
+                "impl2": AgentConfig(
+                    backend=BackendType.HARNESS,
+                    adapter="claude_code",
+                    model="offline",
+                    harness=HarnessAgentConfig(
+                        grant=ExecutionGrantKind.WORKSPACE_WRITE,
+                        executable_path="python",
+                        timeout_seconds=30,
+                    ),
+                )
+            }
+        )
+        conn2, store2 = self._second_store(fixture)
+        try:
+            real_transaction = store2.transaction
+
+            def interleaved():
+                # 'relay room bind' lands after this caller's pre-checks but
+                # before its write lock — the locked pass must see it.
+                RoomLifecycle(fixture.store, fixture.writer).bind(
+                    fixture.store.load_model(Room, fixture.room.id),
+                    AgentRole.IMPLEMENTER.value,
+                    "impl2",
+                    {"gpt", "impl", "impl2", "other"},
+                )
+                return real_transaction()
+
+            monkeypatch.setattr(store2, "transaction", interleaved)
+            from relay.storage.events import EventLogWriter
+
+            baseline = fixture.store.counts()
+            with pytest.raises(RoomRecordRefusal) as excinfo:
+                freeze_room_plan(
+                    store2,
+                    EventLogWriter(conn2),
+                    SqliteEvidenceStore(store2),
+                    config,
+                    fixture.room,
+                    source_message_id=reply.id,
+                    frozen_by="human:utku",
+                    workspace_root=tmp_path,
+                )
+            assert excinfo.value.code == "implementer_seat_changed"
+            after = fixture.store.counts()
+            # Zero canonical freeze delta — the rebind's own event is the only
+            # new row in the ledger.
+            assert after["tasks"] == baseline["tasks"]
+            assert after["artifacts"] == baseline["artifacts"]
+            assert after["event_log"] == baseline["event_log"] + 1
+            persisted = fixture.store.load_model(Room, fixture.room.id)
+            assert persisted is not None
+            seats = {member.role: member.agent for member in persisted.members}
+            # The concurrent rebind survives — no stale writeback restores it.
+            assert seats[AgentRole.IMPLEMENTER.value] == "impl2"
+            assert persisted.active_task_id is None
+        finally:
+            conn2.close()
+
+    def test_unrelated_seat_rebind_survives_a_successful_freeze(
+        self, fixture, tmp_path, monkeypatch
+    ):
+        """An unrelated seat (planner) rebound before the write lock must be
+        preserved by the freeze's own ``active_task_id`` update."""
+        from relay.core.rooms import RoomLifecycle
+
+        _parent, reply, _run = planner_exchange(fixture)
+        conn2, store2 = self._second_store(fixture)
+        try:
+            real_transaction = store2.transaction
+
+            def interleaved():
+                RoomLifecycle(fixture.store, fixture.writer).bind(
+                    fixture.store.load_model(Room, fixture.room.id),
+                    AgentRole.PLANNER.value,
+                    "other",
+                    {"gpt", "impl", "other"},
+                )
+                return real_transaction()
+
+            monkeypatch.setattr(store2, "transaction", interleaved)
+            from relay.storage.events import EventLogWriter
+
+            outcome = freeze_room_plan(
+                store2,
+                EventLogWriter(conn2),
+                SqliteEvidenceStore(store2),
+                room_config(),
+                fixture.room,
+                source_message_id=reply.id,
+                frozen_by="human:utku",
+                workspace_root=tmp_path,
+            )
+            persisted = fixture.store.load_model(Room, fixture.room.id)
+            assert persisted is not None
+            seats = {member.role: member.agent for member in persisted.members}
+            assert seats[AgentRole.PLANNER.value] == "other"
+            assert seats[AgentRole.IMPLEMENTER.value] == "impl"
+            assert persisted.active_task_id == outcome.task.id
+        finally:
+            conn2.close()
+
 
 def _room_without_implementer(fixture: RoomFixture, seats: dict[str, str] | None = None):
     """A second Room in the same workspace with the given seats."""

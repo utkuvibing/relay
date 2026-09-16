@@ -261,11 +261,16 @@ def freeze_room_plan(
 ) -> RoomFreezeOutcome:
     """Freeze one planner-authored plan into canonical Room state (App. D.3).
 
-    Every refusal happens BEFORE the single write transaction: a refused freeze
-    leaves the store byte-identical. ``implementer_model`` is the RESOLVED
-    implementer model (``resolve_settings`` output) — the caller supplies it so
-    ``relay continue``'s pinned-model check matches exactly; core cannot import
-    the agents package (App. C.1 import direction).
+    Refusals are fail-closed at BOTH boundaries: the pre-transaction pass
+    gives a fast typed refusal with a zero store delta, and the
+    ``BEGIN IMMEDIATE`` write lock re-derives the canonical assumptions —
+    freeze source, canonical tip, quiescent dispatch, and the implementer
+    seat — so a serialized competitor can never produce two canonical
+    successors, a duplicate freeze, or a stale-seat writeback.
+    ``implementer_model`` is the RESOLVED implementer model
+    (``resolve_settings`` output) — the caller supplies it so ``relay
+    continue``'s pinned-model check matches exactly; core cannot import the
+    agents package (App. C.1 import direction).
     """
 
     root = Path(workspace_root)
@@ -296,8 +301,24 @@ def freeze_room_plan(
 
     with store.transaction():
         # The OPEN fence is re-checked inside the write transaction: a
-        # concurrent close serializes wholly before or wholly after the freeze.
-        require_open_room(store, room.id)
+        # concurrent close serializes wholly before or wholly after the
+        # freeze. The LOCKED row is authoritative from here on — the caller's
+        # snapshot may predate a concurrent 'relay room bind', and writing it
+        # back would silently restore the old seat map.
+        locked_room = require_open_room(store, room.id)
+        # A rebind that serialized before this lock must not be adopted: the
+        # effective-grant/model preflight ran against the pre-transaction
+        # implementer, so a changed seat refuses rather than binding execution
+        # to an un-preflighted agent.
+        locked_implementer, _locked_model = _resolve_implementer(config, locked_room)
+        _require(
+            locked_implementer == implementer,
+            "implementer_seat_changed",
+            f"@{AgentRole.IMPLEMENTER.value} was rebound from '{implementer}' to "
+            f"'{locked_implementer}' before the freeze took its write lock — "
+            "re-run 'relay room freeze'",
+        )
+        room = locked_room
         # Second fail-closed pass under the write lock (P7.3): assumptions
         # validated pre-transaction may have been invalidated by a serialized
         # competitor — the freeze source, the canonical tip and the quiescent
