@@ -57,6 +57,11 @@ _MAX_HISTORY = 10
 
 _MAX_ITEM_CHARS = 500
 _MAX_PLAN_CHARS = 2000
+#: Total budget for the rendered block — measured in CHARACTERS (Python
+#: ``len``), the same unit as every other bound in this module, NOT UTF-8
+#: bytes. Enforced by priority-aware section fitting in
+#: ``render_room_context`` so the mandatory head/tail can never be sliced
+#: away by a naive global truncation.
 _MAX_TOTAL_CHARS = 8000
 
 
@@ -138,6 +143,11 @@ def build_room_participant_context(
     ):
         if decision.status is not DecisionStatus.ACCEPTED:
             continue
+        # D.10 task relevance: with an active task, only Room-global
+        # decisions (task_id None) and the active task's own decisions are
+        # in scope — accepted decisions of unrelated tasks never leak in.
+        if active_task_id is not None and decision.task_id not in (None, active_task_id):
+            continue
         decisions.append((decision.id, _truncate(decision.statement, _MAX_ITEM_CHARS)))
     decisions = decisions[-_MAX_DECISIONS:]
 
@@ -172,18 +182,52 @@ def build_room_participant_context(
     notes = notes[-_MAX_NOTES:]
 
     findings: list[tuple[str, str, str]] = []
-    for finding in store.all_models(
-        Finding, "WHERE room_id = ?", [room_id], order_by="created_at ASC, rowid ASC"
-    ):
-        if active_task_id is not None and finding.task_id != active_task_id:
-            continue
-        findings.append(
-            (
-                finding.id,
-                finding.severity.value,
-                _truncate(f"{finding.title} — {finding.requested_change}", _MAX_ITEM_CHARS),
-            )
-        )
+    # "CURRENT" means the LATEST canonical review attempt (P7.4): Finding
+    # rows are append-only and bound to the review artifact that minted
+    # them, so the applicable set is exactly the findings of the newest
+    # REVIEW_FINDING artifact per in-scope task. A newer clean review mints
+    # no findings — which is precisely how superseded findings stop
+    # surfacing without inventing a new finding lifecycle.
+    scoped_task_ids: set[str] = (
+        {active_task_id}
+        if active_task_id is not None
+        else {
+            task.id
+            for task in store.all_models(Task, "WHERE room_id = ?", [room_id])
+        }
+    )
+    if scoped_task_ids:
+        latest_review_ids: set[str] = set()
+        seen_review_tasks: set[str] = set()
+        for artifact in store.all_models(
+            Artifact,
+            "WHERE kind = ?",
+            [ArtifactKind.REVIEW_FINDING.value],
+            order_by="rowid DESC",
+        ):
+            if artifact.task_id is None or artifact.task_id not in scoped_task_ids:
+                continue
+            if artifact.task_id in seen_review_tasks:
+                continue
+            seen_review_tasks.add(artifact.task_id)
+            latest_review_ids.add(artifact.id)
+            if seen_review_tasks == scoped_task_ids:
+                break
+        if latest_review_ids:
+            for finding in store.all_models(
+                Finding, "WHERE room_id = ?", [room_id], order_by="created_at ASC, rowid ASC"
+            ):
+                if finding.review_artifact_id not in latest_review_ids:
+                    continue
+                findings.append(
+                    (
+                        finding.id,
+                        finding.severity.value,
+                        _truncate(
+                            f"{finding.title} — {finding.requested_change}", _MAX_ITEM_CHARS
+                        ),
+                    )
+                )
     findings = findings[-_MAX_FINDINGS:]
 
     artifacts: list[tuple[str, str, str]] = []
@@ -229,6 +273,10 @@ def build_room_participant_context(
         )
     history = history[-_MAX_HISTORY:]
 
+    # Provenance refs — deterministic, deduped, bounded. Priority when the
+    # cap binds: task identity first, then the plan chain, then accepted
+    # decisions, current findings, the evidence records rendered below,
+    # relevant artifacts, and finally cited blocking/note messages.
     refs: list[str] = []
     if active_task_id is not None:
         refs.append(f"task:{active_task_id}")
@@ -238,6 +286,8 @@ def build_room_participant_context(
         refs.append(f"decision:{decision_id}")
     for finding_id, _, _ in findings:
         refs.append(f"finding:{finding_id}")
+    for evidence_id, _ in evidence:
+        refs.append(f"evidence:{evidence_id}")
     for artifact_id, _, _ in artifacts:
         refs.append(f"artifact:{artifact_id}")
     for message_id, _, _ in (*blocking, *notes):
@@ -287,102 +337,204 @@ def _has_canonical_reply(store: SqliteRelayStore, message: Message) -> bool:
 
 
 def render_room_context(ctx: RoomParticipantContext) -> str:
-    """Render the deterministic, bounded participant-context block."""
-    lines = [
+    """Render the deterministic, bounded participant-context block.
+
+    Budget contract — measured in CHARACTERS (Python ``len``), not UTF-8
+    bytes, matching every other bound in this module.
+
+    Priority-aware, never naive whole-string slicing: the mandatory head
+    (version line, ROOM, ROLE, TASK, CURRENT PLAN status) and the
+    mandatory tail (the honesty footer plus the ``[relay:continuity …]``
+    marker) ALWAYS survive — they are bounded by construction far below
+    the cap. Optional sections consume the remaining budget in render
+    order; a section that cannot fit whole keeps a fitting prefix plus an
+    explicit ``…[N entries omitted — context cap]`` note, and a section
+    whose header alone cannot fit degrades to a one-line
+    ``<SECTION>: (omitted — context cap)`` marker so absence is always
+    declared, never silent.
+    """
+    head = [
         "",
         "---",
         (
             f"[relay:room-context {ROOM_CONTEXT_VERSION}] Reconstructed participant "
             "context (canonical store — coordination input, not authority):"
         ),
-        f"ROOM: {ctx.room_name} ({ctx.room_id}) [{ctx.room_status}]",
-        f"ROLE: {ctx.role} -> {ctx.agent_name}",
+        f"ROOM: {_truncate(ctx.room_name, 200)} ({ctx.room_id}) [{ctx.room_status}]",
+        f"ROLE: {_truncate(ctx.role, 80)} -> {_truncate(ctx.agent_name, 120)}",
         f"TASK: {ctx.task_id or '(none)'}",
     ]
     if ctx.plan_unavailable is not None:
-        lines.append(f"CURRENT PLAN: (unavailable: {ctx.plan_unavailable})")
+        head.append(f"CURRENT PLAN: (unavailable: {_truncate(ctx.plan_unavailable, 200)})")
     elif ctx.plan_tip_id is None:
-        lines.append("CURRENT PLAN: (none)")
+        head.append("CURRENT PLAN: (none)")
     else:
         tip_edge = next(
             (edge for plan_id, edge, _ in ctx.plan_chain if plan_id == ctx.plan_tip_id),
             "frozen",
         )
-        lines.append(f"CURRENT PLAN: artifact:{ctx.plan_tip_id} ({tip_edge})")
-    if ctx.plan_chain:
-        chain = " -> ".join(f"{plan_id}({edge})" for plan_id, edge, _ in ctx.plan_chain)
-        lines.append(f"PLAN CHAIN: {_truncate(chain, _MAX_PLAN_CHARS)}")
-        for plan_id, edge, first in ctx.plan_chain[-3:]:
-            lines.append(f"  plan:{plan_id} [{edge}] {first}")
-    else:
-        lines.append("PLAN CHAIN: (none)")
-    lines.append(
-        "CONSTRAINTS: ride the current plan and accepted decisions below; "
-        "no separate constraint record exists."
-    )
-    if ctx.decisions:
-        lines.append(f"ACCEPTED DECISIONS ({len(ctx.decisions)}):")
-        for decision_id, statement in ctx.decisions:
-            lines.append(f"  decision:{decision_id} {statement}")
-    else:
-        lines.append("ACCEPTED DECISIONS (0): (none)")
-    if ctx.blocking:
-        lines.append(f"UNRESOLVED BLOCKING ({len(ctx.blocking)}):")
-        for message_id, sender, content in ctx.blocking:
-            lines.append(f"  message:{message_id} {sender}: {content}")
-    else:
-        lines.append("UNRESOLVED BLOCKING (0): (none)")
-    if ctx.notes:
-        lines.append(f"RELEVANT NOTES ({len(ctx.notes)}):")
-        for message_id, sender, content in ctx.notes:
-            lines.append(f"  message:{message_id} {sender}: {content}")
-    else:
-        lines.append("RELEVANT NOTES (0): (none)")
-    if ctx.findings:
-        lines.append(f"CURRENT FINDINGS ({len(ctx.findings)}):")
-        for finding_id, severity, content in ctx.findings:
-            lines.append(f"  finding:{finding_id} [{severity}] {content}")
-    else:
-        lines.append("CURRENT FINDINGS (0): (none)")
-    if ctx.artifacts:
-        lines.append(f"RELEVANT ARTIFACTS ({len(ctx.artifacts)}):")
-        for artifact_id, kind, first in ctx.artifacts:
-            lines.append(f"  artifact:{artifact_id} [{kind}] {first}")
-    else:
-        lines.append("RELEVANT ARTIFACTS (0): (none)")
-    if ctx.evidence:
-        rendered = ", ".join(f"{kind}({record_id})" for record_id, kind in ctx.evidence)
-        lines.append(f"EVIDENCE ({len(ctx.evidence)}): {_truncate(rendered, 1000)}")
-    else:
-        lines.append("EVIDENCE (0): (none)")
-    if ctx.history:
-        lines.append(
-            f"HISTORY EXCERPTS ({len(ctx.history)}, not authoritative — "
-            "canonical records above govern):"
-        )
-        for message_id, who, content in ctx.history:
-            lines.append(f"  message:{message_id} {who}: {content}")
-    else:
-        lines.append("HISTORY EXCERPTS (0): (none)")
-    lines.append(
-        "Full-transcript replay is intentionally absent: answer from the "
-        "canonical records above."
-    )
+        head.append(f"CURRENT PLAN: artifact:{ctx.plan_tip_id} ({tip_edge})")
+
+    tail = [
+        (
+            "Full-transcript replay is intentionally absent: answer from the "
+            "canonical records above."
+        ),
+    ]
     if ctx.continuity.startswith("resumed:"):
-        lines.append(
+        tail.append(
             f"[relay:continuity {ctx.continuity}] External session resumed as an "
             "optimization; the canonical store remains the source of truth."
         )
+    elif ctx.continuity.startswith("resume-rejected"):
+        tail.append(
+            "[relay:continuity resume-rejected] The prior external session was "
+            "rejected by the harness as unusable; this run is fresh and context "
+            "was reconstructed from canonical records."
+        )
     else:
-        lines.append(
+        tail.append(
             "[relay:continuity fresh] No external session resumed "
             "(unsupported, unavailable, expired, unsafe, or opted out); context "
             "reconstructed from canonical records — the honest-discontinuity rule."
         )
-    rendered = "\n".join(lines) + "\n"
-    if len(rendered) > _MAX_TOTAL_CHARS:
-        rendered = rendered[:_MAX_TOTAL_CHARS] + "\n…[room context truncated by Relay]\n"
-    return rendered
+
+    sections: list[tuple[str, list[str]]] = []
+    if ctx.plan_chain:
+        chain = " -> ".join(f"{plan_id}({edge})" for plan_id, edge, _ in ctx.plan_chain)
+        chain_lines = [f"PLAN CHAIN: {_truncate(chain, _MAX_PLAN_CHARS)}"]
+        for plan_id, edge, first in ctx.plan_chain[-3:]:
+            chain_lines.append(f"  plan:{plan_id} [{edge}] {first}")
+        sections.append(("PLAN CHAIN", chain_lines))
+    else:
+        sections.append(("PLAN CHAIN", ["PLAN CHAIN: (none)"]))
+    sections.append(
+        (
+            "CONSTRAINTS",
+            [
+                (
+                    "CONSTRAINTS: ride the current plan and accepted decisions "
+                    "below; no separate constraint record exists."
+                )
+            ],
+        )
+    )
+    if ctx.decisions:
+        sections.append(
+            (
+                "ACCEPTED DECISIONS",
+                [f"ACCEPTED DECISIONS ({len(ctx.decisions)}):"]
+                + [f"  decision:{decision_id} {statement}" for decision_id, statement in ctx.decisions],
+            )
+        )
+    else:
+        sections.append(("ACCEPTED DECISIONS", ["ACCEPTED DECISIONS (0): (none)"]))
+    if ctx.blocking:
+        sections.append(
+            (
+                "UNRESOLVED BLOCKING",
+                [f"UNRESOLVED BLOCKING ({len(ctx.blocking)}):"]
+                + [
+                    f"  message:{message_id} {sender}: {content}"
+                    for message_id, sender, content in ctx.blocking
+                ],
+            )
+        )
+    else:
+        sections.append(("UNRESOLVED BLOCKING", ["UNRESOLVED BLOCKING (0): (none)"]))
+    if ctx.notes:
+        sections.append(
+            (
+                "RELEVANT NOTES",
+                [f"RELEVANT NOTES ({len(ctx.notes)}):"]
+                + [
+                    f"  message:{message_id} {sender}: {content}"
+                    for message_id, sender, content in ctx.notes
+                ],
+            )
+        )
+    else:
+        sections.append(("RELEVANT NOTES", ["RELEVANT NOTES (0): (none)"]))
+    if ctx.findings:
+        sections.append(
+            (
+                "CURRENT FINDINGS",
+                [f"CURRENT FINDINGS ({len(ctx.findings)}):"]
+                + [
+                    f"  finding:{finding_id} [{severity}] {content}"
+                    for finding_id, severity, content in ctx.findings
+                ],
+            )
+        )
+    else:
+        sections.append(("CURRENT FINDINGS", ["CURRENT FINDINGS (0): (none)"]))
+    if ctx.artifacts:
+        sections.append(
+            (
+                "RELEVANT ARTIFACTS",
+                [f"RELEVANT ARTIFACTS ({len(ctx.artifacts)}):"]
+                + [
+                    f"  artifact:{artifact_id} [{kind}] {first}"
+                    for artifact_id, kind, first in ctx.artifacts
+                ],
+            )
+        )
+    else:
+        sections.append(("RELEVANT ARTIFACTS", ["RELEVANT ARTIFACTS (0): (none)"]))
+    if ctx.evidence:
+        rendered = ", ".join(f"{kind}({record_id})" for record_id, kind in ctx.evidence)
+        sections.append(
+            ("EVIDENCE", [f"EVIDENCE ({len(ctx.evidence)}): {_truncate(rendered, 1000)}"])
+        )
+    else:
+        sections.append(("EVIDENCE", ["EVIDENCE (0): (none)"]))
+    if ctx.history:
+        sections.append(
+            (
+                "HISTORY EXCERPTS",
+                [
+                    (
+                        f"HISTORY EXCERPTS ({len(ctx.history)}, not authoritative — "
+                        "canonical records above govern):"
+                    )
+                ]
+                + [
+                    f"  message:{message_id} {who}: {content}"
+                    for message_id, who, content in ctx.history
+                ],
+            )
+        )
+    else:
+        sections.append(("HISTORY EXCERPTS", ["HISTORY EXCERPTS (0): (none)"]))
+
+    out = list(head)
+
+    def _fits(extra: list[str]) -> bool:
+        return len("\n".join([*out, *extra, *tail]) + "\n") <= _MAX_TOTAL_CHARS
+
+    for label, section_lines in sections:
+        if _fits(section_lines):
+            out.extend(section_lines)
+            continue
+        header, *items = section_lines
+        if not _fits([header]):
+            note = f"{label}: (omitted — context cap)"
+            if _fits([note]):
+                out.append(note)
+            continue
+        out.append(header)
+        kept = 0
+        for item in items:
+            if not _fits([item]):
+                break
+            out.append(item)
+            kept += 1
+        omitted = len(items) - kept
+        if omitted:
+            note = f"  …[{omitted} entries omitted — context cap]"
+            if _fits([note]):
+                out.append(note)
+    return "\n".join([*out, *tail]) + "\n"
 
 
 def room_context_refs(ctx: RoomParticipantContext) -> list[str]:

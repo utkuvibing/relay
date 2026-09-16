@@ -144,6 +144,11 @@ class AskOutcome:
     run: Run
     response: AgentResponse | None = None
     error: str | None = None
+    #: The typed cause when the failure crossed ``agent.run()`` as an
+    #: ``AgentError`` family member (P7.4: delivery uses this to positively
+    #: classify a session-continuation rejection without ever parsing error
+    #: text; ``None`` for successes and non-AgentError failures).
+    cause: AgentError | None = None
 
 
 def _persistable_error(exc: Exception) -> str:
@@ -255,7 +260,11 @@ async def run_ask(
                     references=[f"run:{run.id}"],
                 )
             )
-        return AskOutcome(run=failed, error=safe_error)
+        return AskOutcome(
+            run=failed,
+            error=safe_error,
+            cause=exc if isinstance(exc, AgentError) else None,
+        )
 
     usage = response.usage
     succeeded = run.model_copy(

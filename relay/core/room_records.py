@@ -129,11 +129,17 @@ def _require(condition: bool, code: str, message: str) -> None:
 
 
 def _delivered_by(store: SqliteRelayStore, parent: Message, run: Run) -> bool:
-    """True when a MESSAGE_DELIVERED marker binds ``parent`` to ``run``."""
+    """True when a delivery marker binds ``parent`` to ``run``.
+
+    Accepts ``MESSAGE_DELIVERED`` (initiation binding) and the P7.4
+    ``MESSAGE_DELIVERY_FALLBACK`` continuation marker — a reply authored by
+    the fresh fallback run carries ``run_id`` of that run, and the fallback
+    marker is its canonical causal binding to the parent message.
+    """
     for marker in store.all_models(
         EventLogEntry,
-        "WHERE type = ?",
-        [EventType.MESSAGE_DELIVERED.value],
+        "WHERE type IN (?, ?)",
+        [EventType.MESSAGE_DELIVERED.value, EventType.MESSAGE_DELIVERY_FALLBACK.value],
         order_by="sequence ASC",
     ):
         if f"message:{parent.id}" not in marker.references:

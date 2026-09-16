@@ -905,6 +905,15 @@ class EventType(str, enum.Enum):
     #: the delivery run's pre-provider Tx1; retained for failed runs (the
     #: outcome lives on the Run row + AGENT_RUN_FINISHED).
     MESSAGE_DELIVERED = "message_delivered"
+    #: P7.4: delivery CONTINUATION marker — a resumed delivery attempt failed
+    #: because the external session handle was unusable, and the same
+    #: initiation continued on a one-time fresh fallback Run. Binds
+    #: ``message:<id>`` to ``run:<fallback run>`` with ``prior_run:<failed
+    #: resume run>`` causality; committed atomically in the fallback run's
+    #: pre-provider Tx1. Deliberately a distinct type: at-most-once delivery
+    #: accounting, budgets, and stage recovery keep counting only
+    #: MESSAGE_DELIVERED initiations.
+    MESSAGE_DELIVERY_FALLBACK = "message_delivery_fallback"
     #: P6.3: build-dispatch BINDING marker — Relay bound a build-owned run
     #: to a build stage (plan/implement/fix/review). Committed atomically in
     #: the run's pre-provider Tx1 via ``pre_provider``; retained for failed
