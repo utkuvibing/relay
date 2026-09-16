@@ -28,7 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from relay.agents.base import AgentRequest, AgentRole
+from relay.agents.base import Agent, AgentRequest, AgentRole
+from relay.agents.errors import AgentError
 from relay.context.config import AgentConfig, RelayConfig
 from relay.core.build_ledger import ContinueRefusal, derive_position
 from relay.core.evidence import EvidenceStore
@@ -54,7 +55,11 @@ from relay.storage.events import EventLogWriter
 from relay.storage.models import Artifact, ArtifactKind, Room, Task, utcnow
 from relay.storage.store import SqliteRelayStore
 
-__all__ = ["RoomFreezeOutcome", "freeze_room_plan"]
+__all__ = [
+    "RoomFreezeOutcome",
+    "freeze_room_plan",
+    "require_implementer_write_grant",
+]
 
 #: Same implementation-capability contract as ``relay build`` (P3.1 blocker 4):
 #: a Room freeze may only bind an implementer that could actually implement.
@@ -119,12 +124,100 @@ def _resolve_implementer(config: RelayConfig, room: Room) -> tuple[str, str | No
     return agent_name, agent_config.model
 
 
+def require_implementer_write_grant(agent: Agent, agent_name: str) -> None:
+    """Effective-grant preflight for the freeze boundary (App. C.5).
+
+    ``relay room freeze`` binds execution: the Room's ``@implementer`` seat must
+    resolve to a grant that can actually write BEFORE any canonical freeze
+    record exists. Resolution is the adapter's own — profile grant, else the
+    adapter default — and the adapter's capability gate refuses a write grant
+    it cannot honor. Both checks are pure: no discovery, no spawn, no I/O.
+
+    Called at the CLI/application boundary on the CONSTRUCTED agent — core
+    cannot reach the adapter registry (App. C.1). A non-harness agent returns
+    early: ``_resolve_implementer`` already refuses it with a typed code.
+    """
+
+    from relay.harness.runtime import HarnessAgent
+
+    if not isinstance(agent, HarnessAgent):
+        return
+    try:
+        grant = agent.resolve_grant()
+        agent.check_grant_capabilities(grant)
+    except AgentError as exc:
+        raise RoomRecordRefusal("implementer_grant", str(exc)) from exc
+    _require(
+        grant.kind.value in _WRITE_GRANTS,
+        "implementer_grant",
+        f"agent '{agent_name}' cannot implement changes: the effective grant "
+        f"is '{grant.kind.value}' — configure at least 'workspace_write' on "
+        "the Room @implementer seat",
+    )
+
+
 def _freeze_task_title(source: FrozenPlanSource, title: str | None) -> str:
     if title is not None:
         clean = title.strip()
         _require(bool(clean), "empty_title", "the freeze title must not be blank")
         return clean[:200]
     return plan_first_line(source.reply.content)
+
+
+def _require_quiescent_tip(
+    store: SqliteRelayStore,
+    evidence: EvidenceStore,
+    room: Room,
+    task_id: str,
+    plan_artifact_id: str,
+) -> None:
+    """Fail-closed supersession point: canonical tip + quiescent dispatch.
+
+    Runs twice per superseding freeze — once pre-transaction for a fast typed
+    refusal, and again INSIDE the write lock so a concurrent freeze/continue
+    that moved the ledger between the checks is still refused.
+    """
+
+    try:
+        chain = resolve_room_plan_chain(store, room.id, task_id)
+    except RoomGraphIntegrityError as exc:
+        raise RoomRecordRefusal("ledger_inconsistent", str(exc)) from exc
+    _require(
+        chain.tip.id == plan_artifact_id,
+        "supersede_not_tip",
+        f"plan '{plan_artifact_id}' is not the canonical tip of task '{task_id}'",
+    )
+    try:
+        position = derive_position(store, evidence, task_id)
+    except ContinueRefusal as exc:
+        raise RoomRecordRefusal("ledger_refused", f"{exc.code}: {exc}") from exc
+    _require(
+        position.task.state is TaskState.IMPLEMENTING,
+        "not_quiescent",
+        f"task '{task_id}' is at state '{position.task.state.value}' — a superseding "
+        "freeze requires a quiescent IMPLEMENTING position",
+    )
+    in_flight = (
+        len(position.in_flight_runs)
+        + len(position.in_flight_delivery_runs)
+        + len(position.in_flight_tool_runs)
+    )
+    _require(
+        in_flight == 0,
+        "not_quiescent",
+        f"task '{task_id}' has {in_flight} in-flight run(s) — settle them first",
+    )
+    _require(
+        position.pending_signal is None,
+        "not_quiescent",
+        f"task '{task_id}' has an unresolved blocking signal — resolve it first",
+    )
+    _require(
+        position.next_action == "dispatch",
+        "not_quiescent",
+        f"task '{task_id}' next action is '{position.next_action}' — a superseding "
+        "freeze requires a fresh dispatch position",
+    )
 
 
 def _supersede_target(
@@ -148,46 +241,7 @@ def _supersede_target(
     task = store.load_model(Task, target.task_id)
     _require(task is not None, "supersede_unknown", "the plan's task does not exist")
     assert task is not None  # narrowed for type checkers
-    try:
-        chain = resolve_room_plan_chain(store, room.id, task.id)
-    except RoomGraphIntegrityError as exc:
-        raise RoomRecordRefusal("ledger_inconsistent", str(exc)) from exc
-    _require(
-        chain.tip.id == target.id,
-        "supersede_not_tip",
-        f"plan '{plan_artifact_id}' is not the canonical tip of task '{task.id}'",
-    )
-    try:
-        position = derive_position(store, evidence, task.id)
-    except ContinueRefusal as exc:
-        raise RoomRecordRefusal("ledger_refused", f"{exc.code}: {exc}") from exc
-    _require(
-        position.task.state is TaskState.IMPLEMENTING,
-        "not_quiescent",
-        f"task '{task.id}' is at state '{position.task.state.value}' — a superseding "
-        "freeze requires a quiescent IMPLEMENTING position",
-    )
-    in_flight = (
-        len(position.in_flight_runs)
-        + len(position.in_flight_delivery_runs)
-        + len(position.in_flight_tool_runs)
-    )
-    _require(
-        in_flight == 0,
-        "not_quiescent",
-        f"task '{task.id}' has {in_flight} in-flight run(s) — settle them first",
-    )
-    _require(
-        position.pending_signal is None,
-        "not_quiescent",
-        f"task '{task.id}' has an unresolved blocking signal — resolve it first",
-    )
-    _require(
-        position.next_action == "dispatch",
-        "not_quiescent",
-        f"task '{task.id}' next action is '{position.next_action}' — a superseding "
-        "freeze requires a fresh dispatch position",
-    )
+    _require_quiescent_tip(store, evidence, room, task.id, target.id)
     return target, task
 
 
@@ -244,6 +298,20 @@ def freeze_room_plan(
         # The OPEN fence is re-checked inside the write transaction: a
         # concurrent close serializes wholly before or wholly after the freeze.
         require_open_room(store, room.id)
+        # Second fail-closed pass under the write lock (P7.3): assumptions
+        # validated pre-transaction may have been invalidated by a serialized
+        # competitor — the freeze source, the canonical tip and the quiescent
+        # dispatch position are all re-derived here so a concurrent freeze can
+        # never produce two canonical successors or a duplicate freeze.
+        _require(
+            freeze_for_source(store, room.id, source_message_id) is None,
+            "already_frozen",
+            f"message '{source_message_id}' is already frozen in this Room",
+        )
+        if supersedes_plan_artifact_id is not None:
+            _require_quiescent_tip(
+                store, evidence, room, task.id, supersedes_plan_artifact_id
+            )
         if supersedes_plan_artifact_id is None:
             store.save_model(task)
         mint = mint_frozen_plan(

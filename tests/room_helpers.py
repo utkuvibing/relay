@@ -44,10 +44,14 @@ class RoomFixture:
     writer: EventLogWriter
     workspace: Workspace
     room: Room
+    #: The SQLite file backing ``store`` — a second connection simulates a
+    #: concurrent ``relay`` process sharing the canonical ledger.
+    db_path: Path
 
 
 def room_store(tmp_path: Path, *, seats: dict[str, str] | None = None) -> RoomFixture:
-    conn = connect(tmp_path / "rooms.db")
+    db_path = tmp_path / "rooms.db"
+    conn = connect(db_path)
     migrate(conn)
     store = SqliteRelayStore(conn)
     writer = EventLogWriter(conn)
@@ -62,7 +66,12 @@ def room_store(tmp_path: Path, *, seats: dict[str, str] | None = None) -> RoomFi
     )
     workspace = store.load_model(Workspace, workspace.id)
     return RoomFixture(
-        conn=conn, store=store, writer=writer, workspace=workspace, room=room
+        conn=conn,
+        store=store,
+        writer=writer,
+        workspace=workspace,
+        room=room,
+        db_path=db_path,
     )
 
 

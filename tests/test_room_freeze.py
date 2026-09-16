@@ -188,6 +188,225 @@ class TestFreezeImplementerContract:
         assert excinfo.value.code == "implementer_grant"
 
 
+class TestFreezeEffectiveGrantPreflight:
+    """P7.3: the EFFECTIVE implementer grant is validated through the real
+    adapter before any canonical freeze write — an unset grant deferring to a
+    read-only adapter default is refused, as is a write grant the adapter
+    cannot honor."""
+
+    def test_unset_grant_defaulting_to_read_only_refuses(self):
+        from relay.agents.claude_code import ClaudeCodeAgent
+        from relay.context.config import HarnessAgentConfig
+        from relay.core.room_freeze import require_implementer_write_grant
+
+        agent = ClaudeCodeAgent(profile=HarnessAgentConfig(grant=None))
+        with pytest.raises(RoomRecordRefusal) as excinfo:
+            require_implementer_write_grant(agent, "impl")
+        assert excinfo.value.code == "implementer_grant"
+        assert "workspace_write" in str(excinfo.value)
+
+    def test_explicit_read_only_grant_refuses_at_adapter_level(self):
+        from relay.agents.claude_code import ClaudeCodeAgent
+        from relay.context.config import HarnessAgentConfig
+        from relay.core.room_freeze import require_implementer_write_grant
+
+        agent = ClaudeCodeAgent(
+            profile=HarnessAgentConfig(grant=ExecutionGrantKind.READ_ONLY_ACCESS)
+        )
+        with pytest.raises(RoomRecordRefusal) as excinfo:
+            require_implementer_write_grant(agent, "impl")
+        assert excinfo.value.code == "implementer_grant"
+
+    def test_write_grant_on_a_non_write_capable_adapter_refuses(self):
+        from relay.context.config import HarnessAgentConfig
+        from relay.core.room_freeze import require_implementer_write_grant
+        from relay.harness.capabilities import HarnessCapability
+        from relay.harness.runtime import HarnessAgent
+
+        class _ReadOnlyOnly(HarnessAgent):
+            name = "read_only_only"
+            capabilities = frozenset({HarnessCapability.READ_ONLY_ACCESS})
+
+        agent = _ReadOnlyOnly(
+            profile=HarnessAgentConfig(grant=ExecutionGrantKind.WORKSPACE_WRITE)
+        )
+        with pytest.raises(RoomRecordRefusal) as excinfo:
+            require_implementer_write_grant(agent, "impl")
+        assert excinfo.value.code == "implementer_grant"
+
+    def test_workspace_write_on_a_capable_adapter_passes(self):
+        from relay.agents.claude_code import ClaudeCodeAgent
+        from relay.context.config import HarnessAgentConfig
+        from relay.core.room_freeze import require_implementer_write_grant
+
+        agent = ClaudeCodeAgent(
+            profile=HarnessAgentConfig(grant=ExecutionGrantKind.WORKSPACE_WRITE)
+        )
+        require_implementer_write_grant(agent, "impl")  # no refusal
+
+    def test_non_harness_agent_returns_early(self):
+        from relay.agents.openai import OpenAICompatibleAgent
+        from relay.core.room_freeze import require_implementer_write_grant
+
+        # API-backed seats are refused later by the backend check; the grant
+        # preflight only governs harness adapters.
+        require_implementer_write_grant(OpenAICompatibleAgent(), "other")
+
+
+class TestFreezeTransactionRechecks:
+    """P7.3: the freeze re-validates canonical assumptions INSIDE the write
+    lock, so a serialized competitor can never produce two canonical
+    successors or a duplicate freeze."""
+
+    def _second_store(self, fixture: RoomFixture):
+        """A second connection on the same ledger — the 'other process'."""
+        from relay.storage.db import connect
+
+        conn = connect(fixture.db_path)
+        return conn, SqliteRelayStore(conn)
+
+    def test_competing_freeze_between_check_and_lock_refuses(self, fixture, tmp_path, monkeypatch):
+        _parent, reply, _run = planner_exchange(fixture)
+        conn2, store2 = self._second_store(fixture)
+        try:
+            real_transaction = store2.transaction
+
+            def interleaved():
+                # The competitor's freeze lands after this caller's pre-checks
+                # but before its write lock — the in-transaction pass must see it.
+                freeze(fixture, room_config(), reply=reply, workspace_root=tmp_path)
+                return real_transaction()
+
+            monkeypatch.setattr(store2, "transaction", interleaved)
+            from relay.storage.events import EventLogWriter
+
+            with pytest.raises(RoomRecordRefusal) as excinfo:
+                freeze_room_plan(
+                    store2,
+                    EventLogWriter(conn2),
+                    SqliteEvidenceStore(store2),
+                    room_config(),
+                    fixture.room,
+                    source_message_id=reply.id,
+                    frozen_by="human:utku",
+                    workspace_root=tmp_path,
+                )
+            assert excinfo.value.code == "already_frozen"
+            # Exactly one canonical plan chain exists — the winner's.
+            from relay.core.room_graph import resolve_room_plan_chain
+
+            task = next(iter(fixture.store.all_models(Task)))
+            chain = resolve_room_plan_chain(fixture.store, fixture.room.id, task.id)
+            assert len(chain.nodes) == 1
+        finally:
+            conn2.close()
+
+    def test_competing_supersession_between_check_and_lock_refuses(
+        self, fixture, tmp_path, monkeypatch
+    ):
+        first = _freeze(fixture, workspace_root=tmp_path)
+        _p1, reply_a, _r1 = planner_exchange(fixture, content="# Plan\n\nA")
+        _p2, reply_b, _r2 = planner_exchange(fixture, content="# Plan\n\nB")
+        conn2, store2 = self._second_store(fixture)
+        try:
+            real_transaction = store2.transaction
+
+            def interleaved():
+                # The competitor supersedes the SAME tip first.
+                freeze(
+                    fixture,
+                    room_config(),
+                    reply=reply_a,
+                    supersedes=first.plan_artifact.id,
+                    workspace_root=tmp_path,
+                )
+                return real_transaction()
+
+            monkeypatch.setattr(store2, "transaction", interleaved)
+            from relay.storage.events import EventLogWriter
+
+            with pytest.raises(RoomRecordRefusal) as excinfo:
+                freeze_room_plan(
+                    store2,
+                    EventLogWriter(conn2),
+                    SqliteEvidenceStore(store2),
+                    room_config(),
+                    fixture.room,
+                    source_message_id=reply_b.id,
+                    frozen_by="human:utku",
+                    workspace_root=tmp_path,
+                    supersedes_plan_artifact_id=first.plan_artifact.id,
+                )
+            assert excinfo.value.code == "supersede_not_tip"
+            from relay.core.room_graph import resolve_room_plan_chain
+
+            chain = resolve_room_plan_chain(fixture.store, fixture.room.id, first.task.id)
+            assert len(chain.nodes) == 2  # one winner, one refusal — no fork
+        finally:
+            conn2.close()
+
+    def test_newly_in_flight_run_between_check_and_lock_refuses(
+        self, fixture, tmp_path, monkeypatch
+    ):
+        first = _freeze(fixture, workspace_root=tmp_path)
+        _parent, reply, _run = planner_exchange(fixture, content="# Plan\n\nRev")
+        conn2, store2 = self._second_store(fixture)
+        try:
+            real_transaction = store2.transaction
+
+            def interleaved():
+                # A build run takes flight after this caller's quiescence check.
+                store = fixture.store
+                run = store.save_model(
+                    Run(
+                        agent="impl",
+                        role=AgentRole.IMPLEMENTER.value,
+                        status=RunStatus.RUNNING,
+                        task_id=first.task.id,
+                    )
+                )
+                fixture.writer.record(
+                    EventLogEntry(
+                        type=EventType.BUILD_RUN_DISPATCHED,
+                        task_id=first.task.id,
+                        sender="relay:build",
+                        content="build stage 'implement' bound to run",
+                        references=[
+                            f"task:{first.task.id}",
+                            f"run:{run.id}",
+                            "build_stage:implement",
+                            "build_attempt:1",
+                        ],
+                    )
+                )
+                return real_transaction()
+
+            monkeypatch.setattr(store2, "transaction", interleaved)
+            from relay.storage.events import EventLogWriter
+
+            with pytest.raises(RoomRecordRefusal) as excinfo:
+                freeze_room_plan(
+                    store2,
+                    EventLogWriter(conn2),
+                    SqliteEvidenceStore(store2),
+                    room_config(),
+                    fixture.room,
+                    source_message_id=reply.id,
+                    frozen_by="human:utku",
+                    workspace_root=tmp_path,
+                    supersedes_plan_artifact_id=first.plan_artifact.id,
+                )
+            # In-flight work surfaces through the ledger as either a typed
+            # quiescence refusal or a continue-refusal — both are fail-closed.
+            assert excinfo.value.code in {"not_quiescent", "ledger_refused"}
+            from relay.core.room_graph import resolve_room_plan_chain
+
+            chain = resolve_room_plan_chain(fixture.store, fixture.room.id, first.task.id)
+            assert len(chain.nodes) == 1
+        finally:
+            conn2.close()
+
+
 def _room_without_implementer(fixture: RoomFixture, seats: dict[str, str] | None = None):
     """A second Room in the same workspace with the given seats."""
     from relay.core.rooms import RoomLifecycle

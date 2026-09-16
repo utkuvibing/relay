@@ -38,6 +38,7 @@ from relay.core.policy import (
     TurnBudgetExhausted,
 )
 from relay.core.reviews import canonical_json
+from relay.core.rooms import ClosedRoomError
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     Artifact,
@@ -769,6 +770,11 @@ def send_note_signal(
         )
     try:
         services.bus.send(compose_signal_message(task, run, signal))
+    except ClosedRoomError as exc:
+        # P7.3: the Room's OPEN fence refused the note. The same durable
+        # ``room_closed`` escalation a blocking signal would earn records WHY —
+        # but a note is coordination input, so the stage must never park on it.
+        return escalate("room_closed", _room_closed_detail(task, exc))
     except (CommunicationPolicyRefusal, MessageRejected) as exc:
         return escalate("policy_refused", str(exc))
     return None
@@ -828,9 +834,10 @@ def _promote_planner_decision(
         accepted_by=reply.sender if accepted else None,
         status=DecisionStatus.ACCEPTED if accepted else DecisionStatus.REJECTED,
         #: P7.3 (App. D.3): a Room-bound task's promoted decision is Room state,
-        #: with durable promotion provenance. Standalone builds keep both unset.
+        #: with durable promotion provenance. Standalone builds keep BOTH unset
+        #: — the pre-P7.3 Decision shape stays byte-identical.
         room_id=task.room_id,
-        source_reply_id=reply.id,
+        source_reply_id=reply.id if task.room_id is not None else None,
         task_id=task.id,
     )
     exchange_refs = [
@@ -988,7 +995,6 @@ async def resolve_open_signal(
         DeliveryPendingRefusal,
         DeliveryRefusal,
     )
-    from relay.core.rooms import ClosedRoomError
 
     current_plan_artifact_id = (
         signal_context.plan_artifact_id if signal_context is not None else None
@@ -1148,7 +1154,7 @@ async def resolve_open_signal(
 
 def _deliverable(
     services: SignalServices,
-    task_id: str,
+    task: Task,
     sender_role: AgentRole,
     sender_agent: str,
     kind: str,
@@ -1158,6 +1164,11 @@ def _deliverable(
     the role resolves to a DISTINCT configured agent and policy admits both
     the send edge and the reply edge (plus blocking budgets for blocking
     kinds). Advertised capabilities must never dead-end on dispatch.
+
+    P7.3: every policy/budget check runs in the REAL message scope —
+    ``(task.room_id, task.id)`` — because the composed signal persists with
+    exactly that scope. A Room-bound task's preflight against ``room_id=None``
+    would advertise signals the actual budget already exhausted.
     """
 
     resolved = (
@@ -1178,8 +1189,8 @@ def _deliverable(
                 recipient=to_role,
                 type=_KIND_MESSAGE_TYPE[kind],
                 blocking=blocking,
-                room_id=None,
-                task_id=task_id,
+                room_id=task.room_id,
+                task_id=task.id,
             )
         )
     except CommunicationPolicyRefusal:
@@ -1193,12 +1204,12 @@ def _deliverable(
                     recipient=sender_role,
                     type=reply_type,
                     blocking=False,
-                    room_id=None,
-                    task_id=task_id,
+                    room_id=task.room_id,
+                    task_id=task.id,
                 )
             )
-            gate.check_blocking_budget(None, task_id)
-            gate.check_turn_budget(None, task_id)
+            gate.check_blocking_budget(task.room_id, task.id)
+            gate.check_turn_budget(task.room_id, task.id)
         except CommunicationPolicyRefusal:
             return False
     return True
@@ -1223,14 +1234,16 @@ _SIGNAL_PREAMBLE = (
 
 def signal_appendix(
     services: SignalServices | None,
-    task_id: str,
+    task: Task,
     sender_role: AgentRole,
     sender_agent: str,
 ) -> str:
     """Prompt appendix advertising only currently-deliverable signals.
 
     Empty string when communication is unavailable — pre-P6.4 prompts stay
-    byte-compatible in that case.
+    byte-compatible in that case. ``task`` carries the message scope: a
+    Room-bound task's deliverability is judged in its ``(room_id, task_id)``
+    scope, standalone builds in ``(None, task_id)``.
     """
 
     if services is None:
@@ -1239,7 +1252,7 @@ def signal_appendix(
     lines: list[str] = []
     for kind in ("clarification_request", "challenge", "proposal", "note"):
         for target in sorted(legal.get(kind, frozenset()), key=lambda role: role.value):
-            if _deliverable(services, task_id, sender_role, sender_agent, kind, target):
+            if _deliverable(services, task, sender_role, sender_agent, kind, target):
                 blocking = "blocking" if _KIND_BLOCKING[kind] else "non-blocking"
                 lines.append(
                     f'- "{kind}" to "{target.value}" ({blocking}) — {_KIND_BLURB[kind]}'

@@ -427,7 +427,7 @@ def freeze_room(
     implements the frozen plan with no plan-stage run.
     """
     from relay.cli.main import _open_db
-    from relay.core.room_freeze import freeze_room_plan
+    from relay.core.room_freeze import freeze_room_plan, require_implementer_write_grant
     from relay.core.room_records import RoomRecordRefusal
     from relay.storage.store import SqliteEvidenceStore
 
@@ -450,6 +450,13 @@ def freeze_room(
             implementer_model = resolve_settings(
                 cli=CliOverrides(), yaml_agent=config.agents[seat_agent]
             ).model
+            # P7.3: freeze binds execution — the EFFECTIVE grant is validated
+            # through the real adapter before any canonical write, so an unset
+            # grant deferring to a read-only adapter default refuses here, and
+            # a write grant the adapter cannot honor fails pre-spawn semantics.
+            require_implementer_write_grant(
+                RegistryAgentFactory(config, root).build(seat_agent), seat_agent
+            )
         outcome = freeze_room_plan(
             store,
             writer,

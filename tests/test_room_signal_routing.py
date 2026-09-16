@@ -18,6 +18,8 @@ from relay.core.stage_signals import (
     StageSignalPayload,
     compose_signal_message,
     resolve_open_signal,
+    send_note_signal,
+    signal_appendix,
 )
 from relay.storage.models import (
     Artifact,
@@ -328,6 +330,223 @@ class TestFreezeRefusalsSurfaceAsTypedErrors:
         with pytest.raises(RoomRecordRefusal) as excinfo:
             freeze(fixture, room_config(), reply=None) if False else _missing_source(fixture)
         assert excinfo.value.code == "unknown_source"
+
+
+class TestSignalAdvertisementScope:
+    """P7.3: ``signal_appendix`` preflights the REAL (room_id, task_id) scope.
+
+    A Room-bound task's signal persists with ``room_id`` set — advertising it
+    against the unscoped ``(None, task_id)`` budget would promise a dispatch
+    the real budget already refuses.
+    """
+
+    def _blocking_rows(self, fixture: RoomFixture, task_id: str, *, room_id: str | None, count: int):
+        """Persisted blocking messages occupying one exact budget scope."""
+        for index in range(count):
+            fixture.store.save_model(
+                Message(
+                    sender="impl",
+                    recipient="gpt",
+                    room_id=room_id,
+                    task_id=task_id,
+                    type=MessageType.CLARIFICATION_REQUEST,
+                    blocking=True,
+                    content=f"occupied budget {index}",
+                )
+            )
+
+    def test_exhausted_room_scope_suppresses_blocking_signals(self, fixture, tmp_path):
+        outcome = freeze(fixture, room_config(), workspace_root=tmp_path)
+        task = fixture.store.load_model(Task, outcome.task.id)
+        assert task is not None and task.room_id == fixture.room.id
+        services = _gated_services(fixture, max_blocking=1)
+        self._blocking_rows(fixture, task.id, room_id=fixture.room.id, count=1)
+
+        appendix = signal_appendix(services, task, AgentRole.IMPLEMENTER, "impl")
+
+        assert '"clarification_request"' not in appendix
+        assert '"proposal"' not in appendix
+        # A note never consults the blocking budget — still deliverable.
+        assert '"note" to "planner"' in appendix
+
+    def test_unscoped_budget_does_not_shadow_the_room_scope(self, fixture, tmp_path):
+        """Blocking rows in the (None, task) scope must NOT hide a Room-bound
+        task's signals — the real message lands in the Room scope."""
+        outcome = freeze(fixture, room_config(), workspace_root=tmp_path)
+        task = fixture.store.load_model(Task, outcome.task.id)
+        assert task is not None
+        services = _gated_services(fixture, max_blocking=1)
+        self._blocking_rows(fixture, task.id, room_id=None, count=1)
+
+        appendix = signal_appendix(services, task, AgentRole.IMPLEMENTER, "impl")
+
+        assert '"clarification_request" to "planner"' in appendix
+
+    def test_standalone_task_scope_is_unchanged(self, fixture):
+        """A room-less task keeps the pre-P7.3 (None, task) preflight scope."""
+        store = fixture.store
+        task = store.save_model(Task(title="standalone"))
+        services = _gated_services(fixture, max_blocking=1, standalone=True)
+        self._blocking_rows(fixture, task.id, room_id=None, count=1)
+
+        appendix = signal_appendix(services, task, AgentRole.IMPLEMENTER, "impl")
+
+        assert '"clarification_request"' not in appendix
+        assert '"note" to "planner"' in appendix
+
+
+class TestClosedRoomNoteSignal:
+    """P7.3: a note on a closed Room records ONE durable room_closed
+    escalation — and the emitting stage continues (notes never park)."""
+
+    def test_closed_room_note_escalates_without_parking(self, fixture, tmp_path):
+        outcome = freeze(fixture, room_config(), workspace_root=tmp_path)
+        store, writer = fixture.store, fixture.writer
+        run = store.save_model(
+            Run(
+                agent="impl",
+                role=AgentRole.IMPLEMENTER.value,
+                status=RunStatus.SUCCEEDED,
+                task_id=outcome.task.id,
+            )
+        )
+        signal = StageSignalPayload(
+            schema_version="relay.stage_signal.v1",
+            kind="note",
+            to_role=AgentRole.PLANNER.value,
+            body="heads-up: the registry layout changed",
+        )
+        RoomLifecycle(store, writer).close(fixture.workspace, fixture.room)
+        task = store.load_model(Task, outcome.task.id)
+        assert task is not None
+        services = _services(fixture)
+        baseline = store.counts()
+
+        artifact = send_note_signal(
+            store, writer, services, task, run, signal, stage="implement", attempt=1
+        )
+
+        assert artifact is not None
+        assert '"reason":"room_closed"' in (artifact.content or "")
+        assert f'"run_id":"{run.id}"' in (artifact.content or "")
+        assert '"signal_message_id":null' in (artifact.content or "")
+        # No note message, no delivery run, no sent marker — and the task
+        # stays IMPLEMENTING (the stage's normal processing continues).
+        assert not [
+            row
+            for row in store.all_models(Message)
+            if row.task_id == task.id and row.type is MessageType.NOTE
+        ]
+        assert store.counts()["messages"] == baseline["messages"]
+        assert store.load_model(Task, task.id).state is TaskState.IMPLEMENTING
+
+        # Repeated execution is deduplicated by the existing escalation rule.
+        again = send_note_signal(
+            store, writer, services, task, run, signal, stage="implement", attempt=1
+        )
+        assert again is not None and again.id == artifact.id
+
+
+class TestStandalonePromotionProvenance:
+    """P7.3 regression: a room-less task's promoted decision keeps the
+    pre-P7.3 shape — no Room scope and no promotion provenance."""
+
+    def test_standalone_promoted_decision_is_unscoped(self, fixture):
+        from relay.core.stage_signals import _promote_planner_decision
+        from relay.storage.store import SqliteEvidenceStore
+
+        store, writer = fixture.store, fixture.writer
+        task = store.save_model(Task(title="standalone"))
+        impl_run = store.save_model(
+            Run(
+                agent="impl",
+                role=AgentRole.IMPLEMENTER.value,
+                status=RunStatus.SUCCEEDED,
+                task_id=task.id,
+            )
+        )
+        planner_run = store.save_model(
+            Run(agent="gpt", role=AgentRole.PLANNER.value, status=RunStatus.SUCCEEDED)
+        )
+        signal_message = store.save_model(
+            Message(
+                sender="impl",
+                recipient="gpt",
+                recipient_role=AgentRole.PLANNER.value,
+                run_id=impl_run.id,
+                task_id=task.id,
+                type=MessageType.CHALLENGE,
+                blocking=True,
+                content="the plan misses error handling",
+            )
+        )
+        reply = store.save_model(
+            Message(
+                sender="gpt",
+                recipient="impl",
+                reply_to_id=signal_message.id,
+                run_id=planner_run.id,
+                task_id=task.id,
+                type=MessageType.FINAL_POSITION,
+                content=(
+                    '{"schema_version":"relay.planner_decision.v1","outcome":"accept",'
+                    '"plan_effect":"unchanged","statement":"error handling stays '
+                    'out of scope"}'
+                ),
+            )
+        )
+
+        decision = _promote_planner_decision(
+            store,
+            writer,
+            SqliteEvidenceStore(store),
+            task,
+            signal_message,
+            reply,
+            current_plan_artifact_id=None,
+        )
+
+        assert decision is not None
+        assert decision.room_id is None
+        assert decision.source_reply_id is None
+        assert decision.task_id == task.id
+        for event in store.all_models(EventLogEntry, "WHERE task_id = ?", [task.id]):
+            assert event.room_id is None
+
+
+def _gated_services(
+    fixture: RoomFixture, *, max_blocking: int = 1, standalone: bool = False
+) -> SignalServices:
+    """Signal services with a real ledger-backed policy gate (P5.1 seam)."""
+    from relay.agents.factory import RegistryAgentFactory
+    from relay.core.bus import ConversationBus
+    from relay.core.delivery import MessageDelivery
+    from relay.core.policy import (
+        CommunicationBudgets,
+        CommunicationPolicy,
+        SqliteCommunicationPolicyGate,
+    )
+    from relay.core.resolver import role_resolver_from_config
+
+    config = room_config()
+    store, writer = fixture.store, fixture.writer
+    resolver = (
+        role_resolver_from_config(config)
+        if standalone
+        else seat_resolver_for_room(fixture.room, config)
+    )
+    gate = SqliteCommunicationPolicyGate(
+        store,
+        CommunicationPolicy(
+            budgets=CommunicationBudgets(
+                max_agent_turns=16, max_blocking_messages=max_blocking
+            )
+        ),
+    )
+    bus = ConversationBus(store, writer, resolver, gate)
+    factory = RegistryAgentFactory(config, fixture.workspace.path or ".")
+    delivery = MessageDelivery(store, writer, factory, bus, gate)
+    return SignalServices(bus=bus, delivery=delivery, resolver=resolver)
 
 
 def _missing_source(fixture: RoomFixture):

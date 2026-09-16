@@ -1969,7 +1969,7 @@ async def _drive_build(
             if signals is not None:
                 review_prompt_suffix = signal_appendix(
                     signals,
-                    task.id,
+                    task,
                     AgentRole.REVIEWER,
                     review_name or reviewer.name,
                 )
@@ -2155,7 +2155,7 @@ async def _drive_build(
             if signals is not None:
                 prompt += signal_appendix(
                     signals,
-                    task.id,
+                    task,
                     AgentRole.IMPLEMENTER,
                     agent_name or agent.name,
                 )
