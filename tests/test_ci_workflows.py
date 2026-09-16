@@ -78,7 +78,7 @@ class TestImmutablePinning:
     def test_setup_uv_pinned_to_the_reviewed_release(self, ci, release):
         for doc in (ci, release):
             for step in _steps_using(doc, "astral-sh/setup-uv"):
-                assert step["uses"].endswith("20cfd1bf945f4377ade1205e4dbc17946fc9a30d"), step[
+                assert step["uses"].endswith("bec219d24cd3e171d82865faccec33120bb574f4"), step[
                     "uses"
                 ]
 
