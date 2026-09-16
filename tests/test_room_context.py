@@ -816,6 +816,253 @@ async def test_generic_provider_failure_never_triggers_fallback(store, writer):
             [EventType.MESSAGE_DELIVERY_FALLBACK.value],
         )
     )
+    # Re-entry stays terminal: no RUN_SESSION_RESUME_REJECTED marker exists,
+    # so the owed-fallback path never engages and no run is retried.
+    assert not list(
+        store.all_models(
+            EventLogEntry,
+            "WHERE type = ?",
+            [EventType.RUN_SESSION_RESUME_REJECTED.value],
+        )
+    )
+    again = await delivery.deliver_and_reply(message.id, resume_session_ref=_VALID_REF)
+    assert again.reply is None
+    assert again.ask.error is not None
+    assert len(list(store.all_models(Run))) == 1
+    assert len(_Harness.seen) == 1
+
+
+async def test_rejected_resume_records_durable_eligibility_marker(store, writer):
+    """The failed resume run carries canonical proof the fallback is owed."""
+    room = _room(store, writer)
+    delivery = MessageDelivery(store, writer, _Factory({"gpt": _RejectingResume()}))
+    bus = ConversationBus(store, writer, RoomSeatResolver(room))
+    message = bus.send(
+        Message(
+            sender="human:utku",
+            recipient_role="planner",
+            room_id=room.id,
+            type=MessageType.CLARIFICATION_REQUEST,
+            content="Hi",
+        )
+    )
+    await delivery.deliver_and_reply(
+        message.id,
+        prompt_suffix=" RESUMED",
+        fallback_prompt_suffix=" FRESH",
+        resume_session_ref=_VALID_REF,
+    )
+    failed = next(
+        run for run in store.all_models(Run) if run.status is RunStatus.FAILED
+    )
+    markers = list(
+        store.all_models(
+            EventLogEntry,
+            "WHERE type = ?",
+            [EventType.RUN_SESSION_RESUME_REJECTED.value],
+        )
+    )
+    assert len(markers) == 1
+    assert markers[0].room_id == room.id
+    assert markers[0].references == [f"run:{failed.id}"]
+
+
+async def test_crashed_resume_continuation_recovers_on_reentry(
+    store, writer, monkeypatch
+):
+    """Crash window: FAILED resume run + eligibility marker + no fallback.
+
+    A process dying between the failed resume attempt's commit and the
+    fallback run's Tx1 must not leave the exchange terminal — the same
+    initiation's one-time fresh fallback is still owed and recovery runs
+    it exactly once.
+    """
+    import relay.core.delivery as delivery_mod
+
+    room = _room(store, writer)
+    harness = _RejectingResume()
+    delivery = MessageDelivery(store, writer, _Factory({"gpt": harness}))
+    bus = ConversationBus(store, writer, RoomSeatResolver(room))
+    message = bus.send(
+        Message(
+            sender="human:utku",
+            recipient_role="planner",
+            room_id=room.id,
+            type=MessageType.CLARIFICATION_REQUEST,
+            content="Hi",
+        )
+    )
+
+    real_run_ask = delivery_mod.run_ask
+    calls = 0
+
+    async def flaky(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated crash before fallback Tx1")
+        return await real_run_ask(*args, **kwargs)
+
+    monkeypatch.setattr(delivery_mod, "run_ask", flaky)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await delivery.deliver_and_reply(
+            message.id,
+            prompt_suffix=" RESUMED",
+            fallback_prompt_suffix=" FRESH",
+            resume_session_ref=_VALID_REF,
+        )
+
+    # The crashed persisted state: initiation marker + FAILED resume run +
+    # eligibility marker — and NO fallback binding.
+    runs = list(store.all_models(Run))
+    assert len(runs) == 1 and runs[0].status is RunStatus.FAILED
+    failed = runs[0]
+    eligibility = list(
+        store.all_models(
+            EventLogEntry,
+            "WHERE type = ?",
+            [EventType.RUN_SESSION_RESUME_REJECTED.value],
+        )
+    )
+    assert [f"run:{failed.id}"] == eligibility[0].references
+    assert not list(
+        store.all_models(
+            EventLogEntry,
+            "WHERE type = ?",
+            [EventType.MESSAGE_DELIVERY_FALLBACK.value],
+        )
+    )
+
+    # Re-entry completes the owed continuation on exactly one fresh run.
+    outcome = await delivery.deliver_and_reply(
+        message.id,
+        prompt_suffix=" RESUMED",
+        fallback_prompt_suffix=" FRESH",
+        resume_session_ref=_VALID_REF,
+    )
+    assert outcome.reply is not None
+    assert outcome.reply.content == "fresh answer"
+    runs = list(store.all_models(Run))
+    assert len(runs) == 2
+    fresh = runs[1]
+    assert fresh.status is RunStatus.SUCCEEDED
+    assert outcome.reply.run_id == fresh.id
+    fallbacks = list(
+        store.all_models(
+            EventLogEntry,
+            "WHERE type = ?",
+            [EventType.MESSAGE_DELIVERY_FALLBACK.value],
+        )
+    )
+    assert len(fallbacks) == 1
+    assert f"prior_run:{failed.id}" in fallbacks[0].references
+    # Exactly one initiation still; the fallback prompt is the honest
+    # fresh-run suffix, not a resumed claim.
+    assert len(delivery.deliveries_for_message(message.id)) == 1
+    recovered_request = _Harness.seen[-1]
+    assert recovered_request.metadata == {}
+    assert recovered_request.prompt.endswith("MESSAGE:\nHi FRESH")
+
+    # Recovery is idempotent: a second re-entry resolves to the same reply.
+    again = await delivery.deliver_and_reply(
+        message.id, resume_session_ref=_VALID_REF
+    )
+    assert again.reply is not None and again.reply.id == outcome.reply.id
+    assert again.ask.run.id == fresh.id
+    assert len(list(store.all_models(Run))) == 2
+
+
+async def test_concurrent_fallback_recovery_binds_to_winner(
+    store, writer, monkeypatch
+):
+    """A competing recovery that commits its fallback binding first wins.
+
+    The loser's fallback run must be vetoed inside its own Tx1 — the staged
+    run row rolls back, no second fallback marker is ever persisted, and
+    recovery resolves to the committed winner's run and reply.
+    """
+    import relay.core.delivery as delivery_mod
+
+    room = _room(store, writer)
+    delivery = MessageDelivery(store, writer, _Factory({"gpt": _RejectingResume()}))
+    bus = ConversationBus(store, writer, RoomSeatResolver(room))
+    message = bus.send(
+        Message(
+            sender="human:utku",
+            recipient_role="planner",
+            room_id=room.id,
+            type=MessageType.CLARIFICATION_REQUEST,
+            content="Hi",
+        )
+    )
+
+    real_run_ask = delivery_mod.run_ask
+    calls = 0
+
+    async def racing(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return await real_run_ask(*args, **kwargs)  # resume attempt rejects
+        if calls == 2:
+            raise RuntimeError("simulated crash before fallback Tx1")
+        # Recovery fallback attempt: a concurrent winner commits its own
+        # binding moments before our run's Tx1 — the hook must veto ours.
+        prior = next(
+            run for run in store.all_models(Run) if run.status is RunStatus.FAILED
+        )
+        winner = store.save_model(
+            Run(agent="gpt", role="planner", status=RunStatus.SUCCEEDED)
+        )
+        store.save_model(
+            Artifact(
+                kind=ArtifactKind.RUN_OUTPUT, run_id=winner.id, content="winner answer"
+            )
+        )
+        writer.record(
+            EventLogEntry(
+                type=EventType.MESSAGE_DELIVERY_FALLBACK,
+                room_id=room.id,
+                sender="relay:delivery",
+                recipient="gpt",
+                content="concurrent winner binding",
+                references=[
+                    f"message:{message.id}",
+                    f"run:{winner.id}",
+                    f"prior_run:{prior.id}",
+                ],
+            )
+        )
+        return await real_run_ask(*args, **kwargs)
+
+    monkeypatch.setattr(delivery_mod, "run_ask", racing)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await delivery.deliver_and_reply(
+            message.id, prompt_suffix=" S", fallback_prompt_suffix=" F",
+            resume_session_ref=_VALID_REF,
+        )
+
+    outcome = await delivery.deliver_and_reply(
+        message.id, prompt_suffix=" S", fallback_prompt_suffix=" F",
+        resume_session_ref=_VALID_REF,
+    )
+    assert outcome.reply is not None
+    assert outcome.reply.content == "winner answer"
+    runs = list(store.all_models(Run))
+    assert len(runs) == 2  # failed resume run + winner; the vetoed run never persisted
+    assert outcome.reply.run_id == runs[1].id
+    assert (
+        len(
+            list(
+                store.all_models(
+                    EventLogEntry,
+                    "WHERE type = ?",
+                    [EventType.MESSAGE_DELIVERY_FALLBACK.value],
+                )
+            )
+        )
+        == 1
+    )
 
 
 def test_render_cap_preserves_mandatory_sections_and_continuity():
@@ -1224,3 +1471,158 @@ def test_room_ask_end_to_end_opt_out_stays_fresh(tmp_path, monkeypatch):
         )
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P7.4 follow-up: resolvable blocking types + guaranteed omission indicators.
+# ---------------------------------------------------------------------------
+
+
+def test_blocking_challenge_and_proposal_surface_until_answered(store, writer):
+    """UNRESOLVED BLOCKING covers every blocking type with canonical reply
+    semantics — challenge and proposal resolve via a final_position answer."""
+    room = _room(store, writer)
+    bus = ConversationBus(store, writer, RoomSeatResolver(room))
+
+    challenge = bus.send(
+        Message(
+            sender="human:utku",
+            recipient_role="planner",
+            room_id=room.id,
+            type=MessageType.CHALLENGE,
+            content="This contradicts the plan",
+            blocking=True,
+        )
+    )
+    proposal = bus.send(
+        Message(
+            sender="human:utku",
+            recipient_role="planner",
+            room_id=room.id,
+            type=MessageType.PROPOSAL,
+            content="Take approach C instead",
+            blocking=True,
+        )
+    )
+    ctx = build_room_participant_context(
+        store, room_id=room.id, role="planner", agent_name="gpt"
+    )
+    surfaced = {message_id for message_id, _, _ in ctx.blocking}
+    assert surfaced == {challenge.id, proposal.id}
+
+    # Canonical answering replies (recipient -> sender, final_position,
+    # non-blocking) resolve both — nothing stays "unresolved" afterwards.
+    gpt_run = store.save_model(
+        Run(agent="gpt", role="planner", status=RunStatus.SUCCEEDED)
+    )
+    for parent in (challenge, proposal):
+        bus.send(
+            Message(
+                sender="gpt",
+                recipient="human:utku",
+                reply_to_id=parent.id,
+                run_id=gpt_run.id,
+                room_id=room.id,
+                type=MessageType.FINAL_POSITION,
+                content="Settled",
+            )
+        )
+    ctx = build_room_participant_context(
+        store, room_id=room.id, role="planner", agent_name="gpt"
+    )
+    assert ctx.blocking == ()
+
+
+def test_blocking_finding_excluded_and_wrong_reply_stays_unresolved(store, writer):
+    """Blocking REVIEW_FINDING has no canonical answering reply type, so its
+    resolved state is not derivable — it is excluded rather than guessed.
+    A challenge answered by a non-canonical reply stays unresolved."""
+    room = _room(store, writer)
+    bus = ConversationBus(store, writer, RoomSeatResolver(room))
+    gpt_run = store.save_model(
+        Run(agent="gpt", role="planner", status=RunStatus.SUCCEEDED)
+    )
+
+    finding_message = bus.send(
+        Message(
+            sender="human:utku",
+            recipient_role="planner",
+            room_id=room.id,
+            type=MessageType.REVIEW_FINDING,
+            content="blocking finding — unclassifiable resolution",
+            blocking=True,
+        )
+    )
+    challenge = bus.send(
+        Message(
+            sender="human:utku",
+            recipient_role="planner",
+            room_id=room.id,
+            type=MessageType.CHALLENGE,
+            content="Answer me properly",
+            blocking=True,
+        )
+    )
+    # A wrong-type reply does NOT resolve the challenge.
+    bus.send(
+        Message(
+            sender="gpt",
+            recipient="human:utku",
+            reply_to_id=challenge.id,
+            run_id=gpt_run.id,
+            room_id=room.id,
+            type=MessageType.NOTE,
+            content="acknowledged but not a position",
+        )
+    )
+
+    ctx = build_room_participant_context(
+        store, room_id=room.id, role="planner", agent_name="gpt"
+    )
+    surfaced = {message_id for message_id, _, _ in ctx.blocking}
+    assert challenge.id in surfaced
+    assert finding_message.id not in surfaced
+
+
+def test_pathological_near_cap_still_declares_omission():
+    """Near-cap edge: a header may fit while its first item, the normal
+    omission note, and even the labelled note cannot — the section must
+    still emit SOME bounded indicator, and no bare header may survive alone."""
+
+    def _ctx(pad: int) -> RoomParticipantContext:
+        return RoomParticipantContext(
+            room_id="room-1",
+            room_name="n",
+            room_status="open",
+            role="planner",
+            agent_name="gpt",
+            task_id="task-1",
+            plan_tip_id="plan-1",
+            plan_chain=(("plan-1", "frozen", "the plan"),),
+            decisions=(("d0", "x" * pad),),
+            blocking=(("b0", "impl", "y" * 400),),
+            history=(("h0", "who/type", "z" * 300),),
+        )
+
+    bare_header = "UNRESOLVED BLOCKING (1):"
+    saw_labelled = saw_minimal = False
+    for pad in range(6800, 7900):
+        rendered = render_room_context(_ctx(pad))
+        assert len(rendered) <= 8000
+        assert "[relay:room-context relay.room.context.v1]" in rendered
+        assert "CURRENT PLAN:" in rendered
+        assert "[relay:continuity fresh]" in rendered
+        lines = rendered.splitlines()
+        if bare_header in lines:
+            follower = lines[lines.index(bare_header) + 1]
+            # A header with omitted content must be followed by indented
+            # content or an omission note — never a next-section line.
+            assert follower.startswith("  "), follower
+        elif "UNRESOLVED BLOCKING: (omitted — context cap)" in rendered:
+            saw_labelled = True
+        else:
+            # Fully omitted at the cap: the minimal indicator declares it.
+            assert any(line == "…" for line in lines)
+            saw_minimal = True
+    assert saw_labelled
+    assert saw_minimal

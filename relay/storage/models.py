@@ -914,6 +914,15 @@ class EventType(str, enum.Enum):
     #: accounting, budgets, and stage recovery keep counting only
     #: MESSAGE_DELIVERED initiations.
     MESSAGE_DELIVERY_FALLBACK = "message_delivery_fallback"
+    #: P7.4: canonical proof that a FAILED run died on the supplied session
+    #: continuation reference — the harness positively rejected the handle.
+    #: Recorded atomically in the run's failure transaction so delivery
+    #: recovery can tell "resume rejected, one-time fresh fallback still
+    #: owed" apart from a terminal generic failure across a crash — typed
+    #: persisted evidence, never error-text parsing. References
+    #: ``run:<failed run>`` only; the message binding stays on
+    #: MESSAGE_DELIVERED and the continuation on MESSAGE_DELIVERY_FALLBACK.
+    RUN_SESSION_RESUME_REJECTED = "run_session_resume_rejected"
     #: P6.3: build-dispatch BINDING marker — Relay bound a build-owned run
     #: to a build stage (plan/implement/fix/review). Committed atomically in
     #: the run's pre-provider Tx1 via ``pre_provider``; retained for failed

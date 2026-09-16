@@ -310,7 +310,10 @@ class HarnessAgent(Agent):
         """Positive identification that a failed run died on the resume ref.
 
         Consulted ONLY when the request actually carried
-        ``metadata["resume_session_ref"]`` and the process exited non-OK.
+        ``metadata["resume_session_ref"]`` and the run failed — a non-OK
+        process exit, or a zero-exit error envelope that ``parse_output``
+        rejects typed (e.g. ``is_error`` / non-SUCCESS payloads carrying
+        the rejection text).
         Adapters override with their own session-invalid signatures
         (e.g. an explicit "no conversation found" harness message). The
         default is deliberately ``False``: a failure that cannot be clearly

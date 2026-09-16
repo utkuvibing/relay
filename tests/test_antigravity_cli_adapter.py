@@ -38,10 +38,17 @@ from relay.harness.discovery import ResolvedExecutable
 from relay.harness.errors import (
     HarnessDiscoveryError,
     HarnessOutputError,
+    SessionResumeUnavailable,
     UnsupportedCapability,
 )
 from relay.harness.runtime import HarnessAgent
-from relay.harness.types import ExecutionGrantKind, ExitSemantics, HarnessInfo
+from relay.harness.types import (
+    ExecutionGrantKind,
+    ExitSemantics,
+    HarnessInfo,
+    ProcessOutcome,
+    StreamCapture,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
@@ -518,6 +525,79 @@ class TestRunIntegration:
         message = str(excinfo.value)
         assert ("deadline" in message) or ("exceeded" in message)
         assert "time.sleep" not in message
+
+
+class TestSessionResumeRejection:
+    """P7.4: a zero-exit non-SUCCESS envelope can still positively reject a
+    supplied resume ref — that must classify as ``SessionResumeUnavailable``
+    so delivery can run the one-time honest fresh fallback. Non-signature
+    errors and envelopes on runs that never sent a ref stay generic
+    ``HarnessOutputError`` and are never retried."""
+
+    @staticmethod
+    def _agent_with_exit0_envelope(
+        tmp_path: Path, monkeypatch, stdout: str, stderr: str = ""
+    ) -> AntigravityCLIAdapter:
+        import relay.harness.runtime as runtime_module
+        from relay.agents import antigravity_cli as module
+
+        agent = _real(tmp_path)
+        agent._resolved = _fake_resolved()
+        monkeypatch.setattr(module, "_slash_clamp_supported", lambda command: True)
+
+        async def _stub(_spec):
+            return ProcessOutcome(
+                exit_code=0,
+                timed_out=False,
+                cancelled=False,
+                stdout=StreamCapture(text=stdout),
+                stderr=StreamCapture(text=stderr),
+                duration_s=0.01,
+                semantics=ExitSemantics.OK,
+            )
+
+        monkeypatch.setattr(runtime_module, "execute", _stub)
+        return agent
+
+    @staticmethod
+    def _resume_request() -> AgentRequest:
+        return AgentRequest(
+            prompt="p",
+            role=AgentRole.PLANNER,
+            metadata={"resume_session_ref": FIXTURE_SESSION_ID},
+        )
+
+    async def test_exit0_error_envelope_rejection_is_session_typed(
+        self, tmp_path, monkeypatch
+    ):
+        envelope = _envelope(
+            status="ERROR",
+            error=f"no conversation found: {FIXTURE_SESSION_ID}",
+        )
+        agent = self._agent_with_exit0_envelope(tmp_path, monkeypatch, envelope)
+        with pytest.raises(SessionResumeUnavailable):
+            await agent.run(self._resume_request())
+
+    async def test_exit0_error_envelope_without_signature_stays_generic(
+        self, tmp_path, monkeypatch
+    ):
+        envelope = _envelope(status="ERROR", error="rate limit exceeded")
+        agent = self._agent_with_exit0_envelope(tmp_path, monkeypatch, envelope)
+        with pytest.raises(HarnessOutputError) as excinfo:
+            await agent.run(self._resume_request())
+        assert not isinstance(excinfo.value, SessionResumeUnavailable)
+
+    async def test_rejection_envelope_without_resume_ref_stays_generic(
+        self, tmp_path, monkeypatch
+    ):
+        envelope = _envelope(
+            status="ERROR",
+            error=f"no conversation found: {FIXTURE_SESSION_ID}",
+        )
+        agent = self._agent_with_exit0_envelope(tmp_path, monkeypatch, envelope)
+        with pytest.raises(HarnessOutputError) as excinfo:
+            await agent.run(_request("p"))
+        assert not isinstance(excinfo.value, SessionResumeUnavailable)
 
 
 class TestBatteryParityG1Prime:

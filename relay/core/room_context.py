@@ -64,6 +64,13 @@ _MAX_PLAN_CHARS = 2000
 #: away by a naive global truncation.
 _MAX_TOTAL_CHARS = 8000
 
+#: Reserved while fitting non-final sections — exactly the width of the
+#: minimal terminal omission indicator (a newline plus ``…``), so every
+#: later section inherits a budget in which SOME omission marker can still
+#: be emitted. This is what makes "omitted content is always declared"
+#: a guarantee rather than a best effort.
+_OMISSION_RESERVE_CHARS = 2
+
 
 def _truncate(text: str, limit: int) -> str:
     cleaned = " ".join((text or "").split())
@@ -154,11 +161,20 @@ def build_room_participant_context(
     blocking: list[tuple[str, str, str]] = []
     for message in store.all_models(
         Message,
-        "WHERE room_id = ? AND type = ? AND blocking = 1",
-        [room_id, MessageType.CLARIFICATION_REQUEST.value],
+        "WHERE room_id = ? AND blocking = 1",
+        [room_id],
         order_by="created_at ASC, rowid ASC",
     ):
         if active_task_id is not None and message.task_id != active_task_id:
+            continue
+        # Only blocking-capable types with a canonical answering-reply
+        # pairing can be classified as resolved/unresolved (see
+        # _BLOCKING_REPLY_TYPES). REVIEW_FINDING is blocking-legal per the
+        # frozen bus vocabulary but defines no answering reply type, so its
+        # resolved state cannot be derived from canonical records — it is
+        # excluded here rather than guessed at (documented D.10 limitation;
+        # no Relay producer currently mints a blocking finding).
+        if message.type not in _BLOCKING_REPLY_TYPES:
             continue
         if _has_canonical_reply(store, message):
             continue
@@ -315,12 +331,20 @@ def build_room_participant_context(
     )
 
 
+#: Blocking-capable message types whose resolved/unresolved state is
+#: derivable: the canonical answering reply type (P4.3 pair vocabulary —
+#: identical to ``stage_signals._REPLY_TYPE_BY_PARENT``). The bus admits
+#: ``blocking`` on REVIEW_FINDING too, but no answering reply type exists
+#: for it, so it is deliberately absent here.
+_BLOCKING_REPLY_TYPES: dict[MessageType, MessageType] = {
+    MessageType.CLARIFICATION_REQUEST: MessageType.CLARIFICATION_RESPONSE,
+    MessageType.CHALLENGE: MessageType.FINAL_POSITION,
+    MessageType.PROPOSAL: MessageType.FINAL_POSITION,
+}
+
+
 def _has_canonical_reply(store: SqliteRelayStore, message: Message) -> bool:
-    expected = {
-        MessageType.CLARIFICATION_REQUEST: MessageType.CLARIFICATION_RESPONSE,
-        MessageType.CHALLENGE: MessageType.FINAL_POSITION,
-        MessageType.PROPOSAL: MessageType.FINAL_POSITION,
-    }.get(message.type)
+    expected = _BLOCKING_REPLY_TYPES.get(message.type)
     if expected is None:
         return False
     for reply in store.all_models(
@@ -352,6 +376,17 @@ def render_room_context(ctx: RoomParticipantContext) -> str:
     whose header alone cannot fit degrades to a one-line
     ``<SECTION>: (omitted — context cap)`` marker so absence is always
     declared, never silent.
+
+    The omission guarantee is structural, not best-effort: every section
+    that had omitted content emits SOME bounded indicator. When even the
+    normal note cannot fit (a pathological near-cap tail where a bare
+    header plus first item exhaust the budget), kept items are released
+    until the note fits; a section left with zero rendered items degrades
+    to the labelled ``(omitted — context cap)`` line, and if even that
+    cannot fit the single-character ``…`` indicator is emitted — strictly
+    shorter than any section header, so it always fits under the real cap.
+    Non-final sections reserve ``_OMISSION_RESERVE_CHARS`` so a later
+    section can never inherit a budget too small for its own indicator.
     """
     head = [
         "",
@@ -508,32 +543,70 @@ def render_room_context(ctx: RoomParticipantContext) -> str:
         sections.append(("HISTORY EXCERPTS", ["HISTORY EXCERPTS (0): (none)"]))
 
     out = list(head)
+    exhausted = False
 
-    def _fits(extra: list[str]) -> bool:
-        return len("\n".join([*out, *extra, *tail]) + "\n") <= _MAX_TOTAL_CHARS
+    def _fits(extra: list[str], reserve: int = 0) -> bool:
+        return (
+            len("\n".join([*out, *extra, *tail]) + "\n")
+            <= _MAX_TOTAL_CHARS - reserve
+        )
 
-    for label, section_lines in sections:
-        if _fits(section_lines):
+    def _declare_omission(label: str, reserve: int) -> bool:
+        """Emit the strongest whole-section omission indicator that fits.
+
+        Returns True when the minimal ``…`` indicator was emitted — the
+        budget is then exhausted by construction, so no later section can
+        render anything. The single-character indicator is strictly
+        shorter than any section header, and the reserve discipline keeps
+        at least its width available, so it always fits under the real cap.
+        """
+        note = f"{label}: (omitted — context cap)"
+        if _fits([note], reserve):
+            out.append(note)
+            return False
+        if _fits(["…"]):
+            out.append("…")
+        return True
+
+    last_index = len(sections) - 1
+    for index, (label, section_lines) in enumerate(sections):
+        if exhausted:
+            break
+        # Non-final sections reserve the minimal indicator's width for
+        # whatever follows; the final section may consume it.
+        reserve = _OMISSION_RESERVE_CHARS if index < last_index else 0
+        if _fits(section_lines, reserve):
             out.extend(section_lines)
             continue
         header, *items = section_lines
-        if not _fits([header]):
-            note = f"{label}: (omitted — context cap)"
-            if _fits([note]):
-                out.append(note)
+        if not _fits([header], reserve):
+            exhausted = _declare_omission(label, reserve)
             continue
         out.append(header)
         kept = 0
         for item in items:
-            if not _fits([item]):
+            if not _fits([item], reserve):
                 break
             out.append(item)
             kept += 1
         omitted = len(items) - kept
-        if omitted:
+        while omitted:
             note = f"  …[{omitted} entries omitted — context cap]"
-            if _fits([note]):
+            if _fits([note], reserve):
                 out.append(note)
+                break
+            if kept:
+                # Release kept items until the omission note fits — a kept
+                # prefix may never hide the fact that content was omitted.
+                out.pop()
+                kept -= 1
+                omitted += 1
+                continue
+            # Nothing rendered: a bare header would falsely imply an empty
+            # section — drop it and declare the whole-section omission.
+            out.pop()
+            exhausted = _declare_omission(label, reserve)
+            break
     return "\n".join([*out, *tail]) + "\n"
 
 
