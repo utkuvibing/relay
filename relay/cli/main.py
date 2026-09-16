@@ -60,12 +60,19 @@ def _out() -> Console:
     return Console()
 
 
-def _signal_services(config, store, writer, root):
-    """P6.4: the communication seams for in-build micro-interactions.
+def _signal_services(config, store, writer, root, *, task=None):
+    """P6.4/P7.3: the communication seams for in-build micro-interactions.
 
     Built from CURRENT config — role bindings, policy edges and budgets all
     re-resolve on every invocation, so a corrected relay.yaml is what
     ``relay continue`` retries against.
+
+    P7.3 (App. D.2/D.3): for a Room-bound task, role ROUTING comes from that
+    persisted Room's seat snapshot instead of the config role binding — a
+    rebound seat is respected and a persisted seat whose agent is no longer
+    configured fails honestly at delivery (never a silent fallback). The Room
+    is reloaded on every invocation, so ``relay room bind`` takes effect on the
+    next ``relay continue``.
     """
     from relay.agents.factory import RegistryAgentFactory
     from relay.core.bus import ConversationBus
@@ -74,11 +81,19 @@ def _signal_services(config, store, writer, root):
         SqliteCommunicationPolicyGate,
         policy_from_config,
     )
-    from relay.core.resolver import role_resolver_from_config
+    from relay.core.resolver import role_resolver_from_config, seat_resolver_for_room
     from relay.core.stage_signals import SignalServices
+    from relay.storage.models import Room
 
     factory = RegistryAgentFactory(config, root)
     resolver = role_resolver_from_config(config)
+    if task is not None and task.room_id is not None:
+        room = store.load_model(Room, task.room_id)
+        if room is None:
+            raise ConfigError(
+                f"task '{task.id}' is Room-bound but Room '{task.room_id}' does not exist"
+            )
+        resolver = seat_resolver_for_room(room, config)
     gate = SqliteCommunicationPolicyGate(store, policy_from_config(config))
     bus = ConversationBus(store, writer, resolver, gate)
     delivery = MessageDelivery(store, writer, factory, bus, gate)
@@ -281,7 +296,7 @@ def build(
                     reviewer_model=None if reviewer_settings is None else reviewer_settings.model,
                     approval=config.approval,
                     budget=config.budget,
-                    signals=_signal_services(config, store, writer, root),
+                    signals=_signal_services(config, store, writer, root, task=task),
                 )
             )
 
@@ -432,7 +447,7 @@ def continue_(
                     approval=config.approval,
                     budget=config.budget,
                     settle_interrupted=settle_interrupted,
-                    signals=_signal_services(config, store, writer, root),
+                    signals=_signal_services(config, store, writer, root, task=task),
                 )
             )
             from relay.cli.taskview import build_task_view

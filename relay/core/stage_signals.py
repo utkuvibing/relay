@@ -38,6 +38,7 @@ from relay.core.policy import (
     TurnBudgetExhausted,
 )
 from relay.core.reviews import canonical_json
+from relay.core.rooms import ClosedRoomError
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     Artifact,
@@ -174,6 +175,9 @@ EscalationReason = Literal[
     "delivery_failed",
     "delivery_pending",
     "turn_budget_exhausted",
+    #: P7.3: a Room-bound task's micro-exchange hit the Room's OPEN fence
+    #: (P7.1 traffic fence) — the task parks until the human resumes the Room.
+    "room_closed",
 ]
 
 
@@ -234,6 +238,15 @@ def _loads_strict(text: str) -> object:
         raise SignalContractError("malformed") from exc
     _json_depth(value)
     return value
+
+
+def parse_strict_json(text: str) -> object:
+    """Strict JSON decode for canonical reply contracts (P7.3).
+
+    Duplicate keys, non-finite constants and over-deep documents are refused;
+    malformed input raises :class:`SignalContractError`.
+    """
+    return _loads_strict(text)
 
 
 def parse_stage_signal(text: str) -> StageSignalPayload | None:
@@ -522,6 +535,11 @@ def compose_signal_message(
     return Message(
         sender=run.agent,
         run_id=run.id,
+        #: P7.3 (App. D.3): a Room-bound task's micro-exchange is Room state —
+        #: the Room scope makes the signal/reply visible in the canonical Room
+        #: feed and routes it through the Room's OPEN fence. Standalone builds
+        #: stay ``room_id=None`` (byte-identical).
+        room_id=task.room_id,
         task_id=task.id,
         recipient_role=signal.to_role,
         type=_KIND_MESSAGE_TYPE[signal.kind],
@@ -752,6 +770,11 @@ def send_note_signal(
         )
     try:
         services.bus.send(compose_signal_message(task, run, signal))
+    except ClosedRoomError as exc:
+        # P7.3: the Room's OPEN fence refused the note. The same durable
+        # ``room_closed`` escalation a blocking signal would earn records WHY —
+        # but a note is coordination input, so the stage must never park on it.
+        return escalate("room_closed", _room_closed_detail(task, exc))
     except (CommunicationPolicyRefusal, MessageRejected) as exc:
         return escalate("policy_refused", str(exc))
     return None
@@ -810,6 +833,11 @@ def _promote_planner_decision(
         proposed_by=message.sender,
         accepted_by=reply.sender if accepted else None,
         status=DecisionStatus.ACCEPTED if accepted else DecisionStatus.REJECTED,
+        #: P7.3 (App. D.3): a Room-bound task's promoted decision is Room state,
+        #: with durable promotion provenance. Standalone builds keep BOTH unset
+        #: — the pre-P7.3 Decision shape stays byte-identical.
+        room_id=task.room_id,
+        source_reply_id=reply.id if task.room_id is not None else None,
         task_id=task.id,
     )
     exchange_refs = [
@@ -818,11 +846,14 @@ def _promote_planner_decision(
         f"message:{message.id}",
         f"message:{reply.id}",
     ]
+    if task.room_id is not None:
+        exchange_refs.insert(0, f"room:{task.room_id}")
     with store.transaction():
         store.save_model(decision)
         writer.record(
             EventLogEntry(
                 type=EventType.DECISION_PROPOSED,
+                room_id=task.room_id,
                 task_id=task.id,
                 sender=message.sender,
                 recipient=reply.sender,
@@ -835,6 +866,7 @@ def _promote_planner_decision(
                 type=(
                     EventType.DECISION_ACCEPTED if accepted else EventType.DECISION_REJECTED
                 ),
+                room_id=task.room_id,
                 task_id=task.id,
                 sender=reply.sender,
                 recipient=message.sender,
@@ -850,6 +882,7 @@ def _promote_planner_decision(
             plan_artifact = store.save_model(
                 Artifact(
                     kind=ArtifactKind.PLAN,
+                    room_id=task.room_id,
                     task_id=task.id,
                     run_id=reply.run_id,
                     content=payload.revised_plan,
@@ -858,6 +891,7 @@ def _promote_planner_decision(
             revision = store.save_model(
                 Artifact(
                     kind=ArtifactKind.REPORT,
+                    room_id=task.room_id,
                     task_id=task.id,
                     run_id=reply.run_id,
                     content=canonical_json(
@@ -887,13 +921,56 @@ def _promote_planner_decision(
                 writer.record(
                     EventLogEntry(
                         type=EventType.ARTIFACT_CREATED,
+                        room_id=task.room_id,
                         task_id=task.id,
                         sender=SIGNAL_SENDER,
                         content=f"plan revision minted via {message.type.value}",
                         references=[f"task:{task.id}", f"artifact:{artifact.id}"],
                     )
                 )
+            if task.room_id is not None:
+                #: P7.3: a Room-bound task's revised plan becomes the Room's
+                #: canonical tip — the feed's entry marker for the new plan.
+                #: The human-freeze marker (ROOM_PLAN_FROZEN) is never reused.
+                writer.record(
+                    EventLogEntry(
+                        type=EventType.ROOM_PLAN_REVISED,
+                        room_id=task.room_id,
+                        task_id=task.id,
+                        sender=SIGNAL_SENDER,
+                        content=(
+                            "plan revised by decision "
+                            f"{decision.id}: {_first_line(payload.revised_plan)}"
+                        ),
+                        references=[
+                            f"room:{task.room_id}",
+                            f"task:{task.id}",
+                            f"plan:{plan_artifact.id}",
+                            f"supersedes_plan:{current_plan_artifact_id}",
+                            f"decision:{decision.id}",
+                            f"message:{message.id}",
+                            f"message:{reply.id}",
+                        ],
+                    )
+                )
     return decision
+
+
+def _first_line(content: str, limit: int = 200) -> str:
+    """The plan's first non-empty line, bounded — feed display text."""
+    for line in content.splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        if stripped:
+            return stripped[:limit]
+    return "(empty plan)"
+
+
+def _room_closed_detail(task: Task, exc: Exception) -> str:
+    """Human-actionable detail for a Room-fence refusal (P7.3)."""
+    return (
+        f"Room traffic for task '{task.id}' is fenced: {exc} — resume the Room "
+        "(relay room resume <room>) and run 'relay continue' again"
+    )
 
 
 async def resolve_open_signal(
@@ -964,6 +1041,11 @@ async def resolve_open_signal(
         )
         try:
             return services.bus.send(message)
+        except ClosedRoomError as exc:
+            # P7.3: the Room's OPEN fence refused the traffic. ``bus.send``
+            # validates and fences inside its own transaction, so nothing was
+            # persisted — park with a durable, human-actionable escalation.
+            return escalate("room_closed", _room_closed_detail(task, exc))
         except BlockingBudgetExhausted as exc:
             return escalate("budget_exhausted", str(exc))
         except TurnBudgetExhausted as exc:
@@ -1036,6 +1118,12 @@ async def resolve_open_signal(
             )
         except DeliveryPendingRefusal as exc:
             return escalate("delivery_pending", str(exc), message_id=message.id)
+        except ClosedRoomError as exc:
+            # P7.3: the delivery Tx1 fence refused the staged run — no Run, no
+            # artifacts, no MESSAGE_DELIVERED marker survive the rollback.
+            return escalate(
+                "room_closed", _room_closed_detail(task, exc), message_id=message.id
+            )
         except BlockingBudgetExhausted as exc:
             return escalate("budget_exhausted", str(exc), message_id=message.id)
         except TurnBudgetExhausted as exc:
@@ -1066,7 +1154,7 @@ async def resolve_open_signal(
 
 def _deliverable(
     services: SignalServices,
-    task_id: str,
+    task: Task,
     sender_role: AgentRole,
     sender_agent: str,
     kind: str,
@@ -1076,6 +1164,11 @@ def _deliverable(
     the role resolves to a DISTINCT configured agent and policy admits both
     the send edge and the reply edge (plus blocking budgets for blocking
     kinds). Advertised capabilities must never dead-end on dispatch.
+
+    P7.3: every policy/budget check runs in the REAL message scope —
+    ``(task.room_id, task.id)`` — because the composed signal persists with
+    exactly that scope. A Room-bound task's preflight against ``room_id=None``
+    would advertise signals the actual budget already exhausted.
     """
 
     resolved = (
@@ -1096,8 +1189,8 @@ def _deliverable(
                 recipient=to_role,
                 type=_KIND_MESSAGE_TYPE[kind],
                 blocking=blocking,
-                room_id=None,
-                task_id=task_id,
+                room_id=task.room_id,
+                task_id=task.id,
             )
         )
     except CommunicationPolicyRefusal:
@@ -1111,12 +1204,12 @@ def _deliverable(
                     recipient=sender_role,
                     type=reply_type,
                     blocking=False,
-                    room_id=None,
-                    task_id=task_id,
+                    room_id=task.room_id,
+                    task_id=task.id,
                 )
             )
-            gate.check_blocking_budget(None, task_id)
-            gate.check_turn_budget(None, task_id)
+            gate.check_blocking_budget(task.room_id, task.id)
+            gate.check_turn_budget(task.room_id, task.id)
         except CommunicationPolicyRefusal:
             return False
     return True
@@ -1141,14 +1234,16 @@ _SIGNAL_PREAMBLE = (
 
 def signal_appendix(
     services: SignalServices | None,
-    task_id: str,
+    task: Task,
     sender_role: AgentRole,
     sender_agent: str,
 ) -> str:
     """Prompt appendix advertising only currently-deliverable signals.
 
     Empty string when communication is unavailable — pre-P6.4 prompts stay
-    byte-compatible in that case.
+    byte-compatible in that case. ``task`` carries the message scope: a
+    Room-bound task's deliverability is judged in its ``(room_id, task_id)``
+    scope, standalone builds in ``(None, task_id)``.
     """
 
     if services is None:
@@ -1157,7 +1252,7 @@ def signal_appendix(
     lines: list[str] = []
     for kind in ("clarification_request", "challenge", "proposal", "note"):
         for target in sorted(legal.get(kind, frozenset()), key=lambda role: role.value):
-            if _deliverable(services, task_id, sender_role, sender_agent, kind, target):
+            if _deliverable(services, task, sender_role, sender_agent, kind, target):
                 blocking = "blocking" if _KIND_BLOCKING[kind] else "non-blocking"
                 lines.append(
                     f'- "{kind}" to "{target.value}" ({blocking}) — {_KIND_BLURB[kind]}'

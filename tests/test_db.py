@@ -20,6 +20,7 @@ from relay.core.state_machine import (
     TaskStateMachine,
 )
 from relay.storage import connect, migrate
+from relay.storage.db import _APPEND_ONLY_TABLES as _V1_APPEND_ONLY_TABLES
 from relay.storage.db import _MIGRATIONS, SCHEMA_VERSION
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
@@ -30,8 +31,10 @@ from relay.storage.models import (
     EventLogEntry,
     EventType,
     EvidenceRecord,
+    Finding,
     Message,
     MessageType,
+    ReviewSeverity,
     Room,
     RoomMember,
     Run,
@@ -685,3 +688,163 @@ class TestDurabilityAndIdentity:
         counts = store.counts()
         assert set(counts) == {MODEL_TABLES[cls] for cls in MODEL_TABLES}
         assert counts["workspaces"] == 1
+
+
+class TestP73SchemaV9:
+    """P7.3 (App. D.3): Room scope columns, findings table, decision contracts.
+
+    The v9 migration must converge fresh and legacy databases, and the
+    ``findings`` triggers belong to v9 — the v1 append-only helper only knows
+    the tables that exist at v1, so adding ``findings`` there would break
+    fresh creation (guarded by ``test_v1_helper_never_names_later_tables``).
+    """
+
+    def test_v1_helper_never_names_later_tables(self):
+        assert "findings" not in _V1_APPEND_ONLY_TABLES
+        assert "messages" not in _V1_APPEND_ONLY_TABLES  # v3 installed its own
+
+    def test_fresh_v9_installs_findings_triggers_and_decision_rules(self, tmp_path):
+        conn = connect(tmp_path / "fresh.sqlite3")
+        assert migrate(conn) == SCHEMA_VERSION
+        triggers = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        }
+        assert {"findings_no_update", "findings_no_delete"} <= triggers
+        assert {
+            "decisions_no_self_supersede_insert",
+            "decisions_no_self_supersede_update",
+        } <= triggers
+        indices = {row[1] for row in conn.execute("PRAGMA index_list(decisions)")}
+        assert {"idx_decisions_source_reply", "idx_decisions_supersedes"} <= indices
+        artifact_indices = {row[1] for row in conn.execute("PRAGMA index_list(artifacts)")}
+        assert "idx_artifacts_room" in artifact_indices
+        conn.close()
+
+    def test_v8_database_upgrades_to_v9_preserving_history(self, tmp_path):
+        db_path = tmp_path / "v8.sqlite3"
+        legacy = connect(db_path)
+        for version in range(1, 9):
+            for statement in _MIGRATIONS[version]:
+                legacy.execute(statement)
+        legacy.execute("PRAGMA user_version = 8")
+        legacy.execute(
+            "INSERT INTO workspaces (id, name, kind, created_at) VALUES "
+            "('w', 'workspace', 'folder', '2025-01-01T00:00:00+00:00')"
+        )
+        legacy.execute(
+            "INSERT INTO decisions (id, statement, status, created_at) VALUES "
+            "('d-hist', 'pre-v9', 'accepted', '2025-01-01T00:00:00+00:00')"
+        )
+        legacy.execute(
+            "INSERT INTO artifacts (id, kind, content, created_at) VALUES "
+            "('a-hist', 'plan', 'legacy plan', '2025-01-01T00:00:00+00:00')"
+        )
+        legacy.commit()
+        legacy.close()
+
+        upgraded = connect(db_path)
+        assert migrate(upgraded) == SCHEMA_VERSION
+        decision = upgraded.execute("SELECT * FROM decisions WHERE id = 'd-hist'").fetchone()
+        assert decision["statement"] == "pre-v9"
+        assert decision["references_json"] == "[]"
+        assert decision["source_reply_id"] is None
+        assert decision["supersedes_decision_id"] is None
+        artifact = upgraded.execute("SELECT * FROM artifacts WHERE id = 'a-hist'").fetchone()
+        assert artifact["content"] == "legacy plan"
+        assert artifact["room_id"] is None
+        finding_columns = {row[1] for row in upgraded.execute("PRAGMA table_info(findings)")}
+        assert {
+            "id",
+            "room_id",
+            "task_id",
+            "review_artifact_id",
+            "review_run_id",
+            "source_finding_id",
+            "severity",
+            "title",
+            "description",
+            "requested_change",
+            "validation_expectation",
+            "location_json",
+            "created_at",
+        } == finding_columns
+        upgraded.close()
+
+    def test_finding_roundtrip_and_append_only(self, store):
+        store.save_model(Workspace(id="w", name="w"))
+        store.save_model(Room(id="r1", name="Room", workspace_id="w"))
+        store.save_model(Task(id="t1", title="task", room_id="r1"))
+        store.save_model(Run(id="run1", agent="gpt", role="planner"))
+        store.save_model(
+            Artifact(id="a1", kind=ArtifactKind.REVIEW_FINDING, task_id="t1", room_id="r1")
+        )
+        saved = store.save_model(
+            Finding(
+                room_id="r1",
+                task_id="t1",
+                review_artifact_id="a1",
+                review_run_id="run1",
+                source_finding_id="F1",
+                severity=ReviewSeverity.HIGH,
+                title="Missing guard",
+                description="detail",
+                requested_change="add guard",
+                validation_expectation="tests cover it",
+            )
+        )
+        loaded = store.load_model(Finding, saved.id)
+        assert loaded == saved and loaded.severity is ReviewSeverity.HIGH
+        with pytest.raises(sqlite3.IntegrityError):
+            store.save_model(
+                Finding(
+                    room_id="r1",
+                    task_id="t1",
+                    review_artifact_id="a1",
+                    review_run_id="run1",
+                    source_finding_id="F1",
+                    severity=ReviewSeverity.LOW,
+                    title="duplicate",
+                    description="d",
+                    requested_change="c",
+                    validation_expectation="v",
+                )
+            )
+        with pytest.raises(ImmutableHistoryError):
+            store.update_model(loaded.model_copy(update={"title": "rewritten"}))
+        with pytest.raises(ImmutableHistoryError):
+            store.delete_model(loaded)
+
+    def test_decision_promotion_and_supersession_rules_are_fail_closed(self, store):
+        store.save_model(Workspace(id="w", name="w"))
+        store.save_model(Room(id="r1", name="Room", workspace_id="w"))
+        promoted = store.save_model(
+            Decision(statement="first", room_id="r1", status="accepted", source_reply_id="m1")
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            store.save_model(
+                Decision(statement="duplicate", room_id="r1", source_reply_id="m1")
+            )
+        store.save_model(
+            Decision(
+                statement="second",
+                room_id="r1",
+                status="accepted",
+                source_reply_id="m2",
+                supersedes_decision_id=promoted.id,
+            )
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            store.save_model(
+                Decision(
+                    statement="third",
+                    room_id="r1",
+                    status="accepted",
+                    source_reply_id="m3",
+                    supersedes_decision_id=promoted.id,
+                )
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            store.save_model(
+                Decision(id="selfid", statement="self", room_id="r1", supersedes_decision_id="selfid")
+            )

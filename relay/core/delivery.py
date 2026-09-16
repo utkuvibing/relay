@@ -195,21 +195,30 @@ class MessageDelivery:
         """Construct and retain the exact read-only agent used by the next delivery."""
         self._prepared_recipients[recipient] = self._construct_recipient(recipient)
 
-    async def deliver(self, message_id: str) -> DeliveryOutcome:
+    async def deliver(
+        self, message_id: str, *, prompt_suffix: str = ""
+    ) -> DeliveryOutcome:
         """Bind ``message_id`` to a fresh recipient run and execute it.
 
         Pre-run refusals (absent message, non-bare recipient, bogus role,
         unbuildable recipient) and duplicate-initiation vetoes are typed
         exceptions with ZERO store delta. Run failures are NOT refusals —
         the spine records them honestly and the binding marker is retained.
+
+        ``prompt_suffix`` rides OUTSIDE the frozen D15 envelope (the P6.4
+        appendix pattern); it defaults to empty, so ordinary delivery prompts
+        stay byte-identical.
         """
-        return await self._deliver(message_id, admitted_reply_type=None)
+        return await self._deliver(
+            message_id, admitted_reply_type=None, prompt_suffix=prompt_suffix
+        )
 
     async def _deliver(
         self,
         message_id: str,
         *,
         admitted_reply_type: MessageType | None,
+        prompt_suffix: str = "",
     ) -> DeliveryOutcome:
         """Initiate delivery, optionally binding a pre-admitted reply type."""
         message = self._store.load_model(Message, message_id)
@@ -234,7 +243,7 @@ class MessageDelivery:
         prepared = self._prepared_recipients.pop(recipient, None)
         agent, model = prepared if prepared is not None else self._construct_recipient(recipient)
         request = AgentRequest(
-            prompt=self._envelope(message),
+            prompt=self._envelope(message) + prompt_suffix,
             role=role,
             task_id=message.task_id,
             room_id=message.room_id,
@@ -270,6 +279,7 @@ class MessageDelivery:
         *,
         reply_type: MessageType | None = None,
         max_thread_depth: int = DEFAULT_MAX_THREAD_DEPTH,
+        prompt_suffix: str = "",
     ) -> DeliveryReplyOutcome:
         """P4.3 (frozen plan D12-D15): deliver message and materialize reply idempotently.
 
@@ -418,6 +428,7 @@ class MessageDelivery:
             admitted_reply_type=(
                 actual_reply_type if self._policy is not None else None
             ),
+            prompt_suffix=prompt_suffix,
         )
         if outcome.ask.response is None:
             return DeliveryReplyOutcome(message=message, ask=outcome.ask, reply=None)

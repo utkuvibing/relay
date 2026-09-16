@@ -24,7 +24,7 @@ from relay.core.protocols import EvaluationStatus, ParticipantRequirement
 from relay.core.rooms import RoomLifecycle
 from relay.core.state_machine import TaskState
 from relay.harness.capabilities import HarnessCapability
-from relay.storage.db import _MIGRATIONS, connect, migrate
+from relay.storage.db import _MIGRATIONS, SCHEMA_VERSION, connect, migrate
 from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     Message,
@@ -417,10 +417,10 @@ def test_populated_v6_migration(tmp_path):
     )
     store.save_model(legacy)
     before = list(conn.execute("SELECT * FROM rooms"))
-    assert migrate(conn) == 8
+    assert migrate(conn) == SCHEMA_VERSION
     assert [tuple(row)[:6] for row in conn.execute("SELECT * FROM rooms")] == [tuple(before[0])]
     assert store.load_model(Message, legacy.id) == legacy
-    assert migrate(conn) == 8
+    assert migrate(conn) == SCHEMA_VERSION
     store.save_model(execution(room_id="legacy"))
     indexes = conn.execute("PRAGMA index_list(protocol_executions)").fetchall()
     assert sum(row[2] == 1 and row[4] == 1 for row in indexes) == 3

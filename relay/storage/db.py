@@ -13,7 +13,7 @@ from pathlib import Path
 
 from relay.storage.models import room_name_key
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _APPEND_ONLY_TABLES = ("event_log", "evidence_records")
 
@@ -343,6 +343,75 @@ def _finalize_v8(conn: sqlite3.Connection) -> None:
 
 
 _MIGRATION_FINALIZERS = {8: _finalize_v8}
+
+
+#: P7.3 (App. D.3): Room-scoped canonical records — plan/decision/finding graph.
+#: ADD COLUMN / CREATE TABLE only; historical rows are untouched. The
+#: ``findings`` triggers are installed HERE, not in ``_V1_STATEMENTS``: a fresh
+#: database traverses v1→v9 in order, and the v1 append-only helper only knows
+#: the tables that exist at v1. The decision indexes/triggers make the
+#: supersession contract fail-closed at the storage layer:
+#: one promoted decision per reply, at most one successor per decision, and no
+#: self-supersession.
+_MIGRATIONS[9] = (
+    "ALTER TABLE artifacts ADD COLUMN room_id TEXT REFERENCES rooms(id)",
+    "CREATE INDEX IF NOT EXISTS idx_artifacts_room ON artifacts(room_id, kind)",
+    "ALTER TABLE decisions ADD COLUMN references_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE decisions ADD COLUMN source_reply_id TEXT",
+    "ALTER TABLE decisions ADD COLUMN supersedes_decision_id TEXT",
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_source_reply "
+        "ON decisions(source_reply_id) WHERE source_reply_id IS NOT NULL"
+    ),
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_supersedes "
+        "ON decisions(supersedes_decision_id) WHERE supersedes_decision_id IS NOT NULL"
+    ),
+    (
+        "CREATE TRIGGER IF NOT EXISTS decisions_no_self_supersede_insert "
+        "BEFORE INSERT ON decisions WHEN NEW.supersedes_decision_id IS NOT NULL "
+        "AND NEW.supersedes_decision_id = NEW.id "
+        "BEGIN SELECT RAISE(ABORT, 'a decision cannot supersede itself'); END;"
+    ),
+    (
+        "CREATE TRIGGER IF NOT EXISTS decisions_no_self_supersede_update "
+        "BEFORE UPDATE OF supersedes_decision_id ON decisions "
+        "WHEN NEW.supersedes_decision_id IS NOT NULL AND NEW.supersedes_decision_id = NEW.id "
+        "BEGIN SELECT RAISE(ABORT, 'a decision cannot supersede itself'); END;"
+    ),
+    """
+    CREATE TABLE findings (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL REFERENCES rooms(id),
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        review_artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+        review_run_id TEXT NOT NULL REFERENCES runs(id),
+        source_finding_id TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        requested_change TEXT NOT NULL,
+        validation_expectation TEXT NOT NULL,
+        location_json TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    (
+        "CREATE UNIQUE INDEX idx_findings_review_source "
+        "ON findings(review_artifact_id, source_finding_id)"
+    ),
+    "CREATE INDEX idx_findings_room ON findings(room_id, created_at, id)",
+    (
+        "CREATE TRIGGER IF NOT EXISTS findings_no_update "
+        "BEFORE UPDATE ON findings BEGIN "
+        "SELECT RAISE(ABORT, 'findings is append-only'); END;"
+    ),
+    (
+        "CREATE TRIGGER IF NOT EXISTS findings_no_delete "
+        "BEFORE DELETE ON findings BEGIN "
+        "SELECT RAISE(ABORT, 'findings is append-only'); END;"
+    ),
+)
 
 
 def connect(path: str | Path) -> sqlite3.Connection:

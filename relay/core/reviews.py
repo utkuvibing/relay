@@ -28,11 +28,13 @@ from relay.storage.models import (
     ReviewSourcesPayload,
     ReviewSubjectPayload,
     ReviewVerdict,
+    RoomPlanFreezePayload,
     Run,
     RunStatus,
     Task,
     ToolRun,
 )
+from relay.storage.store import SqliteRelayStore
 
 __all__ = [
     "FIX_PACKET_INSTRUCTIONS",
@@ -204,12 +206,58 @@ def _artifact_digest(artifact: Artifact, kind: ArtifactKind) -> str:
     return artifact_digest(content)
 
 
-def build_review_subject(inputs: ReviewInputs) -> ReviewSubjectPayload:
+def _plan_run_is_human_frozen(
+    store: SqliteRelayStore | None, inputs: ReviewInputs
+) -> bool:
+    """P7.3 (App. D.3): may this plan run be Room-scoped?
+
+    A human-frozen plan's authoring run is the planner's Room discussion run —
+    task-less by construction (``Run`` carries no ``room_id``). The relaxation
+    is deliberately narrow: the task must be Room-bound, the plan artifact must
+    be Room-scoped and named by a ``human:*`` freeze record for THIS task, and
+    that record's source run must be exactly the plan run being reviewed.
+    Everything else keeps today's ``foreign_task`` refusal.
+    """
+
+    task = inputs.task
+    plan = inputs.plan_artifact
+    if store is None or task.room_id is None or plan.room_id != task.room_id:
+        return False
+    for artifact in store.all_models(
+        Artifact,
+        "WHERE task_id = ? AND kind = ?",
+        [task.id, ArtifactKind.REPORT.value],
+        order_by="rowid ASC",
+    ):
+        content = artifact.content or ""
+        if '"relay.room.plan_freeze.v1"' not in content:
+            continue
+        try:
+            freeze = RoomPlanFreezePayload.model_validate_json(content)
+        except ValidationError:
+            continue
+        if (
+            freeze.task_id == task.id
+            and freeze.room_id == task.room_id
+            and freeze.plan_artifact_id == plan.id
+            and freeze.source_run_id == inputs.plan_run.id
+            and freeze.frozen_by.startswith("human:")
+        ):
+            return True
+    return False
+
+
+def build_review_subject(
+    inputs: ReviewInputs, *, store: SqliteRelayStore | None = None
+) -> ReviewSubjectPayload:
     """Validate persisted build inputs and bind their IDs/digests."""
 
     task_id = inputs.task.id
     if (
-        inputs.plan_run.task_id != task_id
+        (
+            inputs.plan_run.task_id != task_id
+            and not _plan_run_is_human_frozen(store, inputs)
+        )
         or inputs.implementation_run.task_id != task_id
         or inputs.plan_artifact.task_id != task_id
         or inputs.diff_artifact.task_id != task_id
@@ -305,10 +353,15 @@ def _reject_mismatched(expected: BaseModel, actual: BaseModel) -> None:
             _reject(code)
 
 
-def verify_review_subject(expected: ReviewSubjectPayload, inputs: ReviewInputs) -> None:
+def verify_review_subject(
+    expected: ReviewSubjectPayload,
+    inputs: ReviewInputs,
+    *,
+    store: SqliteRelayStore | None = None,
+) -> None:
     """Require persisted inputs to be the exact subject a review pinned."""
 
-    _reject_mismatched(expected, build_review_subject(inputs))
+    _reject_mismatched(expected, build_review_subject(inputs, store=store))
 
 
 def verify_review_sources(
@@ -316,10 +369,12 @@ def verify_review_sources(
     inputs: ReviewInputs,
     review_run: Run,
     review_output: Artifact,
+    *,
+    store: SqliteRelayStore | None = None,
 ) -> None:
     """Require all pinned source IDs and content digests to match exactly."""
 
-    actual_subject = build_review_subject(inputs)
+    actual_subject = build_review_subject(inputs, store=store)
     actual = build_review_sources(actual_subject, inputs, review_run, review_output)
     _reject_mismatched(expected, actual)
 
@@ -354,6 +409,8 @@ def build_fix_packet(
     inputs: ReviewInputs,
     review_run: Run,
     review_output: Artifact,
+    *,
+    store: SqliteRelayStore | None = None,
 ) -> FixPacketPayload:
     """Derive a packet from one canonical review and its exact live sources."""
 
@@ -365,7 +422,7 @@ def build_fix_packet(
     if content is None:
         _reject("missing_content")
     record = decode_review_record(content)
-    verify_review_sources(record.sources, inputs, review_run, review_output)
+    verify_review_sources(record.sources, inputs, review_run, review_output, store=store)
     if record.report.verdict is not ReviewVerdict.FINDINGS or not record.report.findings:
         _reject("invalid_context", "fix packets require actionable findings")
     if record.task_id != review_artifact.task_id:

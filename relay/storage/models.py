@@ -253,6 +253,10 @@ class Artifact(BaseModel):
 
     id: str = Field(default_factory=new_id)
     task_id: str | None = None
+    #: P7.3 (App. D.3): Room scope for canonical Room records — frozen plans,
+    #: their P6.4 revisions, and the freeze/revision link records. Additive and
+    #: nullable; standalone builds keep ``None`` (byte-identical behavior).
+    room_id: str | None = None
     run_id: str | None = None
     kind: ArtifactKind
     content_ref: str | None = Field(
@@ -658,6 +662,66 @@ class PlanRevisionPayload(BaseModel):
     author_run_id: _RequiredId
 
 
+class RoomPlanFreezePayload(BaseModel):
+    """Human freeze of one planner-authored plan (``relay.room.plan_freeze.v1``).
+
+    P7.3 (App. D.3): persisted as a ``REPORT`` artifact in the same
+    transaction as the frozen ``PLAN`` artifact, its ``PLAN_PRODUCED``
+    evidence, and the Room-scoped ``Task``. The freeze is the human's
+    acceptance: a planner can never accept its own plan into canonical state,
+    and this record is the chain edge when ``supersedes_plan_artifact_id`` is
+    present. Room membership of the source is proven through
+    ``source_message_id`` → its parent Room message → the ``MESSAGE_DELIVERED``
+    marker binding that parent to ``source_run_id`` — never by adding reply
+    metadata or a ``Run.room_id``.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.room.plan_freeze.v1"]
+    room_id: _RequiredId
+    task_id: _RequiredId
+    plan_artifact_id: _RequiredId
+    supersedes_plan_artifact_id: _RequiredId | None = None
+    #: The canonical planner clarification-response reply frozen by the human.
+    source_message_id: _RequiredId
+    #: The delivery run that authored that reply (task-less, Room-scoped).
+    source_run_id: _RequiredId
+    #: ``human:<id>`` — the freeze decision belongs to the human (App. D.3).
+    frozen_by: _RequiredId
+
+
+class RoomDecisionPayload(BaseModel):
+    """The strict object a planner emits on ``relay room decide`` (``relay.room_decision.v1``).
+
+    P7.3 (App. D.3/D.4): consequential Room exchanges promote into canonical
+    ``Decision`` records — Relay's explicit act, never a message side effect.
+    Only a newly ACCEPTED decision may supersede another decision, so a
+    ``reject`` outcome forbids ``supersedes_decision_id`` outright.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["relay.room_decision.v1"]
+    outcome: Literal["accept", "reject"]
+    statement: _BoundedText
+    rationale: _BoundedText | None = None
+    #: Canonical records this decision cites; each must resolve inside the Room.
+    references: tuple[StrictStr, ...] = Field(default_factory=tuple, max_length=16)
+    supersedes_decision_id: _RequiredId | None = None
+
+    @field_validator("statement", "rationale")
+    @classmethod
+    def _nonblank_field(cls, value: str | None) -> str | None:
+        return _nonblank(value) if value is not None else value
+
+    @model_validator(mode="after")
+    def _consistent(self) -> RoomDecisionPayload:
+        if self.outcome == "reject" and self.supersedes_decision_id is not None:
+            raise ValueError("a rejected decision cannot supersede another decision")
+        return self
+
+
 class BuildEscalationPayload(BaseModel):
     """Durable observation that a blocking build micro-exchange stalled (``relay.build.escalation.v1``).
 
@@ -683,6 +747,10 @@ class BuildEscalationPayload(BaseModel):
         "delivery_failed",
         "delivery_pending",
         "turn_budget_exhausted",
+        #: P7.3: a Room-bound task's micro-exchange was refused by the Room's
+        #: OPEN fence (P7.1 traffic fence) — the task parks until the human
+        #: resumes the Room; nothing partial is ever persisted.
+        "room_closed",
     ]
     detail: _BoundedText
 
@@ -732,6 +800,39 @@ class Decision(BaseModel):
     status: DecisionStatus = DecisionStatus.PROPOSED
     room_id: str | None = None
     task_id: str | None = None
+    #: P7.3 (App. D.3/D.4): canonical records the decision cites — validated to
+    #: resolve inside the decision's Room before promotion.
+    references: list[str] = Field(default_factory=list)
+    #: P7.3: the canonical reply this decision was promoted from. The durable
+    #: idempotence key for promotion (one promoted decision per reply).
+    source_reply_id: str | None = None
+    #: P7.3: the canonical supersession edge — only an ACCEPTED decision may
+    #: supersede a currently-ACCEPTED predecessor. Never inferred from prose.
+    supersedes_decision_id: str | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class Finding(BaseModel):
+    """P7.3 (App. D.3): one canonical Room-scoped review finding.
+
+    Derived deterministically from a canonical ``relay.review.record.v1``
+    report of a Room-bound task — individually addressable so decisions can
+    cite the finding that motivated them. Append-only: rows are never mutated.
+    """
+
+    id: str = Field(default_factory=new_id)
+    room_id: str
+    task_id: str
+    review_artifact_id: str
+    review_run_id: str
+    #: The reviewer's per-report finding id (unique within one review record).
+    source_finding_id: str
+    severity: ReviewSeverity
+    title: str
+    description: str
+    requested_change: str
+    validation_expectation: str
+    location: ReviewLocationPayload | None = None
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -794,6 +895,11 @@ class EventType(str, enum.Enum):
     DECISION_PROPOSED = "decision_proposed"
     DECISION_ACCEPTED = "decision_accepted"
     DECISION_REJECTED = "decision_rejected"
+    #: P7.3: a canonical Room decision was superseded by a newer ACCEPTED
+    #: decision. Room-scoped marker referencing ``decision:<old>`` and
+    #: ``decision:<new>``; the canonical edge itself is
+    #: ``Decision.supersedes_decision_id``.
+    DECISION_SUPERSEDED = "decision_superseded"
     #: P4.2 (frozen plan D10): delivery BINDING marker — Relay bound a
     #: persisted Message to a concrete recipient Run. Committed atomically in
     #: the delivery run's pre-provider Tx1; retained for failed runs (the
@@ -811,6 +917,17 @@ class EventType(str, enum.Enum):
     ROOM_RESUMED = "room_resumed"
     ROOM_CLOSED = "room_closed"
     ROOM_SEAT_BOUND = "room_seat_bound"
+    #: P7.3: the HUMAN froze a planner-authored plan into canonical Room state.
+    #: Room-scoped entry marker for the frozen plan; never emitted for P6.4
+    #: plan revisions (those are ``ROOM_PLAN_REVISED``).
+    ROOM_PLAN_FROZEN = "room_plan_frozen"
+    #: P7.3: P6.4 promoted a plan-changing decision for a Room-bound task, so
+    #: the Room's canonical plan tip moved. Room-scoped entry marker for the
+    #: revised plan, referencing its predecessor and full provenance.
+    ROOM_PLAN_REVISED = "room_plan_revised"
+    #: P7.3: a canonical Room-scoped finding was derived from a canonical
+    #: review record of a Room-bound task.
+    FINDING_RECORDED = "finding_recorded"
 
 
 class EvidenceRecord(BaseModel):

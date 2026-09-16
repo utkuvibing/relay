@@ -29,7 +29,9 @@ from relay.storage.models import (
     ReviewSeverity,
     ReviewVerdict,
     Room,
+    RoomDecisionPayload,
     RoomMember,
+    RoomPlanFreezePayload,
     Run,
     RunStatus,
     Task,
@@ -388,6 +390,66 @@ class TestBuildResumePayloads:
                     "file_count": 0,
                     "provider_note": "x",
                 }
+            )
+
+
+class TestRoomCanonicalRecordPayloads:
+    """P7.3 (App. D.3): strict Room payload contracts for freeze and decisions."""
+
+    def test_plan_freeze_payload_roundtrips_and_forbids_extras(self):
+        payload = RoomPlanFreezePayload(
+            schema_version="relay.room.plan_freeze.v1",
+            room_id="r1",
+            task_id="t1",
+            plan_artifact_id="a1",
+            source_message_id="m2",
+            source_run_id="run1",
+            frozen_by="human:utku",
+        )
+        assert payload.supersedes_plan_artifact_id is None
+        decoded = RoomPlanFreezePayload.model_validate_json(payload.model_dump_json())
+        assert decoded == payload
+        with pytest.raises(ValidationError):
+            RoomPlanFreezePayload.model_validate(
+                {
+                    "schema_version": "relay.room.plan_freeze.v1",
+                    "room_id": "r1",
+                    "task_id": "t1",
+                    "plan_artifact_id": "a1",
+                    "source_message_id": "m2",
+                    "source_run_id": "run1",
+                    "frozen_by": "human:utku",
+                    "frozen_at": "2026-01-01T00:00:00+00:00",
+                }
+            )
+
+    def test_decision_payload_accepts_and_rejects_supersession(self):
+        accepted = RoomDecisionPayload(
+            schema_version="relay.room_decision.v1",
+            outcome="accept",
+            statement="use bundle registries",
+            supersedes_decision_id="d1",
+            references=("finding:f1",),
+        )
+        assert accepted.supersedes_decision_id == "d1"
+        rejected = RoomDecisionPayload(
+            schema_version="relay.room_decision.v1",
+            outcome="reject",
+            statement="keep the current design",
+        )
+        assert rejected.supersedes_decision_id is None
+        with pytest.raises(ValidationError, match="rejected decision cannot supersede"):
+            RoomDecisionPayload(
+                schema_version="relay.room_decision.v1",
+                outcome="reject",
+                statement="no",
+                supersedes_decision_id="d1",
+            )
+        with pytest.raises(ValidationError):
+            RoomDecisionPayload(
+                schema_version="relay.room_decision.v1",
+                outcome="accept",
+                statement="   ",
             )
 
 

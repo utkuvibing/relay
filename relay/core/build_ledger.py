@@ -64,6 +64,7 @@ from relay.storage.models import (
     Message,
     MessageType,
     PlanRevisionPayload,
+    RoomPlanFreezePayload,
     Run,
     RunStatus,
     Task,
@@ -75,6 +76,10 @@ from relay.storage.store import SqliteRelayStore
 #: Marker sender identity — the same contract family as P4.2's
 #: ``relay:delivery`` MESSAGE_DELIVERED provenance.
 BUILD_SENDER = "relay:build"
+
+#: The P4.2 delivery-binding marker producer (App. A.1); kept local because
+#: importing ``relay.core.delivery`` here would close an import cycle.
+_DELIVERY_SENDER = "relay:delivery"
 
 BuildStage = Literal["plan", "implement", "fix", "review"]
 _BUILD_STAGES = frozenset({"plan", "implement", "fix", "review"})
@@ -325,6 +330,88 @@ def _validate_continuation(
             f"continuation ref 'message:{reply_id}' is not a canonical "
             f"answer to signal 'message:{message_id}'",
         )
+
+
+def _validate_plan_freeze(
+    store: SqliteRelayStore,
+    evidence: EvidenceStore,
+    task_id: str,
+    freeze: RoomPlanFreezePayload,
+    tip: Artifact,
+) -> None:
+    """Fail-closed check that a human freeze edge is fully provenance-bound.
+
+    P7.3 (App. D.3): the ledger re-derives the whole chain independently — a
+    freeze edge must bind the full causal chain
+
+        planner discussion reply -> its parent Room request -> the delivery run
+        bound to that parent -> the new PLAN -> PLAN_PRODUCED evidence
+
+    — or refuse ``ledger_inconsistent``. A planner can never accept its own
+    plan: only ``human:*`` producers freeze (checked at decode time), and only
+    a normal clarification request/response exchange qualifies.
+    """
+
+    def _inconsistent(detail: str) -> NoReturn:
+        _refuse(
+            "ledger_inconsistent",
+            f"plan freeze '{freeze.plan_artifact_id}': {detail}",
+        )
+
+    reply = store.load_model(Message, freeze.source_message_id)
+    run = store.load_model(Run, freeze.source_run_id)
+    if reply is None or run is None:
+        _inconsistent("source reply or authoring run is missing")
+    if reply.room_id != freeze.room_id or reply.run_id != freeze.source_run_id:
+        _inconsistent("source reply contradicts the freeze record")
+    if reply.reply_to_id is None or reply.blocking:
+        _inconsistent("source reply is not a non-blocking canonical answer")
+    parent = store.load_model(Message, reply.reply_to_id)
+    if (
+        parent is None
+        or parent.room_id != freeze.room_id
+        or parent.task_id is not None
+        or parent.recipient_role != AgentRole.PLANNER.value
+        or parent.recipient != reply.sender
+        or parent.type is not MessageType.CLARIFICATION_REQUEST
+        or reply.type is not MessageType.CLARIFICATION_RESPONSE
+    ):
+        _inconsistent("source reply is not a canonical planner discussion answer")
+    if (
+        run.agent != reply.sender
+        or run.role != AgentRole.PLANNER.value
+        or run.status is not RunStatus.SUCCEEDED
+    ):
+        _inconsistent("source run is not a successful planner run")
+    delivery_bound = any(
+        f"message:{parent.id}" in marker.references
+        and f"run:{freeze.source_run_id}" in marker.references
+        and marker.sender == _DELIVERY_SENDER
+        and marker.room_id == freeze.room_id
+        for marker in store.all_models(
+            EventLogEntry,
+            "WHERE type = ?",
+            [EventType.MESSAGE_DELIVERED.value],
+            order_by="sequence ASC",
+        )
+    )
+    if not delivery_bound:
+        _inconsistent("source parent is not delivery-bound to the freeze's run")
+
+    if tip.kind is not ArtifactKind.PLAN or tip.task_id != task_id:
+        _inconsistent("the frozen plan artifact is not this task's PLAN")
+    if tip.room_id != freeze.room_id:
+        _inconsistent("the frozen plan artifact is not Room-scoped")
+    if tip.run_id != freeze.source_run_id:
+        _inconsistent("the frozen plan artifact is not bound to the source run")
+    if not any(
+        record.kind is EvidenceKind.PLAN_PRODUCED
+        and record.run_id == freeze.source_run_id
+        and record.artifact_id == tip.id
+        and record.produced_by == f"agent:{run.agent}"
+        for record in evidence.records_for_task(task_id, EvidenceKind.PLAN_PRODUCED)
+    ):
+        _inconsistent("PLAN_PRODUCED evidence is missing or its producer is not the planner run")
 
 
 def _validate_plan_revision(
@@ -633,15 +720,62 @@ def derive_position(
             )
         revisions.append((artifact.id, revision))
 
+    # --- P7.3 human freeze records (Room-bound tasks) ---------------------
+    # Each entry: (report artifact id, decoded payload) — the human-acceptance
+    # chain edges. A freeze record is authoritative only for the Room-bound
+    # task it names, and only when a human froze it.
+    freezes: list[tuple[str, RoomPlanFreezePayload]] = []
+    for artifact in store.all_models(
+        Artifact,
+        "WHERE task_id = ? AND kind = ?",
+        [task.id, ArtifactKind.REPORT.value],
+    ):
+        content = artifact.content or ""
+        if '"relay.room.plan_freeze.v1"' not in content:
+            continue
+        try:
+            freeze = RoomPlanFreezePayload.model_validate_json(content)
+        except pydantic.ValidationError:
+            _refuse(
+                "ledger_inconsistent",
+                f"plan freeze record '{artifact.id}' is undecodable",
+            )
+        if freeze.task_id != task.id:
+            _refuse(
+                "ledger_inconsistent",
+                f"plan freeze record '{artifact.id}' names a different task",
+            )
+        if task.room_id is None or freeze.room_id != task.room_id:
+            _refuse(
+                "ledger_inconsistent",
+                f"plan freeze record '{artifact.id}' is not scoped to this task's Room",
+            )
+        if not freeze.frozen_by.startswith("human:"):
+            _refuse(
+                "ledger_inconsistent",
+                f"plan freeze record '{artifact.id}' was not frozen by a human",
+            )
+        freezes.append((artifact.id, freeze))
+
     plan_artifact: Artifact | None = None
     plan_run: Run | None = None
     if plans:
-        # Exactly one ROOT plan — authored by a bound plan-stage run.
-        roots = [
+        # Exactly one ROOT plan — authored by a bound plan-stage run, or
+        # (P7.3) frozen by a human from a planner's Room discussion reply.
+        stage_roots = [
             p
             for p in plans
             if p.run_id is not None and bound.get(p.run_id, ("", 0, None, None))[0] == "plan"
         ]
+        frozen_roots = [
+            p
+            for p in plans
+            if any(
+                freeze.plan_artifact_id == p.id and freeze.supersedes_plan_artifact_id is None
+                for _aid, freeze in freezes
+            )
+        ]
+        roots = [*stage_roots, *frozen_roots]
         if len(roots) != 1:
             _refuse(
                 "ledger_inconsistent",
@@ -649,13 +783,22 @@ def derive_position(
             )
         current = roots[0]
         seen = {current.id}
-        consumed: set[str] = set()
+        consumed: set[str] = {
+            aid
+            for aid, freeze in freezes
+            if freeze.plan_artifact_id == current.id
+            and freeze.supersedes_plan_artifact_id is None
+        }
         while True:
-            successors = [
-                (aid, r)
-                for aid, r in revisions
-                if r.supersedes_plan_artifact_id == current.id
-            ]
+            successors: list[
+                tuple[str, PlanRevisionPayload | RoomPlanFreezePayload, str]
+            ] = []
+            for aid, revision in revisions:
+                if revision.supersedes_plan_artifact_id == current.id:
+                    successors.append((aid, revision, "revision"))
+            for aid, freeze in freezes:
+                if freeze.supersedes_plan_artifact_id == current.id:
+                    successors.append((aid, freeze, "freeze"))
             if len(successors) > 1:
                 _refuse(
                     "ledger_inconsistent",
@@ -663,22 +806,27 @@ def derive_position(
                 )
             if not successors:
                 break
-            revision_id, revision = successors[0]
+            revision_id, revision, edge_kind = successors[0]
             tip = next((p for p in plans if p.id == revision.plan_artifact_id), None)
             if tip is None or tip.id in seen:
                 _refuse(
                     "ledger_inconsistent",
                     f"plan revision '{revision.plan_artifact_id}' is missing or cyclic",
                 )
-            _validate_plan_revision(
-                store,
-                evidence,
-                task.id,
-                revision,
-                tip,
-                frozenset(bound),
-                delivery_runs_for_message,
-            )
+            if edge_kind == "revision":
+                assert isinstance(revision, PlanRevisionPayload)  # tag guarantees it
+                _validate_plan_revision(
+                    store,
+                    evidence,
+                    task.id,
+                    revision,
+                    tip,
+                    frozenset(bound),
+                    delivery_runs_for_message,
+                )
+            else:
+                assert isinstance(revision, RoomPlanFreezePayload)  # tag guarantees it
+                _validate_plan_freeze(store, evidence, task.id, revision, tip)
             consumed.add(revision_id)
             current = tip
             seen.add(current.id)
@@ -696,6 +844,13 @@ def derive_position(
                 f"task '{task.id}' has plan revision records outside the "
                 f"canonical chain: {', '.join(orphan_revisions)}",
             )
+        orphan_freezes = [aid for aid, _ in freezes if aid not in consumed]
+        if orphan_freezes:
+            _refuse(
+                "ledger_inconsistent",
+                f"task '{task.id}' has plan freeze records outside the "
+                f"canonical chain: {', '.join(orphan_freezes)}",
+            )
         plan_artifact = current
         run = store.load_model(Run, plan_artifact.run_id or "")
         if run is None:
@@ -704,7 +859,7 @@ def derive_position(
                 f"plan artifact '{plan_artifact.id}' has no resolvable author run",
             )
         plan_run = run
-    elif revisions:
+    elif revisions or freezes:
         _refuse(
             "ledger_inconsistent",
             f"task '{task.id}' has plan revision records but no plan artifacts",
