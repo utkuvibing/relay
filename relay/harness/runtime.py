@@ -283,6 +283,29 @@ class HarnessAgent(Agent):
         """
         return []
 
+    # -- session continuation seam (App. C.2/C.4, D.10; consumed in P7.4) ----
+    def continuation_ref(self) -> str | None:
+        """In-memory continuation handle from the last parse; default: none.
+
+        Adapters that parse a non-secret session/conversation/thread id
+        override this. The handle is NEVER persisted here — persistence
+        happens only via :meth:`run_observation` when the profile opts in
+        (``persist_session_ref``), and consumption happens only through
+        ``AgentRequest.metadata["resume_session_ref"]``.
+        """
+        return None
+
+    def resume_arguments(self, session_ref: str) -> tuple[str, ...]:
+        """Translate a continuation handle into resume argv; default: refuse.
+
+        Only adapters declaring ``SESSION_RESUME`` override this. Invalid
+        handles fail typed — delivery validates before Tx1 so a bad ref is
+        a refusal with zero store delta, never a silent fresh run.
+        """
+        from relay.harness.errors import UnsupportedCapability as _Unsupported
+
+        raise _Unsupported(f"{self.name}: session resume is not supported")
+
     # -- execution ---------------------------------------------------------------
 
     def _prepared_cwd(self) -> Path:
@@ -314,13 +337,32 @@ class HarnessAgent(Agent):
         """Canonical ordering: invocation · profile.extra_args · grant flags.
 
         Grant flags come last so adapters can rely on positional override;
-        the prompt NEVER rides argv (stdin channel instead).
+        the prompt NEVER rides argv (stdin channel instead). P7.4 resume
+        flags append AFTER grant flags via :meth:`resume_argv_for` — they
+        are orthogonal to authorization, never a substitute for it.
         """
         return (
             *self.invocation_argv(resolved),
             *self._profile_extra_args(),
             *grant.additional_args,
         )
+
+    def resume_argv_for(self, request: AgentRequest) -> tuple[str, ...]:
+        """Resume argv for one request's ``metadata["resume_session_ref"]``.
+
+        Empty when the request carries no handle. A present handle demands
+        the ``SESSION_RESUME`` capability and a valid translation — invalid
+        handles fail typed (fail-closed, never a silent fresh run).
+        """
+        raw = request.metadata.get("resume_session_ref")
+        if raw is None:
+            return ()
+        if not isinstance(raw, str) or not raw:
+            from relay.harness.errors import UnsupportedCapability as _Unsupported
+
+            raise _Unsupported(f"{self.name}: invalid session reference {raw!r}")
+        self.requires(HarnessCapability.SESSION_RESUME)
+        return self.resume_arguments(raw)
 
     def _failure_message(self, prefix: str, outcome_stderr: str, *, semantics_hint: str) -> str:
         tail = redact(outcome_stderr.strip())[-_STDERR_TAIL_CHARS:]
@@ -333,7 +375,7 @@ class HarnessAgent(Agent):
         resolved = await self._discover_once()
 
         spec = LaunchSpec(
-            argv=self.compose_argv(resolved, grant),
+            argv=(*self.compose_argv(resolved, grant), *self.resume_argv_for(request)),
             cwd=self._prepared_cwd(),
             env=self._child_env(),
             timeout_s=self._timeout_s(),

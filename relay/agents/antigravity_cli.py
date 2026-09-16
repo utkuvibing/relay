@@ -266,14 +266,21 @@ class AntigravityCLIAdapter(HarnessAgent):
 
     def run_observation(self) -> RunObservation | None:
         info = self._info
+        persisted = getattr(self._profile, "persist_session_ref", False)
         return RunObservation(
             resolved_model=None,  # envelope carries no model field (D2)
             adapter_version=info.version if info else None,
             backend="harness",
-            # external_session_ref intentionally None: C.4 persistence needs
-            # an explicit config opt-in that does not exist yet (P7 seam).
-            external_session_ref=None,
+            # P7.4 (App. C.4): the parsed conversation id persists ONLY under
+            # the explicit profile opt-in; otherwise None (pre-P7.4 behavior).
+            external_session_ref=(
+                self.last_session_ref if persisted else None
+            ),
         )
+
+    def continuation_ref(self) -> str | None:
+        """The last parsed conversation id for P7.4 resume consumers."""
+        return self.last_session_ref
 
     def tool_observations(self) -> list[ToolObservation]:
         """Single-json mode exposes no per-tool stream — always empty."""

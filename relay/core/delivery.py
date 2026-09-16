@@ -92,6 +92,7 @@ __all__ = [
     "InvalidReplyTypeRefusal",
     "MessageDelivery",
     "ThreadDepthRefusal",
+    "latest_session_ref",
 ]
 
 #: Producer convention (App. A.1): the delivery machinery is a relay:*
@@ -157,6 +158,37 @@ class DeliveryReplyOutcome:
     reply: Message | None = None
 
 
+def latest_session_ref(
+    store: SqliteRelayStore, room_id: str, agent_name: str
+) -> str | None:
+    """Newest persisted ``external_session_ref`` for one Room seat (P7.4).
+
+    Scans ``MESSAGE_DELIVERED`` markers in reverse sequence order for the
+    recipient agent and returns the first non-empty session handle on the
+    bound Run. Pure read — no writes, no validation of the handle shape
+    (callers validate via the adapter's ``resume_arguments`` before use).
+    """
+    for marker in store.all_models(
+        EventLogEntry,
+        "WHERE type = ? AND room_id = ?",
+        [EventType.MESSAGE_DELIVERED.value, room_id],
+        order_by="sequence DESC",
+    ):
+        if marker.recipient != agent_name:
+            continue
+        run_id: str | None = None
+        for ref in marker.references:
+            if ref.startswith("run:"):
+                run_id = ref[4:]
+                break
+        if run_id is None:
+            continue
+        run = store.load_model(Run, run_id)
+        if run is not None and run.external_session_ref:
+            return run.external_session_ref
+    return None
+
+
 class MessageDelivery:
     """Deliver one persisted message into one recipient agent run."""
 
@@ -196,7 +228,12 @@ class MessageDelivery:
         self._prepared_recipients[recipient] = self._construct_recipient(recipient)
 
     async def deliver(
-        self, message_id: str, *, prompt_suffix: str = ""
+        self,
+        message_id: str,
+        *,
+        prompt_suffix: str = "",
+        resume_session_ref: str | None = None,
+        extra_context_refs: list[str] | None = None,
     ) -> DeliveryOutcome:
         """Bind ``message_id`` to a fresh recipient run and execute it.
 
@@ -207,10 +244,19 @@ class MessageDelivery:
 
         ``prompt_suffix`` rides OUTSIDE the frozen D15 envelope (the P6.4
         appendix pattern); it defaults to empty, so ordinary delivery prompts
-        stay byte-identical.
+        stay byte-identical. ``resume_session_ref`` rides
+        ``AgentRequest.metadata`` to SESSION_RESUME-capable harness agents;
+        it defaults to None (honest fresh run, byte-identical behavior).
+        ``extra_context_refs`` appends caller-derived provenance (P7.4 Room
+        context) after the verbatim message references; it defaults to empty
+        so existing ``context_refs == message.references`` assertions hold.
         """
         return await self._deliver(
-            message_id, admitted_reply_type=None, prompt_suffix=prompt_suffix
+            message_id,
+            admitted_reply_type=None,
+            prompt_suffix=prompt_suffix,
+            resume_session_ref=resume_session_ref,
+            extra_context_refs=extra_context_refs,
         )
 
     async def _deliver(
@@ -219,6 +265,8 @@ class MessageDelivery:
         *,
         admitted_reply_type: MessageType | None,
         prompt_suffix: str = "",
+        resume_session_ref: str | None = None,
+        extra_context_refs: list[str] | None = None,
     ) -> DeliveryOutcome:
         """Initiate delivery, optionally binding a pre-admitted reply type."""
         message = self._store.load_model(Message, message_id)
@@ -242,6 +290,10 @@ class MessageDelivery:
 
         prepared = self._prepared_recipients.pop(recipient, None)
         agent, model = prepared if prepared is not None else self._construct_recipient(recipient)
+        metadata: dict[str, object] = {}
+        if resume_session_ref is not None:
+            self._validate_resume_ref(agent, recipient, resume_session_ref)
+            metadata["resume_session_ref"] = resume_session_ref
         request = AgentRequest(
             prompt=self._envelope(message) + prompt_suffix,
             role=role,
@@ -249,7 +301,10 @@ class MessageDelivery:
             room_id=message.room_id,
             # D15 pass-through: semantic references stay canonical on the
             # Message row; the raw list rides the existing request channel.
-            context_refs=list(message.references),
+            # P7.4 appends caller-derived Room-context provenance after the
+            # verbatim references (empty by default — existing assertions hold).
+            context_refs=[*message.references, *(extra_context_refs or [])],
+            metadata=metadata,
         )
 
         ask = await run_ask(
@@ -273,6 +328,34 @@ class MessageDelivery:
             ) from exc
         return agent, model
 
+    @staticmethod
+    def _validate_resume_ref(agent: Agent, recipient: str, session_ref: str) -> None:
+        """Pre-Tx1 resume validation (P7.4): capability + shape, zero delta.
+
+        Only harness agents declaring SESSION_RESUME may resume, and the
+        handle must survive the adapter's own ``resume_arguments`` shape
+        check. Anything else is a typed refusal BEFORE the binding Tx1 —
+        never a silent fresh run.
+        """
+        from relay.harness.capabilities import HarnessCapability
+        from relay.harness.errors import UnsupportedCapability
+        from relay.harness.runtime import HarnessAgent
+
+        if not isinstance(agent, HarnessAgent):
+            raise DeliveryRefusal(
+                f"recipient '{recipient}' cannot resume an external session: "
+                "API-family agents always run fresh from canonical records"
+            )
+        if HarnessCapability.SESSION_RESUME not in agent.capabilities_set():
+            raise DeliveryRefusal(
+                f"recipient '{recipient}' does not declare session_resume — "
+                "honest fresh run required"
+            )
+        try:
+            agent.resume_arguments(session_ref)
+        except UnsupportedCapability as exc:
+            raise DeliveryRefusal(f"invalid session reference: {exc}") from exc
+
     async def deliver_and_reply(
         self,
         message_id: str,
@@ -280,6 +363,8 @@ class MessageDelivery:
         reply_type: MessageType | None = None,
         max_thread_depth: int = DEFAULT_MAX_THREAD_DEPTH,
         prompt_suffix: str = "",
+        resume_session_ref: str | None = None,
+        extra_context_refs: list[str] | None = None,
     ) -> DeliveryReplyOutcome:
         """P4.3 (frozen plan D12-D15): deliver message and materialize reply idempotently.
 
@@ -429,6 +514,8 @@ class MessageDelivery:
                 actual_reply_type if self._policy is not None else None
             ),
             prompt_suffix=prompt_suffix,
+            resume_session_ref=resume_session_ref,
+            extra_context_refs=extra_context_refs,
         )
         if outcome.ask.response is None:
             return DeliveryReplyOutcome(message=message, ask=outcome.ask, reply=None)

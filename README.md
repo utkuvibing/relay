@@ -143,6 +143,15 @@ build micro-interactions resolve roles through the Room's persisted seats, and a
 closed Room parks them with a durable `room_closed` escalation until the Room is
 resumed.
 
+Every Room discussion delivery reconstructs participant context from canonical
+records — role, Room, task, current plan and its supersession chain, accepted
+decisions, unresolved blocking communication, relevant notes, current findings,
+relevant artifacts/diffs, evidence, and bounded history excerpts — never a
+transcript replay. External harness sessions resume only when the agent declares
+`session_resume` and the profile opts into handle persistence
+(`harness.persist_session_ref: true`); otherwise the prompt honestly states the
+fresh-run fallback and the canonical store stays the source of truth.
+
 ### Adapters and authentication
 
 The current adapter registry includes OpenAI-compatible API adapters and harness adapters for Codex CLI, Claude Code, and Antigravity CLI. API keys stay in environment variables. Harnesses own their login and session authentication.
@@ -153,12 +162,14 @@ These are roadmap items, not current capabilities:
 
 - P5 remaining: semantic loop/convergence detection; discussion CLI, bounded protocols, policy, budgets, and stored escalation notices are available;
 - P6 remaining: semantic loop/convergence detection; bounded micro-interactions inside stages, structured findings, deterministic fix packets, the bounded fix loop (attempt-scoped cumulative diffs, per-attempt re-verification and re-review), and `relay continue` resume for parked builds are available;
-- P7 remaining: participant context reconstruction and external-session
-  continuation; persistent Room lifecycle, stable seats, targeted Room chat,
-  traffic fencing, the canonical feed, the canonical plan/decision/finding graph
-  (human freeze with execution binding, P6.4 plan revisions as Room history,
-  promoted decisions, canonical findings, `relay room graph`), and seat-routed
-  Room-bound micro-interactions are available;
+- P7: persistent Rooms are available — Room lifecycle, stable seats, targeted
+  Room chat, traffic fencing, the canonical feed, the canonical
+  plan/decision/finding graph (human freeze with execution binding, P6.4 plan
+  revisions as Room history, promoted decisions, canonical findings,
+  `relay room graph`), seat-routed Room-bound micro-interactions,
+  per-participant canonical context reconstruction (never transcript replay),
+  and honest external-session continuation (capability-gated, opt-in
+  persistence, fresh-run fallback);
 - P8: decision provenance;
 - P9: Relay server;
 - P10: MCP and chat interface integration;

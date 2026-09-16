@@ -228,8 +228,8 @@ class CodexCLIAdapter(HarnessAgent):
             resolved_model=None,
             adapter_version=info.version if info else None,
             backend="harness",
-            # external_session_ref intentionally None: C.4 persistence needs
-            # an explicit config opt-in that does not exist yet (P7 seam).
+            # P7.4: Codex declares no SESSION_RESUME, so every delivery is an
+            # honest fresh run — no session handle is persisted by design.
             external_session_ref=None,
         )
 

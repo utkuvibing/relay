@@ -50,6 +50,14 @@ class HarnessAgentConfig(BaseModel):
     timeout_seconds: float = Field(default=300, gt=0, le=_MAX_HARNESS_TIMEOUT_S)
     grant: ExecutionGrantKind | None = None
     auth_probe: bool = True
+    persist_session_ref: bool = Field(
+        default=False,
+        description=(
+            "P7.4 opt-in: persist the harness-reported non-secret session "
+            "reference (external_session_ref) so later Room deliveries may "
+            "resume it. Default off — no session handle is stored."
+        ),
+    )
 
 
 class AgentConfig(BaseModel):
