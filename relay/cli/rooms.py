@@ -1,4 +1,4 @@
-"""CLI surface for persistent Room lifecycle and targeted exchange (P7.1-P7.3)."""
+"""CLI surface for persistent Room lifecycle and targeted exchange (P7.1-P7.4)."""
 
 from __future__ import annotations
 
@@ -262,8 +262,19 @@ def ask_room(
                 blocking=False,
             )
         )
+        context_suffix, fallback_suffix, extra_refs, resume_ref = (
+            _room_participant_delivery(store, room, role, agent_name, delivery)
+        )
         try:
-            outcome = asyncio.run(delivery.deliver_and_reply(request.id))
+            outcome = asyncio.run(
+                delivery.deliver_and_reply(
+                    request.id,
+                    prompt_suffix=context_suffix,
+                    fallback_prompt_suffix=fallback_suffix,
+                    extra_context_refs=extra_refs,
+                    resume_session_ref=resume_ref,
+                )
+            )
         except ClosedRoomError:
             delivery_started = bool(delivery.deliveries_for_message(request.id))
             raise
@@ -359,11 +370,17 @@ def decide_room(
                 blocking=False,
             )
         )
+        context_suffix, fallback_suffix, extra_refs, resume_ref = (
+            _room_participant_delivery(store, room, role, agent_name, delivery)
+        )
         outcome = asyncio.run(
             delivery.deliver_and_reply(
                 request.id,
                 reply_type=MessageType.FINAL_POSITION,
-                prompt_suffix=ROOM_DECISION_CONTRACT,
+                prompt_suffix=context_suffix + ROOM_DECISION_CONTRACT,
+                fallback_prompt_suffix=fallback_suffix + ROOM_DECISION_CONTRACT,
+                extra_context_refs=extra_refs,
+                resume_session_ref=resume_ref,
             )
         )
         if outcome.ask.error is not None:
@@ -603,6 +620,76 @@ def _graph_view(graph: object) -> dict:
             for node in graph.findings  # type: ignore[attr-defined]
         ],
     }
+
+
+def _room_participant_delivery(
+    store: SqliteRelayStore,
+    room: Room,
+    role: str,
+    agent_name: str,
+    delivery: MessageDelivery,
+) -> tuple[str, str, list[str], str | None]:
+    """P7.4 (App. D.10): reconstructed Room context + honest continuation.
+
+    Builds the deterministic participant-context block from canonical
+    records, resolves a resumable prior session handle only when the seat's
+    agent declares SESSION_RESUME *and* opts into persistence *and* a prior
+    handle for THIS SEAT validates — otherwise an honest fresh run. The
+    seat's agent instance comes from ``delivery.recipient_for_inspection``:
+    the SAME prepared delivery recipient, never a second independently
+    constructed probe.
+
+    Returns ``(prompt_suffix, fallback_prompt_suffix, extra_context_refs,
+    resume_session_ref)`` for :meth:`MessageDelivery.deliver_and_reply`:
+    the primary suffix claims ``resumed:<ref>`` only when a resume will
+    actually be attempted, and the fallback suffix — used only when the
+    harness positively rejects the handle — declares ``resume-rejected``
+    instead, so a fallback prompt never claims a resume that did not
+    happen. The block rides OUTSIDE the frozen D15 envelope so non-Room
+    deliveries stay byte-identical.
+    """
+    from dataclasses import replace
+
+    from relay.core.delivery import latest_session_ref
+    from relay.core.room_context import (
+        build_room_participant_context,
+        render_room_context,
+        room_context_refs,
+    )
+    from relay.harness.capabilities import HarnessCapability
+    from relay.harness.errors import UnsupportedCapability
+    from relay.harness.runtime import HarnessAgent
+
+    resume_ref: str | None = None
+    agent = delivery.recipient_for_inspection(agent_name)
+    if isinstance(agent, HarnessAgent) and (
+        HarnessCapability.SESSION_RESUME in agent.capabilities_set()
+    ):
+        profile = agent.profile
+        if profile is not None and bool(getattr(profile, "persist_session_ref", False)):
+            prior = latest_session_ref(store, room.id, agent_name, role)
+            if prior is not None:
+                try:
+                    agent.resume_arguments(prior)
+                except UnsupportedCapability:
+                    # Invalid persisted handle: honest fresh run, not fatal.
+                    prior = None
+                else:
+                    resume_ref = prior
+    ctx = build_room_participant_context(
+        store,
+        room_id=room.id,
+        role=role,
+        agent_name=agent_name,
+        continuity="fresh",
+    )
+    refs = room_context_refs(ctx)
+    fresh_suffix = render_room_context(ctx)
+    if resume_ref is None:
+        return fresh_suffix, fresh_suffix, refs, None
+    resumed_suffix = render_room_context(replace(ctx, continuity=f"resumed:{resume_ref}"))
+    rejected_suffix = render_room_context(replace(ctx, continuity="resume-rejected"))
+    return resumed_suffix, rejected_suffix, refs, resume_ref
 
 
 def _select_room(store: SqliteRelayStore, workspace: Workspace, selector: str | None) -> Room:

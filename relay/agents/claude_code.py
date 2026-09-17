@@ -36,10 +36,15 @@ Security posture (App. B.3/C.4/C.5), frozen plan rev 2:
   flip C.4 forbids. It remains reachable only through user-supplied
   ``harness.extra_args``, which then carry the auth responsibility.
 
-Session note (frozen-plan D5b): the envelope's ``session_id`` is parsed and
-validated but NOT persisted — ``external_session_ref`` stays ``None`` because
-no generic config opt-in exists yet (P7 seam); resume argv translation
-(``--resume <ref>``) is implemented and unit-tested in memory only.
+Session note (P7.4, supersedes frozen-plan D5b): the envelope's
+``session_id`` is parsed, validated, and surfaced via
+``run_observation().external_session_ref`` — persisted onto the Run row
+ONLY under the explicit ``persist_session_ref: true`` profile opt-in
+(default off). Delivery may then pass ``--resume <id>`` for the same Room
+seat; a stale/expired/invalid ref is positively identified by
+``resume_rejected`` and surfaces as ``SessionResumeUnavailable`` so the
+delivery layer can fall back to a fresh canonical-context run exactly
+once. External session state is never canonical.
 """
 
 from __future__ import annotations
@@ -56,6 +61,7 @@ from relay.agents.base import (
 from relay.harness.capabilities import HarnessCapability
 from relay.harness.discovery import ResolvedExecutable
 from relay.harness.errors import HarnessOutputError, UnsupportedCapability
+from relay.harness.process import ProcessOutcome
 from relay.harness.runtime import HarnessAgent
 from relay.harness.sanitization import redact
 from relay.harness.types import ExecutionGrantKind, ExitSemantics
@@ -222,14 +228,21 @@ class ClaudeCodeAgent(HarnessAgent):
 
     def run_observation(self) -> RunObservation | None:
         info = self._info
+        persisted = getattr(self._profile, "persist_session_ref", False)
         return RunObservation(
             resolved_model=None,  # Q-a: only when the harness reports it (Blocker 5)
             adapter_version=info.version if info else None,
             backend="harness",
-            # external_session_ref intentionally None: C.4 persistence needs
-            # an explicit config opt-in that does not exist yet (P7 seam).
-            external_session_ref=None,
+            # P7.4 (App. C.4): the parsed session id persists ONLY under the
+            # explicit profile opt-in; otherwise None (pre-P7.4 behavior).
+            external_session_ref=(
+                self.last_session_ref if persisted else None
+            ),
         )
+
+    def continuation_ref(self) -> str | None:
+        """The last parsed session id for P7.4 resume consumers."""
+        return self.last_session_ref
 
     def tool_observations(self) -> list[ToolObservation]:
         """Single-json mode exposes no per-tool stream — always empty."""
@@ -239,20 +252,38 @@ class ClaudeCodeAgent(HarnessAgent):
     def last_session_ref(self) -> str | None:
         """In-memory continuation handle parsed from the last envelope.
 
-        Deliberately NOT persisted anywhere (frozen-plan D5b); consumers that
-        want continuity pass it back through their own channel until a P7
-        config seam exists.
+        Persistence is governed by the ``persist_session_ref`` profile
+        opt-in (default off) — see :meth:`run_observation`.
         """
         return getattr(self, "_last_session_id", None)
 
+    #: CLI-side rejection messages meaning the resume ref is unusable —
+    #: unknown/expired/invalid session id. Consulted by ``resume_rejected``
+    #: only after the runtime confirms a resume ref was actually sent, so a
+    #: match surfaces as ``SessionResumeUnavailable`` (one-time fresh-run
+    #: fallback) rather than a generic output failure. Arbitrary provider
+    #: failures (rate limits, transport) do not match and are never retried.
+    RESUME_REJECTED_SIGNATURES: tuple[str, ...] = (
+        "no conversation found",
+        "conversation not found",
+        "session not found",
+        "unknown session",
+        "session expired",
+        "invalid session",
+    )
+
     def resume_arguments(self, session_ref: str) -> tuple[str, ...]:
-        """Dormant-but-tested SESSION_RESUME translation (P7 seam forward)."""
+        """SESSION_RESUME translation: valid UUID refs → ``--resume <ref>``."""
         ref = _uuid_or_none(session_ref)
         if ref is None:
             raise UnsupportedCapability(
                 f"{self.name}: invalid session reference {session_ref!r} — expected a UUID"
             )
         return ("--resume", ref)
+
+    def resume_rejected(self, outcome: ProcessOutcome) -> bool:
+        blob = f"{outcome.stdout.text}\n{outcome.stderr.text}".lower()
+        return any(sig in blob for sig in self.RESUME_REJECTED_SIGNATURES)
 
 
 def _launchable_command(command: str) -> tuple[str, ...]:

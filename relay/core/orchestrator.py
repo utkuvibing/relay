@@ -144,6 +144,27 @@ class AskOutcome:
     run: Run
     response: AgentResponse | None = None
     error: str | None = None
+    #: The typed cause when the failure crossed ``agent.run()`` as an
+    #: ``AgentError`` family member (P7.4: delivery uses this to positively
+    #: classify a session-continuation rejection without ever parsing error
+    #: text; ``None`` for successes and non-AgentError failures).
+    cause: AgentError | None = None
+
+
+def _is_session_resume_rejection(exc: Exception, request: AgentRequest) -> bool:
+    """Typed session-continuation rejection on a request that sent a handle.
+
+    Both halves matter: the harness runtime only raises
+    ``SessionResumeUnavailable`` when a resume ref was actually supplied,
+    but a foreign adapter could in principle raise the type spuriously —
+    the metadata check keeps the durable eligibility marker honest. Kept
+    import-lazy so the orchestrator stays harness-agnostic at module load.
+    """
+    if request.metadata.get("resume_session_ref") is None:
+        return False
+    from relay.harness.errors import SessionResumeUnavailable
+
+    return isinstance(exc, SessionResumeUnavailable)
 
 
 def _persistable_error(exc: Exception) -> str:
@@ -255,7 +276,31 @@ async def run_ask(
                     references=[f"run:{run.id}"],
                 )
             )
-        return AskOutcome(run=failed, error=safe_error)
+            if _is_session_resume_rejection(exc, request):
+                # P7.4 durable eligibility: the one-time fresh fallback is
+                # owed by the bound delivery's initiation. Committing the
+                # marker in THIS transaction closes the crash window — a
+                # process dying before the fallback run's Tx1 can still be
+                # recovered from canonical evidence alone.
+                writer.record(
+                    EventLogEntry(
+                        type=EventType.RUN_SESSION_RESUME_REJECTED,
+                        room_id=request.room_id,
+                        task_id=run.task_id,
+                        content=(
+                            f"agent '{run.agent}' positively rejected the "
+                            "supplied session continuation reference — the "
+                            "delivery initiation's one-time fresh fallback "
+                            "remains owed"
+                        ),
+                        references=[f"run:{run.id}"],
+                    )
+                )
+        return AskOutcome(
+            run=failed,
+            error=safe_error,
+            cause=exc if isinstance(exc, AgentError) else None,
+        )
 
     usage = response.usage
     succeeded = run.model_copy(

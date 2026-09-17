@@ -33,6 +33,18 @@ Frozen contracts implemented here (plan rev 3):
   zero store delta — after success, failure, and the crash-pending window
   alike. No escape hatch exists in P4.2; redelivery/retry semantics are
   P4.4+ work.
+* **P7.4 — session continuation fallback:** when a delivery carried a
+  resume ref and the harness POSITIVELY rejected it (typed
+  ``SessionResumeUnavailable`` — never arbitrary provider failure), the same
+  initiation continues exactly once on a fresh run prompted from canonical
+  context. The fallback run binds via a ``MESSAGE_DELIVERY_FALLBACK``
+  marker (distinct type: initiation accounting still counts one
+  ``MESSAGE_DELIVERED``), and reply materialization/recovery resolve
+  through it to the fallback run. Eligibility is durable: the spine records
+  ``RUN_SESSION_RESUME_REJECTED`` in the failed run's own failure
+  transaction, so a crash before the fallback's Tx1 leaves the continuation
+  still owed — recovery runs it exactly once (a second binding is vetoed
+  inside the fallback run's Tx1 and resolved to the committed winner).
 * **D15 — deterministic envelope:** fixed field order (sender, type,
   blocking, content); byte-for-byte assertable; no timestamps, ids, or
   transcript replay; semantic references ride ``AgentRequest.context_refs``
@@ -89,9 +101,11 @@ __all__ = [
     "DeliveryRefusal",
     "DeliveryReplyOutcome",
     "DuplicateDeliveryRefusal",
+    "DuplicateFallbackRefusal",
     "InvalidReplyTypeRefusal",
     "MessageDelivery",
     "ThreadDepthRefusal",
+    "latest_session_ref",
 ]
 
 #: Producer convention (App. A.1): the delivery machinery is a relay:*
@@ -122,6 +136,16 @@ class DuplicateDeliveryRefusal(DeliveryRefusal):
 
 class DeliveryPendingRefusal(DeliveryRefusal):
     """Delivery run is currently pending or incomplete; re-initiation is refused."""
+
+
+class DuplicateFallbackRefusal(DeliveryRefusal):
+    """Exactly one fresh fallback may bind to a delivered message (P7.4).
+
+    Raised inside the fallback run's Tx1 when a ``MESSAGE_DELIVERY_FALLBACK``
+    binding already exists — a concurrent continuation won the write-lock
+    race. The veto rolls the loser's staged run back atomically, so no
+    second fallback run is ever persisted.
+    """
 
 
 class InvalidReplyTypeRefusal(DeliveryRefusal, ValueError):
@@ -155,6 +179,65 @@ class DeliveryReplyOutcome:
     message: Message
     ask: AskOutcome
     reply: Message | None = None
+
+
+def latest_session_ref(
+    store: SqliteRelayStore, room_id: str, agent_name: str, role: str
+) -> str | None:
+    """Newest persisted ``external_session_ref`` for one Room SEAT (P7.4).
+
+    Seat-scoped, not agent-scoped: one configured agent may occupy several
+    Room roles, and each seat owns a distinct external conversation. The
+    scan walks delivery markers (``MESSAGE_DELIVERED`` plus the P7.4
+    ``MESSAGE_DELIVERY_FALLBACK`` continuation markers) in reverse sequence
+    order and accepts a marker only when canonical provenance lines up:
+
+    * the marker's ``message:`` ref resolves to a Message addressed to this
+      seat — ``recipient_role == role`` AND resolved ``recipient ==
+      agent_name`` (the bus's persisted role→agent resolution);
+    * the marker's ``run:`` ref resolves to a Run whose ``agent``/``role``
+      agree — defense against a marker bound to a stale or corrupted row;
+    * that Run carries a non-empty ``external_session_ref``.
+
+    Anything else is skipped, never inherited across roles. Pure read —
+    no writes, no handle-shape validation (callers validate via the
+    adapter's ``resume_arguments`` before use).
+    """
+    delivered = EventType.MESSAGE_DELIVERED.value
+    fallback = EventType.MESSAGE_DELIVERY_FALLBACK.value
+    for marker in store.all_models(
+        EventLogEntry,
+        "WHERE type IN (?, ?) AND room_id = ?",
+        [delivered, fallback, room_id],
+        order_by="sequence DESC",
+    ):
+        if marker.recipient != agent_name:
+            continue
+        message_id: str | None = None
+        run_id: str | None = None
+        for ref in marker.references:
+            if ref.startswith("message:"):
+                message_id = ref[len("message:") :]
+            elif ref.startswith("run:"):
+                run_id = ref[len("run:") :]
+        if message_id is None or run_id is None:
+            continue
+        message = store.load_model(Message, message_id)
+        if (
+            message is None
+            or message.recipient_role != role
+            or message.recipient != agent_name
+        ):
+            continue
+        run = store.load_model(Run, run_id)
+        if (
+            run is not None
+            and run.agent == agent_name
+            and run.role == role
+            and run.external_session_ref
+        ):
+            return run.external_session_ref
+    return None
 
 
 class MessageDelivery:
@@ -195,8 +278,33 @@ class MessageDelivery:
         """Construct and retain the exact read-only agent used by the next delivery."""
         self._prepared_recipients[recipient] = self._construct_recipient(recipient)
 
+    def recipient_for_inspection(self, recipient: str) -> Agent | None:
+        """The delivery-bound recipient instance for read-only capability checks.
+
+        Returns the prepared recipient when one was staged via
+        :meth:`prepare_recipient` (the SAME instance the next delivery will
+        pop — capability/persist-flag inspection must never probe a second
+        independently-constructed agent). When nothing was prepared the
+        recipient is constructed on demand; an unbuildable recipient yields
+        ``None`` (the subsequent delivery will surface the typed refusal).
+        """
+        prepared = self._prepared_recipients.get(recipient)
+        if prepared is not None:
+            return prepared[0]
+        try:
+            agent, _model = self._construct_recipient(recipient)
+        except DeliveryRefusal:
+            return None
+        return agent
+
     async def deliver(
-        self, message_id: str, *, prompt_suffix: str = ""
+        self,
+        message_id: str,
+        *,
+        prompt_suffix: str = "",
+        fallback_prompt_suffix: str | None = None,
+        resume_session_ref: str | None = None,
+        extra_context_refs: list[str] | None = None,
     ) -> DeliveryOutcome:
         """Bind ``message_id`` to a fresh recipient run and execute it.
 
@@ -207,10 +315,25 @@ class MessageDelivery:
 
         ``prompt_suffix`` rides OUTSIDE the frozen D15 envelope (the P6.4
         appendix pattern); it defaults to empty, so ordinary delivery prompts
-        stay byte-identical.
+        stay byte-identical. ``resume_session_ref`` rides
+        ``AgentRequest.metadata`` to SESSION_RESUME-capable harness agents;
+        it defaults to None (honest fresh run, byte-identical behavior).
+        ``fallback_prompt_suffix`` is the suffix for the one-time fresh run
+        used ONLY when a resume attempt is positively rejected (P7.4); it
+        defaults to ``prompt_suffix`` — callers supplying a resume ref
+        should supply both so a fallback prompt never claims a resume that
+        did not happen. ``extra_context_refs`` appends caller-derived
+        provenance (P7.4 Room context) after the verbatim message
+        references; it defaults to empty so existing
+        ``context_refs == message.references`` assertions hold.
         """
         return await self._deliver(
-            message_id, admitted_reply_type=None, prompt_suffix=prompt_suffix
+            message_id,
+            admitted_reply_type=None,
+            prompt_suffix=prompt_suffix,
+            fallback_prompt_suffix=fallback_prompt_suffix,
+            resume_session_ref=resume_session_ref,
+            extra_context_refs=extra_context_refs,
         )
 
     async def _deliver(
@@ -219,6 +342,9 @@ class MessageDelivery:
         *,
         admitted_reply_type: MessageType | None,
         prompt_suffix: str = "",
+        fallback_prompt_suffix: str | None = None,
+        resume_session_ref: str | None = None,
+        extra_context_refs: list[str] | None = None,
     ) -> DeliveryOutcome:
         """Initiate delivery, optionally binding a pre-admitted reply type."""
         message = self._store.load_model(Message, message_id)
@@ -242,6 +368,10 @@ class MessageDelivery:
 
         prepared = self._prepared_recipients.pop(recipient, None)
         agent, model = prepared if prepared is not None else self._construct_recipient(recipient)
+        metadata: dict[str, object] = {}
+        if resume_session_ref is not None:
+            self._validate_resume_ref(agent, recipient, resume_session_ref)
+            metadata["resume_session_ref"] = resume_session_ref
         request = AgentRequest(
             prompt=self._envelope(message) + prompt_suffix,
             role=role,
@@ -249,7 +379,10 @@ class MessageDelivery:
             room_id=message.room_id,
             # D15 pass-through: semantic references stay canonical on the
             # Message row; the raw list rides the existing request channel.
-            context_refs=list(message.references),
+            # P7.4 appends caller-derived Room-context provenance after the
+            # verbatim references (empty by default — existing assertions hold).
+            context_refs=[*message.references, *(extra_context_refs or [])],
+            metadata=metadata,
         )
 
         ask = await run_ask(
@@ -261,6 +394,51 @@ class MessageDelivery:
             agent_name=recipient,
             pre_provider=self._binding_hook(message, admitted_reply_type),
         )
+        if (
+            resume_session_ref is not None
+            and ask.response is None
+            and _is_session_resume_rejection(ask.cause)
+        ):
+            # P7.4 honest fallback (App. D.10): the harness POSITIVELY
+            # rejected the continuation handle — the typed cause, never a
+            # text match, and only when a resume ref was actually sent.
+            # Exactly one fresh run follows, prompted from the canonical
+            # records already reconstructed for this delivery; arbitrary
+            # provider failures never reach this branch. The fresh run is
+            # bound by a MESSAGE_DELIVERY_FALLBACK marker inside ITS Tx1 —
+            # the same initiation, so at-most-once accounting still sees
+            # exactly one MESSAGE_DELIVERED binding for this message.
+            fallback_request = request.model_copy(
+                update={
+                    "prompt": self._envelope(message)
+                    + (
+                        fallback_prompt_suffix
+                        if fallback_prompt_suffix is not None
+                        else prompt_suffix
+                    ),
+                    "metadata": {},
+                }
+            )
+            try:
+                ask = await run_ask(
+                    self._store,
+                    self._writer,
+                    agent,
+                    fallback_request,
+                    model=model,
+                    agent_name=recipient,
+                    pre_provider=self._fallback_hook(message, ask.run),
+                )
+            except DuplicateFallbackRefusal as exc:
+                # A concurrent recovery bound the owed fallback between our
+                # failed resume attempt and this run's Tx1 — the veto rolled
+                # our staged run back, so exactly one fallback exists. The
+                # continuation is in progress elsewhere; re-entry resolves it.
+                raise DeliveryPendingRefusal(
+                    f"message '{message.id}' continuation was bound to a "
+                    "fallback run by a concurrent recovery — re-invoke to "
+                    "resolve its outcome"
+                ) from exc
         return DeliveryOutcome(message=message, ask=ask)
 
     def _construct_recipient(self, recipient: str) -> tuple[Agent, str | None]:
@@ -273,6 +451,34 @@ class MessageDelivery:
             ) from exc
         return agent, model
 
+    @staticmethod
+    def _validate_resume_ref(agent: Agent, recipient: str, session_ref: str) -> None:
+        """Pre-Tx1 resume validation (P7.4): capability + shape, zero delta.
+
+        Only harness agents declaring SESSION_RESUME may resume, and the
+        handle must survive the adapter's own ``resume_arguments`` shape
+        check. Anything else is a typed refusal BEFORE the binding Tx1 —
+        never a silent fresh run.
+        """
+        from relay.harness.capabilities import HarnessCapability
+        from relay.harness.errors import UnsupportedCapability
+        from relay.harness.runtime import HarnessAgent
+
+        if not isinstance(agent, HarnessAgent):
+            raise DeliveryRefusal(
+                f"recipient '{recipient}' cannot resume an external session: "
+                "API-family agents always run fresh from canonical records"
+            )
+        if HarnessCapability.SESSION_RESUME not in agent.capabilities_set():
+            raise DeliveryRefusal(
+                f"recipient '{recipient}' does not declare session_resume — "
+                "honest fresh run required"
+            )
+        try:
+            agent.resume_arguments(session_ref)
+        except UnsupportedCapability as exc:
+            raise DeliveryRefusal(f"invalid session reference: {exc}") from exc
+
     async def deliver_and_reply(
         self,
         message_id: str,
@@ -280,6 +486,9 @@ class MessageDelivery:
         reply_type: MessageType | None = None,
         max_thread_depth: int = DEFAULT_MAX_THREAD_DEPTH,
         prompt_suffix: str = "",
+        fallback_prompt_suffix: str | None = None,
+        resume_session_ref: str | None = None,
+        extra_context_refs: list[str] | None = None,
     ) -> DeliveryReplyOutcome:
         """P4.3 (frozen plan D12-D15): deliver message and materialize reply idempotently.
 
@@ -289,6 +498,11 @@ class MessageDelivery:
           BEFORE delivery initiation or provider execution.
         - Reuses existing run if delivery already occurred (crash recovery for both
           SUCCEEDED and FAILED runs, preserving sanitized failure error).
+        - P7.4 crash window: a FAILED run carrying canonical
+          ``RUN_SESSION_RESUME_REJECTED`` eligibility but no committed
+          fallback binding still owes the same initiation's one-time fresh
+          run — recovery executes it (never a second initiation, never a
+          second fallback, never a retry of arbitrary failures).
         - Dual provenance verification: run.agent == reply.sender AND causal
           MESSAGE_DELIVERED(message, run) binding.
         - Reconstructs full AskOutcome(run=run, response=recovered_response) on recovery.
@@ -361,12 +575,49 @@ class MessageDelivery:
                 )
 
             if run.status is RunStatus.FAILED:
-                error = self._error_for_failed_run(run.id, run.agent)
-                return DeliveryReplyOutcome(
-                    message=message,
-                    ask=AskOutcome(run=run, error=error),
-                    reply=None,
-                )
+                # P7.4: a rejected resume attempt may have continued on a
+                # fresh fallback run — recover THAT run's outcome so the
+                # honest reply materializes instead of a stale failure.
+                fallback_run = self._fallback_run_for(message.id, run.id)
+                if fallback_run is None and self._resume_rejection_proven(run):
+                    # Crash window: the RUN_SESSION_RESUME_REJECTED marker
+                    # committed atomically with the FAILED update, but the
+                    # process died before the continuation's Tx1. The same
+                    # initiation's one-time fresh fallback is still owed —
+                    # run it now. A concurrent recovery binding resolves to
+                    # the winner's run, never a second fallback.
+                    fallback_run = await self._continue_fallback(
+                        message,
+                        run,
+                        recipient,
+                        prompt_suffix=prompt_suffix,
+                        fallback_prompt_suffix=fallback_prompt_suffix,
+                        extra_context_refs=extra_context_refs,
+                    )
+                if fallback_run is None:
+                    error = self._error_for_failed_run(run.id, run.agent)
+                    return DeliveryReplyOutcome(
+                        message=message,
+                        ask=AskOutcome(run=run, error=error),
+                        reply=None,
+                    )
+                run = fallback_run
+                if run.status is RunStatus.RUNNING:
+                    raise DeliveryPendingRefusal(
+                        f"fallback delivery run '{run.id}' for message "
+                        f"'{message.id}' is still in progress or incomplete"
+                    )
+                if run.status is RunStatus.FAILED:
+                    error = self._error_for_failed_run(run.id, run.agent)
+                    return DeliveryReplyOutcome(
+                        message=message,
+                        ask=AskOutcome(run=run, error=error),
+                        reply=None,
+                    )
+                if run.status is not RunStatus.SUCCEEDED:
+                    raise DeliveryRefusal(
+                        f"fallback delivery run '{run.id}' in unhandled status '{run.status.value}'"
+                    )
 
             if run.status is not RunStatus.SUCCEEDED:
                 raise DeliveryRefusal(
@@ -429,6 +680,9 @@ class MessageDelivery:
                 actual_reply_type if self._policy is not None else None
             ),
             prompt_suffix=prompt_suffix,
+            fallback_prompt_suffix=fallback_prompt_suffix,
+            resume_session_ref=resume_session_ref,
+            extra_context_refs=extra_context_refs,
         )
         if outcome.ask.response is None:
             return DeliveryReplyOutcome(message=message, ask=outcome.ask, reply=None)
@@ -614,6 +868,104 @@ class MessageDelivery:
 
     # -- read model ----------------------------------------------------------
 
+    def _fallback_run_for(self, message_id: str, prior_run_id: str) -> Run | None:
+        """Resolve the one-time fresh fallback run for a failed resume attempt.
+
+        Finds the ``MESSAGE_DELIVERY_FALLBACK`` marker binding this message
+        whose ``prior_run:`` ref is the failed resume run, then loads the
+        ``run:`` ref. Returns ``None`` when no fallback was ever committed —
+        the failed run's honest outcome stands.
+        """
+        message_ref = f"message:{message_id}"
+        prior_ref = f"prior_run:{prior_run_id}"
+        for entry in self._store.all_models(
+            EventLogEntry,
+            "WHERE type = ?",
+            [EventType.MESSAGE_DELIVERY_FALLBACK.value],
+            order_by="sequence ASC",
+        ):
+            if message_ref not in entry.references or prior_ref not in entry.references:
+                continue
+            run_id = next(
+                (ref[len("run:") :] for ref in entry.references if ref.startswith("run:")),
+                None,
+            )
+            return self._store.load_model(Run, run_id) if run_id is not None else None
+        return None
+
+    def _resume_rejection_proven(self, run: Run) -> bool:
+        """Canonical proof the failed run's one-time fallback is still owed.
+
+        ``RUN_SESSION_RESUME_REJECTED`` commits in the SAME transaction that
+        settles the run FAILED (orchestrator failure path), so its presence
+        is durable typed evidence — never error-text parsing — that the
+        primary failure was specifically a positive session-continuation
+        rejection. Absent the marker the failed delivery stays terminal:
+        arbitrary provider failures are never retried, even after a crash.
+        """
+        run_ref = f"run:{run.id}"
+        return any(
+            run_ref in entry.references
+            for entry in self._store.all_models(
+                EventLogEntry,
+                "WHERE type = ?",
+                [EventType.RUN_SESSION_RESUME_REJECTED.value],
+                order_by="sequence ASC",
+            )
+        )
+
+    async def _continue_fallback(
+        self,
+        message: Message,
+        prior_run: Run,
+        recipient: str,
+        *,
+        prompt_suffix: str,
+        fallback_prompt_suffix: str | None,
+        extra_context_refs: list[str] | None,
+    ) -> Run:
+        """Run the owed one-time fresh fallback for a proven resume rejection.
+
+        Returns the bound fallback run — this call's, or the winner's when a
+        concurrent recovery committed the binding first (the Tx1 veto rolls
+        our staged run back atomically and we resolve the committed one).
+        The prompt is the same envelope plus the caller's fallback suffix —
+        a genuinely fresh request: no resume metadata, never a false
+        ``resumed:`` claim.
+        """
+        prepared = self._prepared_recipients.pop(recipient, None)
+        agent, model = (
+            prepared if prepared is not None else self._construct_recipient(recipient)
+        )
+        request = AgentRequest(
+            prompt=self._envelope(message)
+            + (fallback_prompt_suffix if fallback_prompt_suffix is not None else prompt_suffix),
+            role=self._role_for(message),
+            task_id=message.task_id,
+            room_id=message.room_id,
+            context_refs=[*message.references, *(extra_context_refs or [])],
+            metadata={},
+        )
+        try:
+            ask = await run_ask(
+                self._store,
+                self._writer,
+                agent,
+                request,
+                model=model,
+                agent_name=recipient,
+                pre_provider=self._fallback_hook(message, prior_run),
+            )
+        except DuplicateFallbackRefusal:
+            winner = self._fallback_run_for(message.id, prior_run.id)
+            if winner is None:
+                raise DeliveryRefusal(
+                    f"corrupt delivery state: fallback veto for message "
+                    f"'{message.id}' but no committed fallback binding exists"
+                )
+            return winner
+        return ask.run
+
     def deliveries_for_message(self, message_id: str) -> tuple[EventLogEntry, ...]:
         """MESSAGE_DELIVERED markers binding this message to runs (read-only).
 
@@ -719,6 +1071,89 @@ class MessageDelivery:
 
         return bind
 
+    def _fallback_hook(
+        self,
+        message: Message,
+        prior_run: Run,
+    ) -> Callable[[Run, Artifact], Iterable[EventLogEntry]]:
+        """P7.4 Tx1 hook for the one-time fresh fallback run.
+
+        Runs INSIDE the fallback run's pre-provider Tx1: re-asserts the
+        Room OPEN fence (the Room may have closed between the two runs),
+        vetoes a second fallback binding (``DuplicateFallbackRefusal`` —
+        concurrent recoveries serialize on the write lock and the loser
+        resolves to the committed winner), and commits the
+        ``MESSAGE_DELIVERY_FALLBACK`` continuation marker atomically with
+        the fallback run row. Deliberately NOT a re-initiation: no
+        ``MESSAGE_DELIVERED`` duplicate check (the same initiation
+        continues — ``deliveries_for_message`` still sees exactly one
+        initiation binding) and no second turn-budget charge.
+        """
+
+        def bind(run: Run, _input_artifact: object) -> Iterable[EventLogEntry]:
+            if message.room_id is not None:
+                require_open_room(self._store, message.room_id)
+            # One fallback per initiation, enforced on the write lock: two
+            # recovery attempts racing to continue the same crashed
+            # initiation serialize here — the loser sees the winner's
+            # committed marker, refuses typed, and its staged run row rolls
+            # back with the veto.
+            if self._has_fallback_binding(message.id):
+                raise DuplicateFallbackRefusal(
+                    f"message '{message.id}' already has a continuation "
+                    "fallback bound — one fresh run completes a rejected "
+                    "resume, never two"
+                )
+            return [self._fallback_marker_for(message, run, prior_run)]
+
+        return bind
+
+    def _has_fallback_binding(self, message_id: str) -> bool:
+        """Any committed MESSAGE_DELIVERY_FALLBACK binding for this message."""
+        ref = f"message:{message_id}"
+        return any(
+            ref in entry.references
+            for entry in self._store.all_models(
+                EventLogEntry,
+                "WHERE type = ?",
+                [EventType.MESSAGE_DELIVERY_FALLBACK.value],
+                order_by="sequence ASC",
+            )
+        )
+
+    @staticmethod
+    def _fallback_marker_for(
+        message: Message,
+        run: Run,
+        prior_run: Run,
+    ) -> EventLogEntry:
+        """P7.4 continuation marker: same initiation, fresh fallback run."""
+        role_note = f" via role '{message.recipient_role}'" if message.recipient_role else ""
+        references = [
+            f"message:{message.id}",
+            f"run:{run.id}",
+            f"prior_run:{prior_run.id}",
+        ]
+        if message.room_id:
+            references.append(f"room:{message.room_id}")
+        if message.task_id:
+            references.append(f"task:{message.task_id}")
+        return EventLogEntry(
+            stage_key=message.stage_key,
+            room_id=message.room_id,
+            task_id=message.task_id,
+            sender=DELIVERY_SENDER,
+            recipient=message.recipient,
+            type=EventType.MESSAGE_DELIVERY_FALLBACK,
+            content=(
+                f"{message.type.value} from {message.sender} to "
+                f"{message.recipient}{role_note} continued on fresh run "
+                f"{run.id} after session-continuation rejection on run "
+                f"{prior_run.id}"
+            ),
+            references=references,
+        )
+
     @staticmethod
     def _marker_for(
         message: Message,
@@ -747,6 +1182,21 @@ class MessageDelivery:
             ),
             references=references,
         )
+
+
+def _is_session_resume_rejection(cause: object) -> bool:
+    """Positive session-continuation rejection classification (P7.4).
+
+    The fallback applies ONLY to the typed ``SessionResumeUnavailable``
+    cause — a signal the harness/runtime emits exclusively when it
+    positively identified the supplied resume ref as unusable. Arbitrary
+    provider failures (rate limits, transport, auth, config) never carry
+    this type and are never retried. Kept import-lazy so core stays
+    harness-agnostic at module load.
+    """
+    from relay.harness.errors import SessionResumeUnavailable
+
+    return isinstance(cause, SessionResumeUnavailable)
 
 
 def _refusal_reason(exc: Exception) -> str:

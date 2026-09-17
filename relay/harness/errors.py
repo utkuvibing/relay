@@ -37,6 +37,18 @@ class HarnessOutputError(AgentError):
     """Harness output could not be decoded/parsed into a response."""
 
 
+class SessionResumeUnavailable(HarnessOutputError):
+    """The harness positively identified a session continuation handle as
+    unusable (P7.4 — unknown, expired, or rejected resume reference).
+
+    Raised ONLY when the failure signature is session-specific — arbitrary
+    provider failures never carry this type, which is what makes the
+    one-time fresh-run fallback in delivery safe to apply. Consumers must
+    additionally confirm a resume reference was actually attempted before
+    treating this as fallback-eligible.
+    """
+
+
 class HarnessTimeoutError(AgentError):
     """The run exceeded its deadline and was terminated with its tree (G2)."""
 

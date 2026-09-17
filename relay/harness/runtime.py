@@ -283,6 +283,45 @@ class HarnessAgent(Agent):
         """
         return []
 
+    # -- session continuation seam (App. C.2/C.4, D.10; consumed in P7.4) ----
+    def continuation_ref(self) -> str | None:
+        """In-memory continuation handle from the last parse; default: none.
+
+        Adapters that parse a non-secret session/conversation/thread id
+        override this. The handle is NEVER persisted here — persistence
+        happens only via :meth:`run_observation` when the profile opts in
+        (``persist_session_ref``), and consumption happens only through
+        ``AgentRequest.metadata["resume_session_ref"]``.
+        """
+        return None
+
+    def resume_arguments(self, session_ref: str) -> tuple[str, ...]:
+        """Translate a continuation handle into resume argv; default: refuse.
+
+        Only adapters declaring ``SESSION_RESUME`` override this. Invalid
+        handles fail typed — delivery validates before Tx1 so a bad ref is
+        a refusal with zero store delta, never a silent fresh run.
+        """
+        from relay.harness.errors import UnsupportedCapability as _Unsupported
+
+        raise _Unsupported(f"{self.name}: session resume is not supported")
+
+    def resume_rejected(self, outcome: ProcessOutcome) -> bool:
+        """Positive identification that a failed run died on the resume ref.
+
+        Consulted ONLY when the request actually carried
+        ``metadata["resume_session_ref"]`` and the run failed — a non-OK
+        process exit, or a zero-exit error envelope that ``parse_output``
+        rejects typed (e.g. ``is_error`` / non-SUCCESS payloads carrying
+        the rejection text).
+        Adapters override with their own session-invalid signatures
+        (e.g. an explicit "no conversation found" harness message). The
+        default is deliberately ``False``: a failure that cannot be clearly
+        attributed to the continuation handle is NEVER retried — the honest
+        failure stands (P7.4 stale/expired-session rule).
+        """
+        return False
+
     # -- execution ---------------------------------------------------------------
 
     def _prepared_cwd(self) -> Path:
@@ -314,13 +353,32 @@ class HarnessAgent(Agent):
         """Canonical ordering: invocation · profile.extra_args · grant flags.
 
         Grant flags come last so adapters can rely on positional override;
-        the prompt NEVER rides argv (stdin channel instead).
+        the prompt NEVER rides argv (stdin channel instead). P7.4 resume
+        flags append AFTER grant flags via :meth:`resume_argv_for` — they
+        are orthogonal to authorization, never a substitute for it.
         """
         return (
             *self.invocation_argv(resolved),
             *self._profile_extra_args(),
             *grant.additional_args,
         )
+
+    def resume_argv_for(self, request: AgentRequest) -> tuple[str, ...]:
+        """Resume argv for one request's ``metadata["resume_session_ref"]``.
+
+        Empty when the request carries no handle. A present handle demands
+        the ``SESSION_RESUME`` capability and a valid translation — invalid
+        handles fail typed (fail-closed, never a silent fresh run).
+        """
+        raw = request.metadata.get("resume_session_ref")
+        if raw is None:
+            return ()
+        if not isinstance(raw, str) or not raw:
+            from relay.harness.errors import UnsupportedCapability as _Unsupported
+
+            raise _Unsupported(f"{self.name}: invalid session reference {raw!r}")
+        self.requires(HarnessCapability.SESSION_RESUME)
+        return self.resume_arguments(raw)
 
     def _failure_message(self, prefix: str, outcome_stderr: str, *, semantics_hint: str) -> str:
         tail = redact(outcome_stderr.strip())[-_STDERR_TAIL_CHARS:]
@@ -333,7 +391,7 @@ class HarnessAgent(Agent):
         resolved = await self._discover_once()
 
         spec = LaunchSpec(
-            argv=self.compose_argv(resolved, grant),
+            argv=(*self.compose_argv(resolved, grant), *self.resume_argv_for(request)),
             cwd=self._prepared_cwd(),
             env=self._child_env(),
             timeout_s=self._timeout_s(),
@@ -350,6 +408,18 @@ class HarnessAgent(Agent):
 
         semantics = self.classify_exit(outcome.exit_code)
         if semantics is not ExitSemantics.OK:
+            from relay.harness.errors import SessionResumeUnavailable
+
+            if (
+                request.metadata.get("resume_session_ref") is not None
+                and self.resume_rejected(outcome)
+            ):
+                raise SessionResumeUnavailable(
+                    f"{self.name}: the supplied session continuation reference was "
+                    f"rejected by the harness (exit={outcome.exit_code}, "
+                    f"semantics={semantics.value}) — falling back is the caller's "
+                    "one-time decision"
+                )
             hints = {
                 ExitSemantics.AUTH: "authentication failed at the harness — "
                 "log in via the harness itself; Relay never handles credentials",
@@ -369,7 +439,24 @@ class HarnessAgent(Agent):
     async def _run_inner(self, request: AgentRequest) -> AgentResponse:
         outcome = await self._execute_once(request)
 
-        output = self.parse_output(outcome.stdout.text, outcome.stderr.text)
+        try:
+            output = self.parse_output(outcome.stdout.text, outcome.stderr.text)
+        except HarnessOutputError as exc:
+            # A zero-exit envelope can still carry a positive session-ref
+            # rejection (e.g. an ``is_error`` payload). Same rule as the
+            # nonzero path: only when a resume ref was actually sent AND the
+            # adapter positively recognizes the session-invalid signature.
+            if (
+                request.metadata.get("resume_session_ref") is not None
+                and self.resume_rejected(outcome)
+            ):
+                from relay.harness.errors import SessionResumeUnavailable
+
+                raise SessionResumeUnavailable(
+                    f"{self.name}: the supplied session continuation reference "
+                    "was rejected by the harness (error envelope)"
+                ) from exc
+            raise
         if len(output) > DEFAULT_OUTPUT_TEXT_CAP_CHARS:
             output = output[:DEFAULT_OUTPUT_TEXT_CAP_CHARS] + "\n…[output truncated by Relay]"
         return AgentResponse(

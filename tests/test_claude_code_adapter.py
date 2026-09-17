@@ -35,9 +35,18 @@ from relay.context.config import HarnessAgentConfig
 from relay.harness.capabilities import ALL_CAPABILITIES, HarnessCapability
 from relay.harness.conformance import default_factory_for, run_battery
 from relay.harness.discovery import ResolvedExecutable
-from relay.harness.errors import HarnessOutputError, UnsupportedCapability
+from relay.harness.errors import (
+    HarnessOutputError,
+    SessionResumeUnavailable,
+    UnsupportedCapability,
+)
 from relay.harness.runtime import HarnessAgent
-from relay.harness.types import ExecutionGrantKind, ExitSemantics
+from relay.harness.types import (
+    ExecutionGrantKind,
+    ExitSemantics,
+    ProcessOutcome,
+    StreamCapture,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
@@ -550,6 +559,96 @@ class TestPersistenceDormancyD5b:
         assert agent.resume_arguments(jref) == ("--resume", jref)
         with pytest.raises(UnsupportedCapability):
             agent.resume_arguments("junk-ref")
+
+
+class TestSessionResumeRejection:
+    """P7.4: a zero-exit ``is_error`` envelope can still positively reject a
+    supplied resume ref — that must classify as ``SessionResumeUnavailable``
+    so delivery can run the one-time honest fresh fallback. Only the
+    typed classification is asserted here; arbitrary parse failures,
+    non-signature errors, and envelopes on runs that never sent a ref stay
+    generic ``HarnessOutputError`` and are never retried."""
+
+    @staticmethod
+    def _agent_with_exit0_envelope(
+        tmp_path: Path, monkeypatch, stdout: str, stderr: str = ""
+    ) -> ClaudeCodeAgent:
+        import relay.harness.runtime as runtime_module
+
+        agent = _real(tmp_path)
+        agent._resolved = _fake_resolved()
+
+        async def _stub(_spec):
+            return ProcessOutcome(
+                exit_code=0,
+                timed_out=False,
+                cancelled=False,
+                stdout=StreamCapture(text=stdout),
+                stderr=StreamCapture(text=stderr),
+                duration_s=0.01,
+                semantics=ExitSemantics.OK,
+            )
+
+        monkeypatch.setattr(runtime_module, "execute", _stub)
+        return agent
+
+    @staticmethod
+    def _resume_request() -> AgentRequest:
+        return AgentRequest(
+            prompt="p",
+            role=AgentRole.PLANNER,
+            metadata={"resume_session_ref": FIXTURE_SESSION_ID},
+        )
+
+    async def test_exit0_error_envelope_rejection_is_session_typed(
+        self, tmp_path, monkeypatch
+    ):
+        envelope = _envelope(
+            is_error=True,
+            subtype="error_during_execution",
+            result=f"No conversation found with session ID: {FIXTURE_SESSION_ID}",
+        )
+        agent = self._agent_with_exit0_envelope(tmp_path, monkeypatch, envelope)
+        with pytest.raises(SessionResumeUnavailable):
+            await agent.run(self._resume_request())
+
+    async def test_exit0_error_envelope_without_signature_stays_generic(
+        self, tmp_path, monkeypatch
+    ):
+        envelope = _envelope(
+            is_error=True,
+            subtype="error_during_execution",
+            result="rate limit exceeded — retry later",
+        )
+        agent = self._agent_with_exit0_envelope(tmp_path, monkeypatch, envelope)
+        with pytest.raises(HarnessOutputError) as excinfo:
+            await agent.run(self._resume_request())
+        assert not isinstance(excinfo.value, SessionResumeUnavailable)
+
+    async def test_rejection_envelope_without_resume_ref_stays_generic(
+        self, tmp_path, monkeypatch
+    ):
+        # The signature matches but no ref was sent — a fresh run reporting
+        # the same text is an ordinary output failure, never fallback bait.
+        envelope = _envelope(
+            is_error=True,
+            subtype="error_during_execution",
+            result=f"No conversation found with session ID: {FIXTURE_SESSION_ID}",
+        )
+        agent = self._agent_with_exit0_envelope(tmp_path, monkeypatch, envelope)
+        with pytest.raises(HarnessOutputError) as excinfo:
+            await agent.run(_request("p"))
+        assert not isinstance(excinfo.value, SessionResumeUnavailable)
+
+    async def test_malformed_exit0_output_with_resume_ref_stays_generic(
+        self, tmp_path, monkeypatch
+    ):
+        agent = self._agent_with_exit0_envelope(
+            tmp_path, monkeypatch, '{"type": BROKEN'
+        )
+        with pytest.raises(HarnessOutputError) as excinfo:
+            await agent.run(self._resume_request())
+        assert not isinstance(excinfo.value, SessionResumeUnavailable)
 
 
 class TestSecondHarnessGateZeroTouch:
