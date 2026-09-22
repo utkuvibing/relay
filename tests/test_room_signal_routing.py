@@ -491,7 +491,7 @@ class TestStandalonePromotionProvenance:
                 content=(
                     '{"schema_version":"relay.planner_decision.v1","outcome":"accept",'
                     '"plan_effect":"unchanged","statement":"error handling stays '
-                    'out of scope"}'
+                    f'out of scope","references":["message:{signal_message.id}"]}}'
                 ),
             )
         )
@@ -508,7 +508,8 @@ class TestStandalonePromotionProvenance:
 
         assert decision is not None
         assert decision.room_id is None
-        assert decision.source_reply_id is None
+        assert decision.source_reply_id == reply.id
+        assert decision.references == [f"message:{signal_message.id}"]
         assert decision.task_id == task.id
         for event in store.all_models(EventLogEntry, "WHERE task_id = ?", [task.id]):
             assert event.room_id is None

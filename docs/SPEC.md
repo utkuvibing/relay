@@ -1667,6 +1667,20 @@ Bir room günler sonra yeniden açıldığında çalışma state'i devam etmeli.
 
 # Phase 8 — Decision Provenance
 
+**Status: implemented.** `relay why <decision-id> [--json]` reads canonical
+Room and standalone build decisions without running agents or writing state.
+New P6.4 decisions persist `source_reply_id`; both decision paths accept up to
+16 explicit references of types `message:`, `finding:`, `plan:`, `artifact:`,
+`evidence:`, and `decision:`. References are validated for record type and
+decision scope before promotion and again on read. Taskless Room decisions may
+cite task records only when their Task belongs to that Room; standalone
+decisions stay within their Task. Historical gaps are reported rather than
+filled by inference. JSON output uses `relay.decision.provenance.v1`.
+Its `graph.nodes` contains the five typed classes below with deterministic
+provenance references and explicit gaps. `canonical_fields` separately exposes
+the Decision row's supporters, challengers, verifier, alternatives, and primary
+objection; these fields are not inferred from transcript prose.
+
 Amaç:
 
 "Bu kararı neden aldık?" sorusunu cevaplamak.

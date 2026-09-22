@@ -9,7 +9,9 @@ adapter; ``status`` reports "configured / not configured" and nothing else.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -41,6 +43,7 @@ from relay.storage.events import EventLogWriter
 from relay.storage.models import (
     Approval,
     ApprovalStatus,
+    Decision,
     EvidenceRecord,
     Run,
     Task,
@@ -127,6 +130,23 @@ def _open_db(root: Path):
         raise ConfigError(f"workspace not initialized - run 'relay init' in {root} first")
     conn = connect(layout.db_path)
     migrate(conn)
+    return conn
+
+
+def _open_db_readonly(root: Path):
+    """Open an existing current-schema ledger without migration or writes."""
+    from relay.storage.db import SCHEMA_VERSION
+
+    db_path = workspace_layout(root).db_path
+    if not db_path.exists():
+        raise ConfigError(f"workspace not initialized - run 'relay init' in {root} first")
+    conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if current != SCHEMA_VERSION:
+        conn.close()
+        raise ConfigError(f"ledger schema v{current} requires v{SCHEMA_VERSION}; migrate with a normal Relay command")
     return conn
 
 
@@ -754,6 +774,78 @@ def history(
     except ConfigError as exc:
         _out().print(f"[red]ERROR[/red] {exc}")
         raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def why(
+    decision_id: str = typer.Argument(..., help="Decision ID or unique ID prefix."),
+    json_output: bool = typer.Option(False, "--json", help="Versioned provenance JSON."),
+) -> None:
+    """Explain a canonical Room or build decision from persisted records."""
+    from relay.core.decision_provenance import DecisionProvenanceError, build_decision_provenance
+
+    try:
+        conn = _open_db_readonly(Path.cwd())
+        try:
+            store = SqliteRelayStore(conn)
+            exact = store.load_model(Decision, decision_id)
+            matches = [exact] if exact is not None else list(
+                store.all_models(Decision, "WHERE substr(id, 1, length(?)) = ?", [decision_id, decision_id])
+            )
+            if len(matches) != 1:
+                raise DecisionProvenanceError("decision ID is unknown or ambiguous")
+            view = build_decision_provenance(store, matches[0])
+        finally:
+            conn.close()
+    except (ConfigError, DecisionProvenanceError) as exc:
+        typer.echo(f"ERROR {exc}", err=True)
+        raise typer.Exit(1) from exc
+    if json_output:
+        typer.echo(json.dumps(view, ensure_ascii=False))
+        return
+    item = view["decision"]
+    typer.echo(f"Decision {item['id']} [{item['status']}]: {item['statement']}")
+    typer.echo(f"Reason: {item['rationale'] or 'not recorded'}")
+    typer.echo(f"Proposed by: {item['proposed_by'] or 'not recorded'}")
+    typer.echo(f"Accepted by: {item['accepted_by'] or 'not applicable'}")
+    canonical = view["canonical_fields"]
+    if any(
+        canonical[key]
+        for key in (
+            "supported_by", "challenged_by", "verified_by",
+            "alternatives_considered", "primary_objection",
+        )
+    ):
+        typer.echo("Recorded on Decision:")
+        if canonical["supported_by"]:
+            typer.echo(f"Supported by: {', '.join(canonical['supported_by'])}")
+        if canonical["challenged_by"]:
+            typer.echo(f"Challenged by: {', '.join(canonical['challenged_by'])}")
+        if canonical["verified_by"]:
+            typer.echo(f"Repository verification: {canonical['verified_by']}")
+        if canonical["alternatives_considered"]:
+            typer.echo(f"Rejected alternative: {', '.join(canonical['alternatives_considered'])}")
+        if canonical["primary_objection"]:
+            typer.echo(f"Primary objection: {canonical['primary_objection']}")
+    exchange = view["exchange"]
+    typer.echo(f"Exchange: {exchange['proposal_message_id'] or '?'} -> {exchange['reply_message_id'] or '?'}")
+    if exchange["proposal_text"]:
+        typer.echo(f"Proposal: {exchange['proposal_text']}")
+    if exchange["reply_text"]:
+        typer.echo(f"Reply: {exchange['reply_text']}")
+    for node in view["citation_nodes"]:
+        typer.echo(f"Cited {node['reference']} [{node['kind']}] by {node['by']}: {node['summary']}")
+    typer.echo("Decision graph:")
+    for kind, nodes in view["graph"]["nodes"].items():
+        refs = ", ".join(node["provenance_ref"] for node in nodes)
+        typer.echo(f"  {kind}: {refs or '(unrecorded)'}")
+    for label in ("support", "objections", "evidence", "alternatives", "references"):
+        if view[label]:
+            typer.echo(f"{label.title()}: {', '.join(view[label])}")
+    if view["supersession"]["successor_id"]:
+        typer.echo(f"Superseded by: {view['supersession']['successor_id']}")
+    if view["gaps"]:
+        typer.echo(f"Provenance gaps: {', '.join(view['gaps'])}")
 
 
 from relay.cli.discussions import register as _register_discussions

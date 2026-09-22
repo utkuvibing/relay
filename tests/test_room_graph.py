@@ -433,7 +433,7 @@ class TestGraphIntegrity:
             )
         )
         assert decision.id
-        with pytest.raises(RoomGraphIntegrityError, match="unresolvable reference"):
+        with pytest.raises(RoomGraphIntegrityError, match="invalid reference"):
             build_room_graph(store, room.id)
 
     def test_superseded_decision_without_successor_refuses(self, fixture):
