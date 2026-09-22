@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 
 from relay.agents.base import AgentRole
+from relay.core.decision_references import DecisionReferenceError, validate_decision_references
 from relay.core.evidence import EvidenceKind, EvidenceStore
 from relay.core.reviews import canonical_json
 from relay.core.stage_signals import SignalContractError, parse_strict_json
@@ -90,8 +91,9 @@ ROOM_DECISION_CONTRACT = (
     "Answer with EXACTLY one JSON object and nothing else:\n"
     '{"schema_version":"relay.room_decision.v1","outcome":"accept|reject",'
     '"statement":"...","rationale":null,"references":[],"supersedes_decision_id":null}\n'
-    "references may cite canonical records of this Room (plan:<id>, finding:<id>, "
-    "decision:<id>, message:<id>). Only an accept outcome may carry "
+    "references (maximum 16) may cite canonical records of this Room "
+    "(message:<id>, finding:<id>, plan:<id>, artifact:<id>, evidence:<id>, "
+    "decision:<id>). Only an accept outcome may carry "
     "supersedes_decision_id, and only a currently ACCEPTED decision may be "
     "superseded. Relay promotes the object into canonical Room state; ordinary "
     "prose promotes nothing.\n"
@@ -480,29 +482,6 @@ def parse_room_decision(text: str) -> RoomDecisionPayload | None:
         return None
 
 
-def _reference_resolves(store: SqliteRelayStore, room_id: str, reference: str) -> bool:
-    prefix, _, value = reference.partition(":")
-    if not value:
-        return False
-    if prefix == "plan":
-        artifact = store.load_model(Artifact, value)
-        return (
-            artifact is not None
-            and artifact.kind is ArtifactKind.PLAN
-            and artifact.room_id == room_id
-        )
-    if prefix == "finding":
-        finding = store.load_model(Finding, value)
-        return finding is not None and finding.room_id == room_id
-    if prefix == "decision":
-        decision = store.load_model(Decision, value)
-        return decision is not None and decision.room_id == room_id
-    if prefix == "message":
-        message = store.load_model(Message, value)
-        return message is not None and message.room_id == room_id
-    return False
-
-
 def _supersession_predecessor(
     store: SqliteRelayStore, room: Room, decision_id: str
 ) -> Decision | None:
@@ -552,7 +531,10 @@ def promote_room_decision(
     payload = parse_room_decision(reply.content)
     if payload is None:
         return None
-    if not all(_reference_resolves(store, room.id, ref) for ref in payload.references):
+    proposed = Decision(room_id=room.id, statement=payload.statement, references=list(payload.references))
+    try:
+        validate_decision_references(store, proposed)
+    except DecisionReferenceError:
         return None
     predecessor: Decision | None = None
     if payload.supersedes_decision_id is not None:

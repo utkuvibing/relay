@@ -621,6 +621,7 @@ class PlannerDecisionPayload(BaseModel):
     plan_effect: Literal["unchanged", "supersede"]
     statement: _BoundedText
     rationale: _BoundedText | None = None
+    references: tuple[StrictStr, ...] = Field(default_factory=tuple, max_length=16)
     revised_plan: StrictStr | None = None
 
     @field_validator("statement", "rationale")

@@ -29,6 +29,7 @@ from pydantic import ValidationError
 
 from relay.agents.base import AgentRole
 from relay.core.bus import ConversationBus, RoleResolver
+from relay.core.decision_references import DecisionReferenceError, validate_decision_references
 from relay.core.evidence import EvidenceKind, EvidenceStore
 from relay.core.policy import (
     BlockingBudgetExhausted,
@@ -160,9 +161,10 @@ _DECISION_REPLY_CONTRACT = (
     "[relay:stage-signal] Reply with EXACTLY one JSON object and nothing else:\n"
     '{"schema_version":"relay.planner_decision.v1","outcome":"accept"|"reject",'
     '"plan_effect":"unchanged"|"supersede","statement":"...","rationale":"...",'
-    '"revised_plan":"..."}\n'
+    '"revised_plan":"...","references":[]}\n'
     "supersede requires a non-empty revised_plan and is accept-only; "
-    "unchanged forbids revised_plan; reject keeps the plan unchanged."
+    "unchanged forbids revised_plan; reject keeps the plan unchanged. "
+    "references (maximum 16) use message:, finding:, plan:, artifact:, evidence:, or decision: IDs."
 )
 
 
@@ -833,13 +835,15 @@ def _promote_planner_decision(
         proposed_by=message.sender,
         accepted_by=reply.sender if accepted else None,
         status=DecisionStatus.ACCEPTED if accepted else DecisionStatus.REJECTED,
-        #: P7.3 (App. D.3): a Room-bound task's promoted decision is Room state,
-        #: with durable promotion provenance. Standalone builds keep BOTH unset
-        #: — the pre-P7.3 Decision shape stays byte-identical.
         room_id=task.room_id,
-        source_reply_id=reply.id if task.room_id is not None else None,
+        source_reply_id=reply.id,
         task_id=task.id,
+        references=list(payload.references),
     )
+    try:
+        validate_decision_references(store, decision)
+    except DecisionReferenceError:
+        return None
     exchange_refs = [
         f"task:{task.id}",
         f"decision:{decision.id}",

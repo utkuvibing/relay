@@ -29,6 +29,7 @@ Conversation is coordination input, not workflow authority. Messages cannot sile
 - `relay approve <task-id> --by <name>` records explicit human approval. The default path is `approval_required`; `approval: {mode: direct}` is an explicit opt-out that still requires verification and review evidence.
 - `relay continue [task-id] [--settle-interrupted]` resumes a parked build from durable ledger state — persisted stage boundaries advance without new agent runs, the fix-loop budget stays cumulative, and the frozen workspace baseline is verified before use. Resume pins the original implementer identity/model while verification, reviewer, approval, and budget policy come from the current `relay.yaml`.
 - `relay status`, `relay history`, and `relay inspect` expose the local ledger.
+- `relay why <decision-id> [--json]` reconstructs verified proposal, objection, evidence, rebuttal, and decision links for Room and standalone build decisions. It also shows provenance recorded directly on a Decision and marks missing historical links.
 
 The ledger lives at `.relay/relay.sqlite3` and stores tasks, runs, artifacts, tool runs, evidence, approvals, events, and inter-agent messages.
 
@@ -170,7 +171,6 @@ These are roadmap items, not current capabilities:
   per-participant canonical context reconstruction (never transcript replay),
   and honest external-session continuation (capability-gated, opt-in
   persistence, fresh-run fallback);
-- P8: decision provenance;
 - P9: Relay server;
 - P10: MCP and chat interface integration;
 - P11: adapter ecosystem and certification;

@@ -29,7 +29,9 @@ from typing import Literal, NoReturn
 from pydantic import ValidationError
 
 from relay.agents.base import AgentRole
+from relay.core.decision_references import DecisionReferenceError, validate_decision_references
 from relay.core.evidence import EvidenceKind
+from relay.core.finding_integrity import FindingIntegrityError, resolve_finding_source
 from relay.storage.models import (
     Artifact,
     ArtifactKind,
@@ -68,7 +70,6 @@ _PLAN_MARKER = "plan:"
 _SUPERSEDES_PLAN_MARKER = "supersedes_plan:"
 _DECISION_MARKER = "decision:"
 _SUPERSEDES_DECISION_MARKER = "supersedes_decision:"
-_FINDING_MARKER = "finding:"
 
 _MAX_CHAIN = 64
 
@@ -492,9 +493,10 @@ def _decision_nodes(store: SqliteRelayStore, room_id: str) -> tuple[RoomDecision
         if reply is None or reply.room_id != room_id:
             _fail(f"Room decision '{decision.id}' names a missing or foreign promotion reply")
         assert reply is not None  # narrowed for type checkers
-        for reference in decision.references:
-            if not _reference_in_room(store, room_id, reference):
-                _fail(f"Room decision '{decision.id}' cites an unresolvable reference '{reference}'")
+        try:
+            validate_decision_references(store, decision)
+        except DecisionReferenceError as exc:
+            _fail(f"Room decision '{decision.id}' cites an invalid reference: {exc}")
         if decision.status is DecisionStatus.SUPERSEDED and decision.id not in successors:
             _fail(f"Room decision '{decision.id}' is superseded without a successor")
         if decision.supersedes_decision_id is not None:
@@ -526,29 +528,6 @@ def _decision_nodes(store: SqliteRelayStore, room_id: str) -> tuple[RoomDecision
     return tuple(nodes)
 
 
-def _reference_in_room(store: SqliteRelayStore, room_id: str, reference: str) -> bool:
-    prefix, _, value = reference.partition(":")
-    if not value:
-        return False
-    if prefix == "plan":
-        artifact = store.load_model(Artifact, value)
-        return (
-            artifact is not None
-            and artifact.kind is ArtifactKind.PLAN
-            and artifact.room_id == room_id
-        )
-    if prefix == "finding":
-        finding = store.load_model(Finding, value)
-        return finding is not None and finding.room_id == room_id
-    if prefix == "decision":
-        decision = store.load_model(Decision, value)
-        return decision is not None and decision.room_id == room_id
-    if prefix == "message":
-        message = store.load_model(Message, value)
-        return message is not None and message.room_id == room_id
-    return False
-
-
 def _finding_nodes(store: SqliteRelayStore, room_id: str) -> tuple[RoomFindingNode, ...]:
     findings = list(
         store.all_models(
@@ -557,29 +536,12 @@ def _finding_nodes(store: SqliteRelayStore, room_id: str) -> tuple[RoomFindingNo
     )
     nodes: list[RoomFindingNode] = []
     for finding in findings:
-        task = store.load_model(Task, finding.task_id)
-        if task is None or task.room_id != room_id:
-            _fail(f"finding '{finding.id}' names a task outside this Room")
-        artifact = store.load_model(Artifact, finding.review_artifact_id)
-        if (
-            artifact is None
-            or artifact.kind is not ArtifactKind.REVIEW_FINDING
-            or artifact.task_id != finding.task_id
-        ):
-            _fail(f"finding '{finding.id}' names a foreign review artifact")
-        run = store.load_model(Run, finding.review_run_id)
-        if run is None or run.id != artifact.run_id:
-            _fail(f"finding '{finding.id}' names a foreign review run")
-        assert artifact is not None and run is not None  # narrowed for type checkers
-        marker = _single_marker(
-            store,
-            room_id,
-            EventType.FINDING_RECORDED,
-            f"{_FINDING_MARKER}{finding.id}",
-            f"finding '{finding.id}'",
-        )
-        if f"artifact:{artifact.id}" not in marker.references:
-            _fail(f"finding '{finding.id}' marker contradicts its review artifact")
+        if finding.room_id != room_id:
+            _fail(f"finding '{finding.id}' belongs to another Room")
+        try:
+            artifact, run = resolve_finding_source(store, finding)
+        except FindingIntegrityError as exc:
+            _fail(str(exc))
         nodes.append(RoomFindingNode(finding=finding, review_artifact=artifact, review_run=run))
     return tuple(nodes)
 
