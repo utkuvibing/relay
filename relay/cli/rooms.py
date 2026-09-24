@@ -513,6 +513,15 @@ def graph_room(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable graph."),
 ) -> None:
     """Render the canonical Room plan/decision/finding graph (P7.3)."""
+    from relay.cli.server_client import request, server_url
+
+    if server_url():
+        from urllib.parse import quote
+
+        view = request("GET", "/rooms/" + quote(selector, safe="") + "/graph")
+        typer.echo(json.dumps(view, ensure_ascii=True))
+        return
+
     from relay.cli.main import _open_db
     from relay.core.room_graph import RoomGraphIntegrityError, build_room_graph
 

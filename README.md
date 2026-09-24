@@ -153,6 +153,20 @@ transcript replay. External harness sessions resume only when the agent declares
 (`harness.persist_session_ref: true`); otherwise the prompt honestly states the
 fresh-run fallback and the canonical store stays the source of truth.
 
+### Local server
+
+Phase 9 exposes one initialized workspace on loopback. Set
+`RELAY_SERVER_TOKEN` before `relay serve`; every REST request and WebSocket
+handshake requires `Authorization: Bearer <token>`.
+
+Set `RELAY_SERVER_URL=http://127.0.0.1:8765` and the same token in another
+terminal to use server mode for `relay task-create`, `relay message-send`,
+`relay discuss`, `relay room graph`, `relay approve`, and `relay status`.
+Without `RELAY_SERVER_URL`, these commands use the local ledger. Draft task
+creation and message sending do not invoke agents. The read-only
+`/v1/events/ws?last_sequence=N` stream sends events after the last one seen;
+sequence gaps are valid.
+
 ### Adapters and authentication
 
 The current adapter registry includes OpenAI-compatible API adapters and harness adapters for Codex CLI, Claude Code, and Antigravity CLI. API keys stay in environment variables. Harnesses own their login and session authentication.
@@ -171,7 +185,6 @@ These are roadmap items, not current capabilities:
   per-participant canonical context reconstruction (never transcript replay),
   and honest external-session continuation (capability-gated, opt-in
   persistence, fresh-run fallback);
-- P9: Relay server;
 - P10: MCP and chat interface integration;
 - P11: adapter ecosystem and certification;
 - P12: TUI.

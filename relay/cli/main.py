@@ -58,6 +58,94 @@ app = typer.Typer(
 )
 
 
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Loopback interface only."),
+    port: int = typer.Option(8765, "--port", min=1, max=65535),
+) -> None:
+    """Serve the initialized workspace over an authenticated local API."""
+    import ipaddress
+
+    import uvicorn
+
+    from relay.server import create_app
+    from relay.server.operations import OperationError
+
+    try:
+        if not ipaddress.ip_address(host).is_loopback:
+            raise OperationError("server may bind only to a loopback address")
+        server = create_app(Path.cwd())
+    except (ValueError, ConfigError, OperationError) as exc:
+        typer.echo(f"ERROR {exc}")
+        raise typer.Exit(1) from exc
+    uvicorn.run(server, host=host, port=port, workers=1)
+
+
+@app.command("task-create")
+def task_create(title: str) -> None:
+    """Create a draft task without starting execution."""
+    import json
+
+    from relay.cli.server_client import request, server_url
+    from relay.server.operations import OperationError, RelayOperations
+
+    if server_url():
+        result = request("POST", "/tasks", {"title": title})
+    else:
+        try:
+            result = RelayOperations(Path.cwd()).create_task(title)
+        except (ConfigError, OperationError) as exc:
+            typer.echo(f"ERROR {exc}")
+            raise typer.Exit(1) from exc
+    typer.echo(json.dumps(result, ensure_ascii=True))
+
+
+@app.command("message-send")
+def message_send(
+    recipient: str,
+    content: str,
+    by: str = typer.Option(..., "--by"),
+    room: str | None = typer.Option(None, "--room"),
+    task: str | None = typer.Option(None, "--task"),
+    message_type: str = typer.Option("note", "--type"),
+) -> None:
+    """Persist an addressed human message without invoking an agent."""
+    import json
+
+    from relay.cli.server_client import request, server_url
+    from relay.server.operations import RelayOperations
+    from relay.storage.models import MessageType
+
+    try:
+        kind = MessageType(message_type)
+        if server_url():
+            result = request(
+                "POST",
+                "/messages",
+                {
+                    "recipient": recipient,
+                    "content": content,
+                    "by": by,
+                    "room_id": room,
+                    "task_id": task,
+                    "type": kind.value,
+                },
+            )
+        else:
+            result = RelayOperations(Path.cwd()).send_message(
+                by=by,
+                recipient=recipient,
+                content=content,
+                room_id=room,
+                task_id=task,
+                message_type=kind,
+            )
+    except ValueError as exc:
+        typer.echo(f"ERROR {exc}")
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(result, ensure_ascii=True))
+
+
 def _out() -> Console:
     """A Console bound to the *current* stdout (test runners swap it)."""
     return Console()
@@ -508,6 +596,15 @@ def approve(
     store refuses it from any non-``human:`` producer. The machine's
     ``APPROVAL_REQUIRED -> DONE`` edge demands it.
     """
+    from relay.cli.server_client import request, server_url
+
+    if server_url():
+        from urllib.parse import quote
+
+        request("POST", f"/tasks/{quote(task_id, safe='')}/approve", {"by": by})
+        _out().print(f"[green]task {task_id} approved by human:{by} - DONE[/green]")
+        return
+
     from relay.core.orchestrator import advance_task
     from relay.core.state_machine import StateMachineError
     from relay.storage.models import Approval, EventLogEntry, EventType
@@ -677,6 +774,14 @@ _STATUS_TASKS = 5  # recent-task rows shown by `relay status` (P3.4)
 @app.command()
 def status() -> None:
     """Show workspace state, agent configuration, and task positions (P3.4)."""
+    from relay.cli.server_client import request, server_url
+
+    if server_url():
+        import json
+
+        typer.echo(json.dumps(request("GET", "/status"), ensure_ascii=True))
+        return
+
     from relay.cli.render import status as render_status
     from relay.cli.taskview import build_task_view
 
