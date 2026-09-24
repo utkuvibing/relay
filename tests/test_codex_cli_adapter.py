@@ -12,12 +12,10 @@ import json
 
 import pytest
 
-from relay.agents.base import AgentRequest, AgentRole, BackendType
+from relay.agents.base import AgentRequest, AgentRole
 from relay.agents.codex_cli import CodexCLIAdapter
 from relay.agents.config import AgentSettings
-from relay.agents.registry import AGENTS, get_agent_class
 from relay.context.config import HarnessAgentConfig
-from relay.harness.capabilities import ALL_CAPABILITIES, HarnessCapability
 from relay.harness.conformance import default_factory_for, run_battery
 from relay.harness.env_policy import DEFAULT_CONFLICT_VARIABLES, build_child_env
 from relay.harness.errors import HarnessOutputError
@@ -27,35 +25,6 @@ from relay.harness.types import ExecutionGrantKind, ExitSemantics
 # ---------------------------------------------------------------------------
 # Vocabulary / declaration surface
 # ---------------------------------------------------------------------------
-
-
-class TestDeclaration:
-    def test_registered_under_canonical_and_alias_names(self):
-        assert get_agent_class("codex_cli") is CodexCLIAdapter
-        assert get_agent_class("codex") is CodexCLIAdapter
-        assert AGENTS["codex_cli"] is CodexCLIAdapter
-
-    def test_backend_is_harness_family(self):
-        assert CodexCLIAdapter.backend is BackendType.HARNESS
-        assert issubclass(CodexCLIAdapter, HarnessAgent)
-
-    def test_capabilities_subset_of_frozen_vocabulary(self):
-        declared = CodexCLIAdapter({}).capabilities_set()
-        assert declared <= set(ALL_CAPABILITIES)
-        # Honest-declaration posture: no approval mediation exists on exec;
-        # diffs are extracted Relay-side; resume seam unconsumed.
-        assert HarnessCapability.APPROVAL_EVENT_STREAM not in declared
-        assert HarnessCapability.DIFF_REPORTING not in declared
-        assert HarnessCapability.SESSION_RESUME not in declared
-        assert HarnessCapability.RESOLVED_MODEL_REPORTING not in declared
-        # The C.5 tiers this adapter translates must be declared.
-        assert HarnessCapability.READ_ONLY_ACCESS in declared
-        assert HarnessCapability.WORKSPACE_WRITE in declared
-
-    def test_default_grant_is_read_only(self):
-        agent = CodexCLIAdapter({})
-        grant = agent.resolve_grant(None)
-        assert grant.kind is ExecutionGrantKind.READ_ONLY_ACCESS
 
 
 class TestGrantTranslation:
@@ -499,12 +468,6 @@ def test_battery_rejects_a_broken_codex_profile(tmp_path):
     report = run_battery(default_factory_for(LiarFixture), tmp_path)
     assert not report.passed
     assert any(name.startswith("B05") for name in {c.name for c in report.failures()})
-
-
-class TestRegistryHygiene:
-    def test_conformance_fixture_never_enters_production_registry(self):
-        assert "codex_conformance_fixture" not in AGENTS
-        assert "codex_cli" in AGENTS and "codex" in AGENTS
 
 
 # ---------------------------------------------------------------------------

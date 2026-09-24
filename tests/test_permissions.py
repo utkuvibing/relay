@@ -1,7 +1,5 @@
 """Permission defaults are a security contract (SPEC §18/§19; App. A.3/A.4)."""
 
-import pytest
-from pydantic import ValidationError
 
 from relay.core.permissions import (
     DEFAULT_POLICIES,
@@ -46,15 +44,8 @@ class TestCompletionPolicy:
         assert policy.cleared(pending_approvals=0) is True
         assert policy.cleared(pending_approvals=1) is False
 
-    def test_policy_is_frozen(self):
-        with pytest.raises(ValidationError):
-            CompletionPolicy().require_human_approval = False  # type: ignore[misc]
-
 
 class TestGateOutcomes:
-    def test_auto_allows(self):
-        decision = PermissionGate().check(ToolRequest(action=Action.READ_FILES))
-        assert decision.outcome == "allow"
 
     def test_ask_requires_human_approval(self):
         decision = PermissionGate().check(

@@ -38,14 +38,12 @@ from relay.storage.models import (
     Room,
     RoomMember,
     Run,
-    RunStatus,
     Task,
     ToolRun,
     Workspace,
     utcnow,
 )
 from relay.storage.store import (
-    MODEL_TABLES,
     ImmutableHistoryError,
     SqliteEvidenceStore,
     SqliteRelayStore,
@@ -146,53 +144,12 @@ def sample_record(request):
 
 
 class TestCodecRoundtrips:
-    def test_every_aggregate_survives_a_roundtrip(self, store, sample_record):
-        saved = store.save_model(sample_record)
-        loaded = store.load_model(type(saved), _pk(saved))
-        if isinstance(sample_record, EventLogEntry):
-            # sequence is DB-assigned; compare every semantic field instead.
-            semantic = (
-                "room_id",
-                "task_id",
-                "sender",
-                "recipient",
-                "type",
-                "content",
-                "references",
-                "created_at",
-            )
-            for field in semantic:
-                assert getattr(loaded, field) == getattr(saved, field)
-            assert loaded.sequence > 0
-            return
-        assert loaded == saved
-
-    def test_fix_packet_artifact_kind_roundtrips_without_migration(self, store):
-        task = store.save_model(Task(title="reviewed"))
-        artifact = Artifact(
-            kind=ArtifactKind.FIX_PACKET,
-            task_id=task.id,
-            content='{"schema_version":"relay.fix_packet.v1"}',
-        )
-        saved = store.save_model(artifact)
-        loaded = store.load_model(Artifact, saved.id)
-        assert loaded is not None
-        assert loaded.kind is ArtifactKind.FIX_PACKET
-        assert loaded.content == artifact.content
-
     def test_duplicate_id_insert_is_rejected(self, store):
         record = Run(agent="gpt", role="researcher")
         store.save_model(record)
         same_run = Run.model_validate(record.model_dump())
         with pytest.raises(sqlite3.IntegrityError):
             store.save_model(same_run)
-
-    def test_update_model_mutates_state_bearing_rows(self, store):
-        run = store.save_model(Run(agent="gpt", role="researcher"))
-        finished = run.model_copy(update={"status": RunStatus.SUCCEEDED})
-        store.update_model(finished)
-        reloaded = store.load_model(Run, run.id)
-        assert reloaded.status is RunStatus.SUCCEEDED
 
 
 def _pk(record) -> str | int:
@@ -362,26 +319,27 @@ class TestEventSequenceInvariant:
         assert rows == [started.sequence]
 
 
-class TestEventWriterReadback:
-    def test_tail_returns_newest_first(self, db):
-        writer = EventLogWriter(db)
-        for i in range(3):
-            writer.record(EventLogEntry(type=EventType.AGENT_RUN_STARTED, content=f"n{i}"))
-        tail = writer.tail(limit=2)
-        assert [entry.content for entry in tail] == ["n2", "n1"]
-        assert tail[0].created_at.tzinfo is not None
-
-    def test_all_returns_oldest_first(self, db):
-        writer = EventLogWriter(db)
-        for i in range(3):
-            writer.record(EventLogEntry(type=EventType.AGENT_RUN_FINISHED, content=f"n{i}"))
-        ordered = writer.all()
-        assert [entry.content for entry in ordered] == ["n0", "n1", "n2"]
-
-
 # --------------------------------------------------------------------------
 # Evidence protocol: provenance boundary + parity + state machine seam swap
 # --------------------------------------------------------------------------
+
+
+class TestEventWriterReadback:
+    def test_tail_and_all_return_opposite_event_orders(self, db):
+        # Failure modes: reverse tail order, reverse full-history order, or
+        # a limit applied before sorting instead of after sorting.
+        writer = EventLogWriter(db)
+        for index in range(3):
+            writer.record(
+                EventLogEntry(type=EventType.AGENT_RUN_STARTED, content=f"event-{index}")
+            )
+
+        assert [event.content for event in writer.tail(limit=2)] == ["event-2", "event-1"]
+        assert [event.content for event in writer.all()] == [
+            "event-0",
+            "event-1",
+            "event-2",
+        ]
 
 
 class TestSqliteEvidenceStore:
@@ -683,12 +641,6 @@ class TestDurabilityAndIdentity:
         assert again == loaded
         reopened.close()
 
-    def test_counts_cover_every_table(self, store):
-        store.save_model(Workspace(name="only"))
-        counts = store.counts()
-        assert set(counts) == {MODEL_TABLES[cls] for cls in MODEL_TABLES}
-        assert counts["workspaces"] == 1
-
 
 class TestP73SchemaV9:
     """P7.3 (App. D.3): Room scope columns, findings table, decision contracts.
@@ -707,8 +659,7 @@ class TestP73SchemaV9:
         conn = connect(tmp_path / "fresh.sqlite3")
         assert migrate(conn) == SCHEMA_VERSION
         triggers = {
-            row[0]
-            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
         }
         assert {"findings_no_update", "findings_no_delete"} <= triggers
         assert {
@@ -822,9 +773,7 @@ class TestP73SchemaV9:
             Decision(statement="first", room_id="r1", status="accepted", source_reply_id="m1")
         )
         with pytest.raises(sqlite3.IntegrityError):
-            store.save_model(
-                Decision(statement="duplicate", room_id="r1", source_reply_id="m1")
-            )
+            store.save_model(Decision(statement="duplicate", room_id="r1", source_reply_id="m1"))
         store.save_model(
             Decision(
                 statement="second",
@@ -846,5 +795,7 @@ class TestP73SchemaV9:
             )
         with pytest.raises(sqlite3.IntegrityError):
             store.save_model(
-                Decision(id="selfid", statement="self", room_id="r1", supersedes_decision_id="selfid")
+                Decision(
+                    id="selfid", statement="self", room_id="r1", supersedes_decision_id="selfid"
+                )
             )

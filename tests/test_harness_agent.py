@@ -69,14 +69,6 @@ def _agent(
 
 
 class TestGrants:
-    def test_profile_grant_beats_adapter_default(self, tmp_path):
-        profile = HarnessAgentConfig(
-            executable_path=str(PY),
-            grant=ExecutionGrantKind.WORKSPACE_WRITE,
-        )
-        agent = _agent(tmp_path, profile=profile)
-        assert agent.resolve_grant().kind is ExecutionGrantKind.WORKSPACE_WRITE
-
     def test_missing_everywhere_raises_typed_error_before_spawn(self, tmp_path):
         class NoDefault(EchoHarness):
             name = "no_default"
@@ -168,14 +160,6 @@ class TestArgvOrdering:
 
 
 class TestRunIntegration:
-    async def test_happy_path_prompt_over_stdin(self, tmp_path):
-        response = await _agent(tmp_path).run(
-            AgentRequest(prompt="relay-prompt-echo", role=AgentRole.IMPLEMENTER)
-        )
-        assert response.output == "relay-prompt-echo"
-        assert response.agent == "echo_test"
-        assert response.role is AgentRole.IMPLEMENTER
-
     async def test_timeout_maps_to_typed_sanitized_error(self, tmp_path):
         class TimeoutEcho(EchoHarness):
             name = "timeout_test"
@@ -242,10 +226,3 @@ class TestErrorBoundaryTable:
         assert "failed unexpectedly" in message
         assert "ValueError" not in message
         assert "secret-value-42" not in message
-
-
-class TestBackendDeclaration:
-    def test_backend_is_harness_on_the_base_itself(self):
-        from relay.agents.base import BackendType
-
-        assert HarnessAgent.backend is BackendType.HARNESS

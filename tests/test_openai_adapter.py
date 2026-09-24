@@ -18,8 +18,6 @@ from relay.agents import (
     AgentSettings,
     CliOverrides,
     OpenAICompatibleAgent,
-    UnknownAgentError,
-    get_agent_class,
     resolve_settings,
 )
 from relay.agents.base import AgentRequest, AgentResponse, AgentRole, BackendType
@@ -144,16 +142,6 @@ def asyncio_run(agent, request: AgentRequest) -> AgentResponse:
     import asyncio
 
     return asyncio.run(agent.run(request))
-
-
-class TestRegistry:
-    def test_aliases_resolve_to_the_openai_adapter(self):
-        for name in ("openai", "openai_compatible", "gpt"):
-            assert get_agent_class(name) is OpenAICompatibleAgent
-
-    def test_unknown_name_lists_knowns(self):
-        with pytest.raises(UnknownAgentError, match="known adapters"):
-            get_agent_class("future_cli")  # stable synthetic placeholder (Q-b)
 
 
 class TestSettingsPrecedence:

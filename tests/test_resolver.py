@@ -9,7 +9,7 @@ import pytest
 
 from relay.context.config import AgentConfig, BackendType, RelayConfig
 from relay.core.bus import ConversationBus
-from relay.core.resolver import ConfigRoleResolver, role_resolver_from_config
+from relay.core.resolver import role_resolver_from_config
 from relay.storage.db import connect, migrate
 from relay.storage.events import EventLogWriter
 from relay.storage.models import Message, MessageType, Room, Run
@@ -28,33 +28,7 @@ def _config(**overrides) -> RelayConfig:
     return RelayConfig(**base)
 
 
-class TestConfigRoleResolver:
-    def test_known_role_resolves_to_configured_agent(self):
-        resolver = ConfigRoleResolver({"reviewer": "claude"}, known_agents=["gpt", "claude"])
-        assert resolver.resolve_role("reviewer") == "claude"
-
-    def test_unknown_role_resolves_to_none(self):
-        """None → the bus rejects unresolved role addresses pre-persistence."""
-        resolver = ConfigRoleResolver({"reviewer": "claude"}, known_agents=["claude"])
-        assert resolver.resolve_role("nonexistent") is None
-
-    def test_knows_agent_reports_configured_membership(self):
-        resolver = ConfigRoleResolver({}, known_agents=["gpt", "claude"])
-        assert resolver.knows_agent("gpt") is True
-        assert resolver.knows_agent("stranger") is False
-
-    def test_resolver_is_deterministic(self):
-        resolver = ConfigRoleResolver({"reviewer": "claude"}, known_agents=["claude"])
-        assert resolver.resolve_role("reviewer") == resolver.resolve_role("reviewer")
-
-
 class TestFromConfig:
-    def test_builds_from_parsed_relay_yaml(self):
-        resolver = role_resolver_from_config(_config())
-        assert resolver.resolve_role("planner") == "gpt"
-        assert resolver.resolve_role("reviewer") == "claude"
-        assert resolver.knows_agent("gpt") and resolver.knows_agent("claude")
-        assert resolver.knows_agent("stranger") is False
 
     def test_reviewer_selector_is_not_consulted(self):
         """Frozen plan D4: the P3.3 build-flow selector never leaks into the

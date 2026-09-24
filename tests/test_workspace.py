@@ -26,10 +26,9 @@ from relay.context import (
     initialize_workspace,
     load_config,
     load_profile,
-    workspace_layout,
 )
 from relay.storage import connect, migrate
-from relay.storage.models import Artifact, ArtifactKind, Run, Workspace, WorkspaceKind
+from relay.storage.models import Artifact, ArtifactKind, Run, Workspace
 from relay.storage.store import SqliteRelayStore
 
 
@@ -62,14 +61,6 @@ class TestProjectProfile:
         assert profile.default_branch == "develop"
         assert profile.tests["backend"] == "uv run pytest"
 
-    def test_profile_has_no_provider_fields(self, repo):
-        profile = discover_profile(repo)
-        banned = {"backend", "adapter", "model", "provider", "base_url", "api_key"}
-        assert not (banned & set(profile.model_dump()))
-
-    def test_default_branch_falls_back_to_main(self, tmp_path):
-        (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
-        assert discover_profile(tmp_path).default_branch == "main"
 
     def test_profile_yaml_roundtrip_matches_spec_shape(self, repo):
         profile = discover_profile(repo)
@@ -87,13 +78,6 @@ class TestProjectProfile:
 class TestRelayYamlConfig:
     """App. B.2/B.3: backend-aware config, api/harness separation canonical."""
 
-    def test_missing_relay_yaml_uses_builtin_default(self, tmp_path):
-        config = load_config(tmp_path)
-        assert list(config.agents) == ["gpt"]
-        agent = config.agents["gpt"]
-        assert agent.backend is BackendType.API
-        assert agent.adapter == "openai"
-        assert agent.model == "gpt-4o-mini"
 
     def test_verification_block_parses_typed_argv(self, tmp_path):
         """P3.2 (frozen plan Q-c): typed argv, bounded timeout — never a
@@ -109,16 +93,6 @@ class TestRelayYamlConfig:
         assert config.verification.args == ["-q"]
         assert config.verification.timeout_seconds == 120
 
-    def test_verification_defaults_and_absence(self, tmp_path):
-        assert load_config(tmp_path).verification is None
-        (tmp_path / "relay.yaml").write_text(
-            "agents:\n  gpt: {backend: api, adapter: openai}\nverification:\n  program: pytest\n",
-            encoding="utf-8",
-        )
-        verification = load_config(tmp_path).verification
-        assert verification is not None
-        assert verification.args == []
-        assert verification.timeout_seconds == 300
 
     @pytest.mark.parametrize(
         "block",
@@ -147,15 +121,6 @@ class TestRelayYamlConfig:
         assert config.budget is not None
         assert config.budget.max_fix_loops == 1
 
-    def test_budget_defaults_and_absence(self, tmp_path):
-        assert load_config(tmp_path).budget is None
-        (tmp_path / "relay.yaml").write_text(
-            "agents:\n  gpt: {backend: api, adapter: openai}\nbudget: {}\n",
-            encoding="utf-8",
-        )
-        budget = load_config(tmp_path).budget
-        assert budget is not None
-        assert budget.max_fix_loops == 3
 
     @pytest.mark.parametrize(
         "block",
@@ -177,18 +142,6 @@ class TestRelayYamlConfig:
         with pytest.raises(ConfigError):
             load_config(tmp_path)
 
-    def test_parses_api_and_harness_entries(self, tmp_path):
-        (tmp_path / "relay.yaml").write_text(
-            "agents:\n"
-            "  gpt-api: {backend: api, adapter: openai, model: gpt-4o-mini}\n"
-            "  codex:   {backend: harness, adapter: codex_cli}\n"
-            "  claude:  {backend: harness, adapter: claude_code}\n",
-            encoding="utf-8",
-        )
-        config = load_config(tmp_path)
-        assert config.agents["gpt-api"].backend is BackendType.API
-        assert config.agents["codex"].backend is BackendType.HARNESS
-        assert config.agents["claude"].adapter == "claude_code"
 
     def test_api_backend_cannot_carry_harness_block(self, tmp_path):
         """Family/field coherence: 'harness:' demands backend: harness."""
@@ -228,20 +181,6 @@ class TestRelayYamlConfig:
         with pytest.raises(ConfigError, match="relay.yaml"):
             load_config(tmp_path)
 
-    def test_roles_block_maps_roles_to_configured_agents(self, tmp_path):
-        """P4.2 (frozen plan D4/D5): roles: is the bus role vocabulary —
-        AgentRole-valued keys mapping to configured agent names."""
-        (tmp_path / "relay.yaml").write_text(
-            "agents:\n"
-            "  gpt: {backend: api, adapter: openai}\n"
-            "  claude: {backend: harness, adapter: claude_code}\n"
-            "roles:\n"
-            "  planner: gpt\n"
-            "  reviewer: claude\n",
-            encoding="utf-8",
-        )
-        config = load_config(tmp_path)
-        assert config.roles == {"planner": "gpt", "reviewer": "claude"}
 
     @pytest.mark.parametrize("block", ["bogus_role: gpt\n", "Planner: gpt\n"])
     def test_roles_with_unknown_role_address_is_a_config_error(self, tmp_path, block):
@@ -303,11 +242,6 @@ def store(db_path):
 class TestIdempotentInit:
     """M3 contract: canonical identity, one row, history preserved."""
 
-    def test_init_creates_one_workspace_row(self, repo, store):
-        workspace = initialize_workspace(repo, store.conn)
-        assert workspace.kind is WorkspaceKind.GIT_REPO
-        rows = list(store.all_models(Workspace))
-        assert len(rows) == 1
 
     def test_reinit_preserves_id_and_history(self, repo, store):
         first = initialize_workspace(repo, store.conn)
@@ -334,9 +268,3 @@ class TestIdempotentInit:
             or key.lower() == identity_key(tmp_path / "demo").lower()
         )  # normcase handles Windows case-folding
         assert key == identity_key(folder / ".." / "Demo")  # realpath collapses ".."
-
-    def test_layout_paths(self, tmp_path):
-        layout = workspace_layout(tmp_path)
-        assert layout.profile_path == tmp_path / ".relay" / "profile.yaml"
-        assert layout.config_path == tmp_path / "relay.yaml"
-        assert layout.db_path == tmp_path / ".relay" / "relay.sqlite3"

@@ -26,6 +26,7 @@ from typing import Any
 
 import httpx
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 import relay.agents.openai as openai_mod
@@ -110,7 +111,11 @@ def _open_store(db_path):
 class TestOfflineE2E:
     def test_init_then_ask_success_persists_everything(self, workspace, db):
         assert runner.invoke(app, ["init"]).exit_code == 0
-        assert (workspace / ".relay" / "profile.yaml").is_file()
+        profile_path = workspace / ".relay" / "profile.yaml"
+        assert profile_path.is_file()
+        assert yaml.safe_load(profile_path.read_text(encoding="utf-8"))["project"][
+            "default_branch"
+        ] == "main"
         assert (workspace / "relay.yaml").is_file()
 
         result = _patched_invoke(
@@ -147,6 +152,29 @@ class TestOfflineE2E:
             assert all(b > a for a, b in itertools.pairwise(sequences))
             assert f"run:{run.id}" in events[0].references
             assert f"artifact:{by_kind[ArtifactKind.RUN_OUTPUT].id}" in events[1].references
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize("adapter", ["gpt", "openai_compatible"])
+    def test_openai_adapter_aliases_complete_a_cli_run(self, workspace, db, adapter):
+        assert runner.invoke(app, ["init"]).exit_code == 0
+        (workspace / "relay.yaml").write_text(
+            f"agents:\n  alias: {{backend: api, adapter: {adapter}, model: offline}}\n",
+            encoding="utf-8",
+        )
+
+        result = _patched_invoke(
+            ["ask", "alias", "ping"],
+            lambda request: httpx.Response(200, json=_completion("alias answered")),
+        )
+        assert result.exit_code == 0, result.output
+
+        conn, store = _open_store(db)
+        try:
+            run = next(iter(store.all_models(Run)))
+            assert run.status is RunStatus.SUCCEEDED
+            outputs = store.artifacts_for_run(run.id, kind=ArtifactKind.RUN_OUTPUT)
+            assert [artifact.content for artifact in outputs] == ["alias answered"]
         finally:
             conn.close()
 
@@ -633,7 +661,7 @@ class TestHarnessRefusal:
         assert "'harness'" in result.output
         assert result.exception is None or isinstance(result.exception, SystemExit)
 
-    def test_harness_agent_end_to_end_via_transient_registration(self, workspace):
+    def test_harness_agent_end_to_end_via_transient_registration(self, workspace, db):
         """Full ask-flow through the generic runtime using a registered fake.
 
         The fake NEVER enters AGENTS (G0#3); executable_path comes from
@@ -666,6 +694,23 @@ class TestHarnessRefusal:
             result = runner.invoke(app, ["ask", "echoh", "ping-marker"])
         assert result.exit_code == 0, result.output
         assert "c7echo:ping-marker" in result.output
+
+        # The persisted database is this run's verifiable artifact. Reopening
+        # it proves the CLI, factory, child process, and store completed the
+        # same request without relying on the transient registration afterward.
+        assert db.is_file()
+        conn, store = _open_store(db)
+        try:
+            runs = list(store.all_models(Run))
+            assert len(runs) == 1
+            assert runs[0].status is RunStatus.SUCCEEDED
+            artifacts = store.artifacts_for_run(runs[0].id)
+            assert {artifact.kind: artifact.content for artifact in artifacts} == {
+                ArtifactKind.RUN_INPUT: "ping-marker",
+                ArtifactKind.RUN_OUTPUT: "c7echo:ping-marker",
+            }
+        finally:
+            conn.close()
 
     def test_room_ask_harness_runtime_probe_happens_after_request_persistence(
         self, workspace, db

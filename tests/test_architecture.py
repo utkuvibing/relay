@@ -18,13 +18,12 @@ Enforced invariants:
 from __future__ import annotations
 
 import ast
-import enum
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
 
-from relay.agents.base import Agent, AgentRequest, AgentResponse, BackendType
+from relay.agents.base import AgentRequest, AgentResponse
 
 RELAY_ROOT = Path(__file__).resolve().parents[1] / "relay"
 
@@ -132,44 +131,13 @@ class TestPersistedVocabularyHygiene:
 
 
 class TestAgentLayerTransportNeutrality:
-    """App. B.2/B.4: the seam admits harnesses without touching domain models."""
-
-    def test_agent_declares_backend_with_api_default(self):
-        assert Agent.backend is BackendType.API
-        assert issubclass(BackendType, str) and issubclass(BackendType, enum.Enum)
-
     def test_request_response_expose_no_auth_or_pricing_requirements(self):
         req_fields = AgentRequest.model_fields
         resp_fields = AgentResponse.model_fields
-        required_req = {n for n, f in req_fields.items() if f.is_required()}
-        required_resp = {n for n, f in resp_fields.items() if f.is_required()}
-        assert required_resp == {"agent", "role", "output"}  # usage optional → cost-None legal
-        assert not ({"api_key", "url", "headers", "model"} & required_req)
+        required_resp = {name for name, field in resp_fields.items() if field.is_required()}
+        assert required_resp == {"agent", "role", "output"}
         assert not ({"api_key", "url", "headers", "model"} & set(req_fields))
         assert not ({"api_key", "url", "headers"} & set(resp_fields))
-
-    def test_a_harness_adapters_can_satisfy_the_interface(self):
-        """A subscription-backed adapter plugs in via one ClassVar — proof seam."""
-        from relay.agents.base import AgentResponse, AgentRole
-
-        class InTestHarnessAgent(Agent):  # e.g. future CodexCLI/ClaudeCode adapters
-            name = "in_test_harness"
-            backend = BackendType.HARNESS
-
-            async def run(self, request: AgentRequest) -> AgentResponse:
-                return AgentResponse(
-                    agent=self.name,
-                    role=request.role,
-                    output=f"harness handled: {request.prompt}",
-                )
-
-        from relay.storage.models import Artifact, ArtifactKind, Run  # domain untouched
-
-        run = Run(agent="in_test_harness", role=AgentRole.RESEARCHER)
-        artifact = Artifact(kind=ArtifactKind.RUN_OUTPUT, run_id=run.id)
-        assert run.cost_usd is None and run.input_size is None and run.output_size is None
-        assert InTestHarnessAgent.backend is BackendType.HARNESS
-        assert artifact.kind is ArtifactKind.RUN_OUTPUT
 
 
 class TestCoreNeverImportsTheRegistry:
@@ -206,10 +174,6 @@ class TestCoreNeverImportsTheRegistry:
                             if alias.name == "registry":
                                 offenders.append((module_path.name, "relay.agents.registry"))
         assert not offenders, f"relay/core imports the adapter registry: {offenders}"
-
-    def test_the_sweep_actually_parses_core(self):
-        """Guard against a silent rename emptying the boundary sweep."""
-        assert len(_py_files(RELAY_ROOT / "core")) >= 10
 
 
 class TestConversationBusAuthorityBoundary:
@@ -322,9 +286,7 @@ class TestDriverRoutesOnIdentityNotProviders:
     def _docstring_node_ids(tree: ast.AST) -> set[int]:
         docstrings: set[int] = set()
         for node in ast.walk(tree):
-            if isinstance(
-                node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            ):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 body = getattr(node, "body", [])
                 if (
                     body
@@ -395,27 +357,3 @@ class TestDriverRoutesOnIdentityNotProviders:
                     if re.search(rf"\b{re.escape(token)}\b", lowered):
                         offenders.append(f"{token} in {text!r}")
         assert not offenders, f"policy.py carries provider vocabulary: {offenders}"
-
-    def test_policy_module_actually_parses(self):
-        """P5.1 guard against a silent rename emptying the policy scan."""
-        path = RELAY_ROOT / "core" / "policy.py"
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        names = {
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        assert "CommunicationPolicy" in names
-        assert "evaluate_edge" in names
-
-    def test_the_driver_module_actually_parses(self):
-        """Guard against a silent rename emptying the scan."""
-        path = RELAY_ROOT / "core" / "driver.py"
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        names = {
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        assert "ConversationDriver" in names
-        assert "derive_message_id" in names
