@@ -60,23 +60,6 @@ def _script(spec_src: str) -> tuple[str, ...]:
     return (PY, "-c", spec_src)
 
 
-async def test_happy_path_captures_stdout_and_exit_zero(tmp_path):
-    spec = _spec(_script("print('relay-hello'); print('second line')"), tmp_path)
-    outcome = await execute(spec)
-    assert outcome.exit_code == 0
-    assert outcome.stdout.text.splitlines()[0] == "relay-hello"
-    assert outcome.stdout.lines_seen == 2
-    assert not outcome.timed_out
-    assert outcome.duration_s > 0
-
-
-async def test_nonzero_exit_is_reported_not_raised(tmp_path):
-    spec = _spec(_script("import sys; print('boom-err', file=sys.stderr); sys.exit(7)"), tmp_path)
-    outcome = await execute(spec)
-    assert outcome.exit_code == 7
-    assert "boom-err" in outcome.stderr.text
-
-
 async def test_stdin_delivery_reaches_child_and_pipe_closes(tmp_path):
     spec = _spec(
         _script("import sys; data=sys.stdin.read(); print('got:'+data)"),

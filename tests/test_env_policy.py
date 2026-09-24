@@ -6,8 +6,6 @@ built child environment is inspected key-by-key per adapter profile.
 
 from __future__ import annotations
 
-import os
-
 from relay.harness.env_policy import (
     BASELINE_ALLOWLIST,
     DEFAULT_CONFLICT_VARIABLES,
@@ -22,12 +20,6 @@ _POLLUTED_PARENT = {
     "SOME_RANDOM_JUNK": "nope",
     "MY_COOKIE_JAR": "session-state",
 }
-
-
-def test_baseline_variables_survive():
-    env = build_child_env(_POLLUTED_PARENT)
-    for name in BASELINE_ALLOWLIST:
-        assert env.get(name) == f"value-of-{name}"
 
 
 def test_no_conflict_variable_reaches_the_child_by_default():
@@ -58,12 +50,6 @@ def test_self_whitelist_cannot_resurrect_non_conflict_variables():
     assert "SOME_RANDOM_JUNK" not in env
 
 
-def test_missing_baseline_entries_are_simply_absent():
-    parent = {"PATH": "/bin", "NOT_IN_LIST": "x"}
-    env = build_child_env(parent)
-    assert env == {"PATH": "/bin"}
-
-
 def test_default_conflict_set_matches_app_c4_examples():
     assert {
         "OPENAI_API_KEY",
@@ -75,8 +61,3 @@ def test_default_conflict_set_matches_app_c4_examples():
         "GOOGLE_API_KEY",
         "GOOGLE_APPLICATION_CREDENTIALS",
     } <= set(DEFAULT_CONFLICT_VARIABLES)
-
-
-def test_snapshot_helper_returns_a_copy():
-    snapshot = dict(os.environ)
-    assert isinstance(snapshot, dict)

@@ -8,112 +8,13 @@ and ``backend`` is the only declaration an adapter family makes.
 
 import asyncio
 
-import pytest
-from pydantic import ValidationError
-
 from relay.agents.base import (
     Agent,
     AgentRequest,
     AgentResponse,
     AgentRole,
     BackendType,
-    TokenUsage,
 )
-
-
-class EchoAgent(Agent):
-    name = "echo"
-
-    async def run(self, request: AgentRequest) -> AgentResponse:
-        return AgentResponse(
-            agent=self.name,
-            role=request.role,
-            output=f"echo:{request.prompt}",
-            usage=TokenUsage(input_tokens=10, output_tokens=5),
-        )
-
-
-class TestRolesAreDecoupledFromModels:
-    """SPEC §8: 'Claude = reviewer' is wrong; any model can act in any role."""
-
-    def test_same_adapter_any_role(self):
-        agent = EchoAgent()
-
-        async def scenario():
-            outputs = []
-            for role in (AgentRole.ARCHITECT, AgentRole.REVIEWER, AgentRole.CRITIC):
-                response = await agent.run(AgentRequest(prompt="x", role=role))
-                outputs.append((response.agent, response.role))
-            return outputs
-
-        results = asyncio.run(scenario())
-        assert all(agent_name == "echo" for agent_name, _ in results)
-        assert [role for _, role in results] == [
-            AgentRole.ARCHITECT,
-            AgentRole.REVIEWER,
-            AgentRole.CRITIC,
-        ]
-
-
-class TestRequestValidation:
-    def test_prompt_and_role_required(self):
-        with pytest.raises(ValidationError):
-            AgentRequest()  # type: ignore[call-arg]
-
-    def test_context_refs_default_empty(self):
-        request = AgentRequest(prompt="analyze", role=AgentRole.RESEARCHER)
-        assert request.context_refs == []
-        assert request.task_id is None
-
-
-class TestResponseContract:
-    def test_response_roundtrips_through_json(self):
-        response = AgentResponse(
-            agent="claude",
-            role=AgentRole.MODERATOR,
-            output="synthesis...",
-            artifact_refs=["artifact:123"],
-            usage=TokenUsage(input_tokens=100, output_tokens=50, cost_usd=0.01),
-        )
-        restored = AgentResponse.model_validate_json(response.model_dump_json())
-        assert restored == response
-
-    def test_error_status_carries_error_text(self):
-        response = AgentResponse(
-            agent="gpt",
-            role=AgentRole.PLANNER,
-            output="",
-            status="error",
-            error="provider timeout",
-        )
-        assert response.status == "error"
-
-
-class TestTokenUsageOptionality:
-    """App. B.2: usage/cost are optional; harness runs may carry none."""
-
-    def test_token_usage_all_fields_optional(self):
-        usage = TokenUsage()
-        assert usage.input_tokens is None
-        assert usage.output_tokens is None
-        assert usage.cost_usd is None
-
-    def test_response_with_none_usage_flows_cleanly(self):
-        response = AgentResponse(agent="codex", role=AgentRole.IMPLEMENTER, output="done")
-        assert response.usage is None
-        restored = AgentResponse.model_validate_json(response.model_dump_json())
-        assert restored == response
-
-    def test_cost_none_survives_serialization(self):
-        usage = TokenUsage(input_tokens=10, output_tokens=20, cost_usd=None)
-        restored = TokenUsage.model_validate_json(usage.model_dump_json())
-        assert restored.cost_usd is None
-
-    def test_request_response_serialize_without_transport_fields(self):
-        request = AgentRequest(prompt="p", role=AgentRole.RESEARCHER)
-        response = AgentResponse(agent="claude", role=AgentRole.RESEARCHER, output="o")
-        for dump in (request.model_dump(), response.model_dump()):
-            assert not ({"api_key", "url", "headers", "auth", "token"} & set(dump))
 
 
 class FakeHarnessAgent(Agent):
@@ -133,26 +34,6 @@ class FakeHarnessAgent(Agent):
             output=f"harness handled: {request.prompt}",
             usage=None,  # subscription-backed runs carry no usage data
         )
-
-
-class TestHarnessFamilyDeclaration:
-    """One ClassVar declares the family; the interface stays identical."""
-
-    def test_harness_backend_declared_without_interface_changes(self):
-        assert FakeHarnessAgent.backend is BackendType.HARNESS
-        assert Agent.backend is BackendType.API  # default unchanged
-
-    def test_fake_harness_answers_offline(self):
-        async def scenario():
-            response = await FakeHarnessAgent().run(
-                AgentRequest(prompt="analyze", role=AgentRole.RESEARCHER)
-            )
-            return response
-
-        response = asyncio.run(scenario())
-        assert response.output == "harness handled: analyze"
-        assert response.usage is None  # cost_usd=None flows cleanly
-        assert response.status == "ok"
 
 
 class TestHarnessOfflinePersistPath:

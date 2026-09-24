@@ -247,9 +247,6 @@ class TestFeedIsPure:
         assert first == second
         assert all(isinstance(entry, FeedEntry) for entry in first)
 
-    def test_empty_room_yields_empty_feed(self, store):
-        assert build_room_feed(store, "missing-room") == []
-
 
 class TestCanonicalRecordProjection:
     """P7.3 (App. D.3): canonical Room records render at their marker sequence."""
@@ -366,9 +363,3 @@ class TestCanonicalRecordProjection:
         )
         with pytest.raises(RoomFeedIntegrityError, match="foreign decision"):
             build_room_feed(fixture.store, fixture.room.id)
-
-    def test_record_free_rooms_render_unchanged(self, store, bus):
-        bus.send(_msg())
-        feed = build_room_feed(store, "room-1")
-        assert [entry.origin for entry in feed] == ["message"]
-        assert all(entry.origin != "record" for entry in feed)

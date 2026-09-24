@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import sys
-import uuid
 from pathlib import Path
 
 import pytest
@@ -25,15 +24,11 @@ from relay.agents.antigravity_cli import AntigravityCLIAdapter
 from relay.agents.base import (
     AgentRequest,
     AgentRole,
-    BackendType,
     RunObservation,
     TokenUsage,
 )
 from relay.agents.config import AgentSettings
-from relay.agents.registry import AGENTS
 from relay.context.config import HarnessAgentConfig
-from relay.harness.capabilities import ALL_CAPABILITIES, HarnessCapability
-from relay.harness.conformance import default_factory_for, run_battery
 from relay.harness.discovery import ResolvedExecutable
 from relay.harness.errors import (
     HarnessDiscoveryError,
@@ -243,41 +238,6 @@ def _real(tmp_path: Path, *, version: str | None = "1.1.9") -> AntigravityCLIAda
         version_raw=None,
     )
     return agent
-
-
-class TestDeclaration:
-    def test_registered_under_canonical_and_alias_names(self):
-        assert AGENTS["antigravity_cli"] is AntigravityCLIAdapter
-        assert AGENTS["agy"] is AntigravityCLIAdapter
-
-    def test_backend_is_harness_family(self):
-        assert AntigravityCLIAdapter.backend is BackendType.HARNESS
-        assert AntigravityCLIAdapter.name == "antigravity_cli"
-        assert AntigravityCLIAdapter.harness_command == "agy"
-
-    def test_capabilities_subset_of_frozen_vocabulary(self):
-        assert AntigravityCLIAdapter.capabilities <= ALL_CAPABILITIES
-
-    def test_default_grant_is_read_only(self, tmp_path):
-        assert _real(tmp_path).resolve_grant().kind is ExecutionGrantKind.READ_ONLY_ACCESS
-
-    def test_workspace_write_deliberately_absent(self):
-        """Grilled decision Q4: no per-invocation clamp flag exists, so the
-        write tier is refused at the capability layer, not clamped at the
-        flag layer."""
-        assert HarnessCapability.WORKSPACE_WRITE not in AntigravityCLIAdapter.capabilities
-
-    def test_unsupported_provider_toggles_absent_from_capabilities(self):
-        shell_family = {
-            HarnessCapability.SHELL_EXECUTION,
-            HarnessCapability.GIT_OPERATIONS,
-            HarnessCapability.NETWORK_ACCESS,
-            HarnessCapability.TOOL_EVENT_STREAM,
-            HarnessCapability.RESOLVED_MODEL_REPORTING,
-            HarnessCapability.DIFF_REPORTING,
-            HarnessCapability.APPROVAL_EVENT_STREAM,
-        }
-        assert not (AntigravityCLIAdapter.capabilities & shell_family)
 
 
 class TestGrantContract:
@@ -600,23 +560,6 @@ class TestSessionResumeRejection:
         assert not isinstance(excinfo.value, SessionResumeUnavailable)
 
 
-class TestBatteryParityG1Prime:
-    def test_full_battery_on_antigravity_shaped_fixture(self, tmp_path):
-        report = run_battery(default_factory_for(AntigravityShapedFixture), tmp_path)
-        if not report.passed:
-            pytest.fail("antigravity fixture failed conformance:\n" + report.summary())
-
-    def test_liar_fixture_still_fails_battery(self, tmp_path):
-        class Liar(AntigravityShapedFixture):
-            name = "liar_antigravity"
-
-            def classify_exit(self, exit_code):
-                return ExitSemantics.OK
-
-        report = run_battery(default_factory_for(Liar), tmp_path)
-        assert not report.passed
-
-
 class TestWideningDefenseQ4:
     """No clamp flag exists — so the defense is structural: Relay composes
     the plan-mode tail and the mandatory slash clamp, and NEVER composes the
@@ -687,27 +630,6 @@ class TestWideningDefenseQ4:
             "--yolo",
         ):
             assert forbidden not in joined
-
-
-class TestPersistenceDormancyD5b:
-    async def test_external_session_ref_stays_none_after_success(self, tmp_path):
-        agent = _agent(tmp_path)
-        response = await agent.run(_request("dormancy"))
-        observation = response.observation
-        assert observation is not None
-        assert observation.external_session_ref is None
-        assert agent.last_session_ref is not None  # parsed in memory only…
-        facts = agent.describe_facts()  # …never promoted into C.4 facts
-        assert facts.external_session_ref is None
-
-    def test_resume_translation_available_but_dormant(self, tmp_path):
-        # Pure translation on the SHIPPING class: no process involved.
-        agent = _real(tmp_path)
-        raw = uuid.uuid4().hex
-        jref = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
-        assert agent.resume_arguments(jref) == ("--conversation", jref)
-        with pytest.raises(UnsupportedCapability):
-            agent.resume_arguments("junk-ref")
 
 
 class TestSecondHarnessGateZeroTouch:

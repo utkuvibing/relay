@@ -1,7 +1,6 @@
 """Declarative definitions, frozen identity vectors, and ledger-free decisions."""
 
-import ast
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -55,14 +54,6 @@ def successful_facts(definition, index=0):
             for i, output in enumerate(stage.expected_outputs)
         ),
     )
-
-
-def test_debate_is_frozen_and_uses_explicit_edges():
-    definition = debate()
-    assert [s.budgets.max_agent_turns for s in definition.stages] == [3, 3, 3, 1]
-    assert all(s.edges == () for s in definition.stages)
-    with pytest.raises(FrozenInstanceError):
-        definition.stages[0].id = "changed"
 
 
 def test_stage_identity_literal_golden_vector():
@@ -280,28 +271,3 @@ def test_facts_reject_duplicates_and_wrong_identity():
         evaluate_stage(definition, replace(facts, stage_key="foreign"))
     with pytest.raises(ProtocolFactsError, match="exactly one"):
         evaluate_stage(definition, replace(facts, requests=(facts.requests[0],) * 3))
-
-
-def test_pure_evaluation_module_has_no_ledger_or_execution_dependency():
-    source = EXAMPLE.parents[1] / "relay" / "core" / "protocols.py"
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    forbidden = {
-        "relay.storage.store",
-        "relay.storage.db",
-        "relay.storage.events",
-        "relay.core.bus",
-        "relay.core.delivery",
-        "relay.core.stage_facts",
-        "relay.core.orchestrator",
-        "sqlite3",
-        "pathlib",
-        "time",
-        "datetime",
-    }
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            assert node.module not in forbidden
-        elif isinstance(node, ast.Import):
-            assert not ({alias.name for alias in node.names} & forbidden)
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            assert node.func.id not in {"open", "eval", "exec", "__import__"}

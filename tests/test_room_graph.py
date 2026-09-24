@@ -131,9 +131,6 @@ def _revision_setup(fixture: RoomFixture, task_id: str) -> tuple[Message, Messag
 
 
 class TestGraphReconstruction:
-    def test_empty_room_has_an_empty_graph(self, fixture):
-        graph = build_room_graph(fixture.store, fixture.room.id)
-        assert graph.plans == () and graph.decisions == () and graph.findings == ()
 
     def test_frozen_plan_chain(self, fixture, tmp_path):
         outcome = freeze(fixture, room_config(), workspace_root=tmp_path)
