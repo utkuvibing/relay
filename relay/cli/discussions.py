@@ -109,6 +109,23 @@ def discuss(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable discussion."),
 ) -> None:
     """Run a bounded discussion, or explicitly resume its saved execution."""
+    from relay.cli.server_client import request, server_url
+
+    if server_url():
+        if resume is not None:
+            _error("Server mode supports starting discussions; resume locally.", json_output)
+        if topic is None or not topic.strip():
+            _error("Supply a discussion topic.", json_output)
+        if protocol is not None and not protocol.is_absolute():
+            protocol_value = str(protocol)
+        elif protocol is not None:
+            _error("Server mode requires a workspace-relative protocol path.", json_output)
+        else:
+            protocol_value = None
+        view = request("POST", "/discussions", {"topic": topic, "protocol": protocol_value})
+        render_discussion(view, json_output=json_output)
+        return
+
     from relay.cli.main import _open_db
 
     if (resume is not None and (topic is not None or protocol is not None)) or (
