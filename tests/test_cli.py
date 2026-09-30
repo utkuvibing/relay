@@ -1079,3 +1079,28 @@ class TestRoomCanonicalGraphCLI:
         result = runner.invoke(app, ["room", "graph", "Design"])
         assert result.exit_code == 1
         assert "outside the chain" in result.output
+
+
+class TestAskOutputIsNotMarkup:
+    """Agent- and user-controlled text is printed verbatim, never as rich markup."""
+
+    @staticmethod
+    def _flat(output: str) -> str:
+        return " ".join(output.split())
+
+    def test_model_output_with_brackets_is_verbatim(self, workspace):
+        assert runner.invoke(app, ["init"]).exit_code == 0
+        text = "keep [x] boxes and a[/b] path"
+        result = _patched_invoke(
+            ["ask", "gpt", "hi"],
+            lambda request: httpx.Response(200, json=_completion(text)),
+        )
+        assert result.exit_code == 0, result.output
+        assert text in self._flat(result.output)
+
+    def test_error_text_with_brackets_is_verbatim(self, workspace):
+        assert runner.invoke(app, ["init"]).exit_code == 0
+        result = runner.invoke(app, ["ask", "[x]", "hi"])
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "unknown agent '[x]'" in self._flat(result.output)

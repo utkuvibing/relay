@@ -17,6 +17,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from relay.agents import (
     AgentRequest,
@@ -314,7 +315,7 @@ def ask(
         finally:
             conn.close()
     except (ConfigError, AgentError, AgentNotConfigured, UnknownAgentError) as exc:
-        _out().print(f"[red]ERROR[/red] {exc}")
+        _out().print(f"[red]ERROR[/red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     ask_result(
@@ -428,7 +429,7 @@ def build(
         UnknownAgentError,
         BuildRefusal,
     ) as exc:
-        _out().print(f"[red]ERROR[/red] {exc}")
+        _out().print(f"[red]ERROR[/red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     build_result(task=outcome.task, outcome=outcome, view=view)
@@ -575,7 +576,7 @@ def continue_(
         UnknownAgentError,
         BuildRefusal,
     ) as exc:
-        _out().print(f"[red]ERROR[/red] {exc}")
+        _out().print(f"[red]ERROR[/red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     build_result(task=outcome.task, outcome=outcome, view=view)
@@ -674,7 +675,7 @@ def approve(
             ),
         )
     except (ConfigError, StateMachineError) as exc:
-        _out().print(f"[red]ERROR[/red] {exc}")
+        _out().print(f"[red]ERROR[/red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
     finally:
         if conn is not None:
@@ -726,7 +727,7 @@ def inspect(
         finally:
             conn.close()
     except ConfigError as exc:
-        _out().print(f"[red]ERROR[/red] {exc}")
+        _out().print(f"[red]ERROR[/red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
     inspect_task(ledger, json_output=json_output)
@@ -877,7 +878,7 @@ def history(
         finally:
             conn.close()
     except ConfigError as exc:
-        _out().print(f"[red]ERROR[/red] {exc}")
+        _out().print(f"[red]ERROR[/red] {escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
 

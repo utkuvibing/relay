@@ -72,9 +72,12 @@ def ask_result(
     error: str | None,
 ) -> None:
     if error is not None:
-        _out().print(f"[red]ERROR {provider} failed:[/red] {error}")
+        _out().print(f"[red]ERROR {escape(provider)} failed:[/red] {escape(error)}")
         return
-    _out().print(Panel(output or "(empty response)", title=f"{provider} | {model or 'default'}"))
+    # Model output and config names are data, never rich markup.
+    _out().print(
+        Panel(Text(output or "(empty response)"), title=Text(f"{provider} | {model or 'default'}"))
+    )
     usage = (
         f"in {run.input_size} | out {run.output_size}"
         if run.input_size is not None or run.output_size is not None
