@@ -173,6 +173,12 @@ The current adapter registry includes OpenAI-compatible API adapters and harness
 
 ## Planned
 
+> **Native rewrite in progress.** Relay is being ported to Rust (single
+> `relay` binary) together with an Electron + React desktop app, in a
+> separate repository. This repository is now the feature-frozen reference
+> implementation: it accepts only bug fixes that come with an oracle test
+> in the rewrite repo.
+
 These are roadmap items, not current capabilities:
 
 - P5 remaining: semantic loop/convergence detection; discussion CLI, bounded protocols, policy, budgets, and stored escalation notices are available;
