@@ -1079,3 +1079,36 @@ class TestRoomCanonicalGraphCLI:
         result = runner.invoke(app, ["room", "graph", "Design"])
         assert result.exit_code == 1
         assert "outside the chain" in result.output
+
+
+class TestInvalidConfig:
+    """init/status report an invalid relay.yaml as ERROR + exit 1, never a traceback."""
+
+    INVALID = "agents:\n  gpt: {backend: cloud, adapter: openai}\n"
+
+    def test_status_reports_config_error(self, workspace):
+        (workspace / "relay.yaml").write_text(self.INVALID, encoding="utf-8")
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "ERROR" in result.output
+        assert "agents.gpt.backend: Input should be 'api' or 'harness'" in result.output
+        assert not (workspace / ".relay").exists()
+
+    def test_init_reports_config_error_after_initializing(self, workspace):
+        (workspace / "relay.yaml").write_text(self.INVALID, encoding="utf-8")
+        result = runner.invoke(app, ["init"])
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "agents.gpt.backend: Input should be 'api' or 'harness'" in result.output
+        # Discovery and the ledger are set up before the config is read.
+        assert (workspace / ".relay" / "relay.sqlite3").is_file()
+        assert (workspace / "relay.yaml").read_text(encoding="utf-8") == self.INVALID
+
+    def test_config_error_brackets_survive_markup(self, workspace):
+        (workspace / "relay.yaml").write_text(
+            "agents:\n  gpt: {backend: api, adapter: openai}\nroles: {1: gpt}\n", encoding="utf-8"
+        )
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 1
+        assert "roles.1.[key]: Input should be a valid string" in result.output

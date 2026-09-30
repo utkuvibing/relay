@@ -248,6 +248,22 @@ def _key_states(config) -> dict[str, bool]:
     return states
 
 
+def _load_config_or_exit(root: Path):
+    """Load relay.yaml; an invalid config is a one-line ERROR and exit 1.
+
+    Same contract as ``ask``: a ``ConfigError`` is user input feedback, never
+    a traceback. The message is markup-escaped because pydantic locations may
+    contain brackets (``roles.x.[key]``) that rich would read as style tags.
+    """
+    from rich.markup import escape
+
+    try:
+        return load_config(root)
+    except ConfigError as exc:
+        _out().print(f"[red]ERROR[/red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+
+
 def _default_relay_yaml() -> str:
     return (
         "# Relay configuration - non-secret provider facts only (SPEC App. B.3).\n"
@@ -278,7 +294,7 @@ def init() -> None:
             layout.config_path.write_text(_default_relay_yaml(), encoding="utf-8")
     finally:
         conn.close()
-    config = load_config(root)
+    config = _load_config_or_exit(root)
     _out().print(f"[green]OK[/green] initialized {root}")
     from relay.cli.render import init_summary
 
@@ -786,7 +802,7 @@ def status() -> None:
     from relay.cli.taskview import build_task_view
 
     root = Path.cwd()
-    config = load_config(root)
+    config = _load_config_or_exit(root)
     workspace = None
     tasks: list[Task] = []
     active_view = None
